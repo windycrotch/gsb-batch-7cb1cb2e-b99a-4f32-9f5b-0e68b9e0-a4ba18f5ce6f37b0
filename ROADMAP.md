@@ -6,6 +6,9 @@
 
 ## Current: v0.32.0
 
+- `InputSessionCoordinator` + `CanvasTransform`: one state axis for IME composition and zoom/pan
+  gestures (candidate window re-mapped to logical DIP per frame, invalid UTF-8 ranges dropped whole,
+  cancel/disable never commit, pointer cancel/leave re-anchor the gesture baseline)
 - IME contract (ADR-045): one `IMEController` (cursor area, content type, surrounding text, cancel,
   capabilities), `IMEState` with UTF-8 byte ranges, optional `IMEEventSource`
 - `TextureRegionUpdater.UpdateRegion` struct API (`image.Rectangle` + `ImageDataLayout`, #484)

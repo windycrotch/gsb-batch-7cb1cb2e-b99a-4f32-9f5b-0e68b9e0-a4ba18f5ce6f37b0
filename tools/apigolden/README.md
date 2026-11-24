@@ -22,7 +22,7 @@ golden: the context list in `main.go` has to be extended deliberately.
 
 `contextFloors` pins the package and identifier counts the loader must reach before the golden is
 written. A load that loses the package or drops identifiers fails instead of producing a short file that
-looks reviewed. The current floor is `1 package / 346 identifiers`.
+looks reviewed. The current floor is `1 package / 353 identifiers`.
 
 ## Regenerating after an intended change
 

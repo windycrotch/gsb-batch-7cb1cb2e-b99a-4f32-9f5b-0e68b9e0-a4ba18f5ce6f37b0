@@ -8,6 +8,8 @@
 //   - IMEController, IMEEventSource: Input Method Editor control and optional events
 //     (ADR-045; UTF-8 byte offsets, see IMETextRange)
 //   - PointerEventSource: Interface for unified pointer events (W3C Level 3, mouse+touch+pen)
+//   - InputSessionCoordinator, CanvasTransform: coordinate IME composition with per-frame
+//     zoom-and-pan gestures on one transform state axis
 //   - WindowProvider: Interface for window geometry, DPI, and redraw requests
 //   - PlatformProvider: Interface for clipboard, cursor, dark mode, accessibility
 //   - ScrollEventSource: Interface for detailed scroll events

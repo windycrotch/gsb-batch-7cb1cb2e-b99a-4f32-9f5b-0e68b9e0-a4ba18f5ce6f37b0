@@ -210,6 +210,25 @@ func (input *TextInput) Focus(controller gpucontext.IMEController) {
 }
 ```
 
+### Coordinating IME with zoom-and-pan gestures
+
+On a borderless-window canvas the IME and the touchpad gesture stream are independent: a pinch during
+CJK composition would otherwise leave the candidate window at the caret's old position.
+`InputSessionCoordinator` joins both chains on one `CanvasTransform` state axis:
+
+```go
+coordinator := gpucontext.NewInputSessionCoordinator(controller)
+if err := coordinator.Bind(source); err != nil { // EventSource + optional pointer/gesture/IME extensions
+    log.Fatal(err)
+}
+
+// Caret in canvas content coordinates; the coordinator re-maps it to logical DIP on every frame.
+coordinator.SetCaretArea(gpucontext.IMECursorArea{X: caretX, Y: caretY, Height: lineHeight})
+// Per-frame gesture deltas update the shared transform and reposition the candidate window while composing.
+// Composition frames with illegal UTF-8 Cursor/Selection ranges are dropped whole, never truncated;
+// OnIMECanceled/OnIMEDisabled clear the preedit without committing.
+```
+
 ### Texture Interface
 
 `Texture` provides a minimal interface for GPU textures, enabling sharing between packages:

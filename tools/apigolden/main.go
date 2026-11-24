@@ -34,7 +34,7 @@ type floor struct {
 }
 
 var contextFloors = map[string]floor{
-	"windows/amd64/": {1, 346},
+	"windows/amd64/": {1, 353},
 }
 
 func floorFor(c config) (floor, error) {

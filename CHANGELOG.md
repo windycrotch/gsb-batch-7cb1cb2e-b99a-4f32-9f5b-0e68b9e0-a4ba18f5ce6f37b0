@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `InputSessionCoordinator` puts the IME composition chain (`EventSource` composition callbacks,
+  `IMEController` cursor area and content type) and the gesture/pointer chain (`GestureEventSource`
+  per-frame deltas, `PointerEventSource` cancel/leave) on one state axis. It records the canvas
+  transform and caret at composition start, re-maps the candidate-window position to logical DIP
+  after every transform change during composition, drops whole composition frames whose
+  `Cursor`/`Selection` are not valid UTF-8 byte ranges in `CompositionText` (never truncates), and
+  clears the session without committing on `OnIMECanceled`/`OnIMEDisabled`. Pointer cancel/leave
+  break the gesture baseline so the next frame re-anchors instead of zoom-jumping. All state is
+  mutex-guarded and every `IMEController` call happens outside the lock, so it is safe from a draw
+  callback goroutine and never blocks the caller.
+- `CanvasTransform` (with `IdentityCanvasTransform`, `ApplyGesture`, `MapRect`): the zoom-and-pan
+  transform mapping canvas content coordinates to window logical DIP, shared by gestures and IME
+  caret placement.
+- `ErrCoordinatorAlreadyBound`, `ErrNoIMEController`, `ErrNoEventSource`.
+
 ## [0.32.0] - 2026-11-08
 
 ### Changed (breaking)
