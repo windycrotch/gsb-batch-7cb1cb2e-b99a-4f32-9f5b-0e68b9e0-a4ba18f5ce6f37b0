@@ -1,6 +1,8 @@
 package service
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 )
 
@@ -113,4 +115,78 @@ func TestDefaultSourcesIncludeNewPlayableProviders(t *testing.T) {
 	if sources["spotify"] {
 		t.Error("spotify should remain opt-in because it is not a direct playback source")
 	}
+}
+
+// TestCookieSnapshotConsistencyUnderConcurrentUpdate exercises the hot-update
+// vs. probe race: every snapshot taken while updates are in flight must report
+// one internally consistent set of cookie values (all old or all new), never a
+// mixture of the two.
+func TestCookieSnapshotConsistencyUnderConcurrentUpdate(t *testing.T) {
+	manager := &CookieManager{cookies: map[string]string{
+		"netease": "old-netease",
+		"qq":      "old-qq",
+		"kugou":   "old-kugou",
+	}}
+	sources := []string{"netease", "qq", "kugou"}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Mutator: repeatedly flips every platform cookie as one update batch.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			cookies := make(map[string]string, len(sources))
+			value := fmt.Sprintf("new-%d", i)
+			for _, source := range sources {
+				cookies[source] = value
+			}
+			manager.SetAll(cookies)
+		}
+	}()
+
+	// Readers: each snapshot must be internally consistent — either the
+	// untouched initial set ("old-<source>" everywhere) or one complete update
+	// batch (the same "new-<i>" value everywhere). A mixture would mean a
+	// probe could see some platforms with the new cookie and others with old.
+	allOld := func(snapshot CookieSnapshot) bool {
+		for _, source := range sources {
+			if snapshot.Cookie(source) != "old-"+source {
+				return false
+			}
+		}
+		return true
+	}
+	allSameNew := func(snapshot CookieSnapshot) bool {
+		batch := snapshot.Cookie(sources[0])
+		if batch == "old-"+sources[0] || len(batch) < 5 || batch[:4] != "new-" {
+			return false
+		}
+		for _, source := range sources[1:] {
+			if snapshot.Cookie(source) != batch {
+				return false
+			}
+		}
+		return true
+	}
+
+	for i := 0; i < 2000; i++ {
+		snapshot := manager.Snapshot()
+		if !allOld(snapshot) && !allSameNew(snapshot) {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("mixed snapshot detected: %s=%q, %s=%q, %s=%q",
+				sources[0], snapshot.Cookie(sources[0]),
+				sources[1], snapshot.Cookie(sources[1]),
+				sources[2], snapshot.Cookie(sources[2]))
+		}
+	}
+	close(stop)
+	wg.Wait()
 }

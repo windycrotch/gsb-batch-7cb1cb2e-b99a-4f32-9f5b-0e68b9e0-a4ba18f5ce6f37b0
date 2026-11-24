@@ -25,6 +25,23 @@ import (
 
 const CookieFile = "cookies.json"
 
+// CookieSnapshot is an immutable, point-in-time copy of every platform cookie.
+// Probe and quality-resolution flows build their providers from one snapshot so
+// that a concurrent hot update can never make a single probe read a mixture of
+// old and new cookies. A snapshot is never mutated after creation.
+type CookieSnapshot struct {
+	cookies map[string]string
+}
+
+// Cookie returns the cookie recorded for source at the time the snapshot was
+// taken. The returned string is a copy-safe value.
+func (s CookieSnapshot) Cookie(source string) string {
+	if s.cookies == nil {
+		return ""
+	}
+	return s.cookies[strings.ToLower(strings.TrimSpace(source))]
+}
+
 type CookieManager struct {
 	mu      sync.RWMutex
 	cookies map[string]string
@@ -91,6 +108,20 @@ func (m *CookieManager) Get(source string) string {
 	return m.cookies[source]
 }
 
+// Snapshot captures every current cookie under a single read-lock acquisition.
+// The returned snapshot is immutable: subsequent SetAll calls replace the
+// manager's map but never touch the snapshot, which is what gives in-flight
+// probes a consistent view across all platforms.
+func (m *CookieManager) Snapshot() CookieSnapshot {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	cookies := make(map[string]string, len(m.cookies))
+	for source, cookie := range m.cookies {
+		cookies[source] = cookie
+	}
+	return CookieSnapshot{cookies: cookies}
+}
+
 func (m *CookieManager) SetAll(cookies map[string]string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -119,11 +150,19 @@ func (m *CookieManager) GetAll() map[string]string {
 }
 
 func (m *CookieManager) Save() error {
-	data, err := json.MarshalIndent(m.GetAll(), "", "  ")
+	snapshot := m.Snapshot()
+	data, err := json.MarshalIndent(snapshot.cookies, "", "  ")
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(CookieFile, data, 0644)
+}
+
+// sourceProviderFromSnapshot builds a platform provider exclusively from the
+// immutable snapshot so every network call made during one probe carries the
+// same cookie, regardless of concurrent hot updates.
+func sourceProviderFromSnapshot(source string, snapshot CookieSnapshot) any {
+	return sourceProvider(source, snapshot.Cookie(source))
 }
 
 func DetectSource(link string) string {

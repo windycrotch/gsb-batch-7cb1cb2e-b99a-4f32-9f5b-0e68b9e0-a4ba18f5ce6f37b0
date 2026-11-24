@@ -55,21 +55,33 @@ func GetAudioQualities(c *gin.Context) {
 		return
 	}
 
+	// Validate every source up front: an unknown platform must surface as an
+	// explicit error instead of an empty result list.
+	for _, currentSource := range sources {
+		if _, err := service.GetAudioQualityChoices(currentSource); err != nil {
+			c.JSON(http.StatusBadRequest, Response{
+				Code: http.StatusBadRequest,
+				Msg:  err.Error(),
+			})
+			return
+		}
+	}
+
+	// One snapshot for the entire request. With probe=true this guarantees
+	// the entitlement probe uses one consistent cookie value even if a hot
+	// update lands while the probe is in flight.
+	snapshot := service.CM.Snapshot()
+
 	results := make([]qualitySourceResult, 0, len(sources))
 	for _, currentSource := range sources {
 		result := qualitySourceResult{
 			Source: currentSource,
 			Name:   service.GetSourceDescription(currentSource),
 		}
-		qualities, err := service.GetAudioQualityChoices(currentSource)
-		if err != nil {
-			result.Error = err.Error()
-			results = append(results, result)
-			continue
-		}
+		qualities, _ := service.GetAudioQualityChoices(currentSource)
 		result.Qualities = qualities
 		if probe {
-			available, probeErr := service.GetAudioQualityOptions(currentSource)
+			available, probeErr := service.GetAudioQualityOptionsWithSnapshot(snapshot, currentSource)
 			if probeErr != nil {
 				result.Error = probeErr.Error()
 			} else {

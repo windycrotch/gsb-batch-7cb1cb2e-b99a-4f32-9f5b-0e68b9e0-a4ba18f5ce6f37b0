@@ -37,8 +37,10 @@ const (
 	Ref_Migu     = "http://music.migu.cn/"
 )
 
-// 辅助函数：构造带有 Cookie 和防盗链的 Request
-func buildReq(method, urlStr, source, rangeHeader string) (*http.Request, error) {
+// 辅助函数：构造带有 Cookie 和防盗链的 Request。
+// 当 resolvedCookie 非空时（来自一次解析请求的 Cookie 快照），整次探测/串流
+// 都复用该快照值；否则回退到当前最新配置，保持与既有调用方的兼容。
+func buildReq(method, urlStr, source, rangeHeader, resolvedCookie string) (*http.Request, error) {
 	req, err := http.NewRequest(method, urlStr, nil)
 	if err != nil {
 		return nil, err
@@ -58,7 +60,11 @@ func buildReq(method, urlStr, source, rangeHeader string) (*http.Request, error)
 		req.Header.Set("Referer", "http://y.qq.com")
 	}
 
-	if cookie := service.CM.Get(source); cookie != "" {
+	cookie := resolvedCookie
+	if cookie == "" {
+		cookie = service.CM.Get(source)
+	}
+	if cookie != "" {
 		req.Header.Set("Cookie", cookie)
 	}
 	return req, nil
@@ -514,15 +520,16 @@ func StreamMusic(c *gin.Context) {
 	quality := requestedAudioQuality(c)
 
 	if source == "soda" {
-		info, resolvedQuality, err := service.ResolveSodaDownloadInfo(tempSong, quality)
+		resolvedSoda, err := service.ResolveSodaDownloadInfo(tempSong, quality)
 		if err != nil {
 			c.String(502, "Soda info error")
 			return
 		}
+		info := resolvedSoda.Info
 		tempSong.Ext = info.Format
 		filename := fmt.Sprintf("%s - %s.%s", name, artist, songExtension(tempSong, info.URL))
-		c.Header("X-Audio-Quality", resolvedQuality)
-		req, err := buildReq("GET", info.URL, "soda", "")
+		c.Header("X-Audio-Quality", resolvedSoda.Quality)
+		req, err := buildReq("GET", info.URL, "soda", "", resolvedSoda.Cookie)
 		if err != nil {
 			c.String(502, "Soda request error")
 			return
@@ -552,7 +559,7 @@ func StreamMusic(c *gin.Context) {
 	filename := fmt.Sprintf("%s - %s.%s", name, artist, songExtension(tempSong, resolved.URL))
 	c.Header("X-Audio-Quality", resolved.Quality)
 
-	req, err := buildReq("GET", resolved.URL, source, c.GetHeader("Range"))
+	req, err := buildReq("GET", resolved.URL, source, c.GetHeader("Range"), resolved.Cookie)
 	if err != nil {
 		c.String(502, "Upstream request error")
 		return
@@ -596,28 +603,31 @@ func InspectMusic(c *gin.Context) {
 	var urlStr string
 	var err error
 	var resolvedQuality string
+	var resolvedCookie string
 
 	if src == "soda" {
-		info, sodaQuality, sErr := service.ResolveSodaDownloadInfo(song, requestedAudioQuality(c))
+		resolvedSoda, sErr := service.ResolveSodaDownloadInfo(song, requestedAudioQuality(c))
 		if sErr != nil {
 			c.JSON(200, gin.H{"valid": false})
 			return
 		}
-		urlStr = info.URL
-		resolvedQuality = sodaQuality
-		song.Ext = info.Format
+		urlStr = resolvedSoda.Info.URL
+		resolvedQuality = resolvedSoda.Quality
+		resolvedCookie = resolvedSoda.Cookie
+		song.Ext = resolvedSoda.Info.Format
 	} else {
 		resolved, resolveErr := service.ResolveDownloadURL(src, song, requestedAudioQuality(c))
 		err = resolveErr
 		urlStr = resolved.URL
 		resolvedQuality = resolved.Quality
+		resolvedCookie = resolved.Cookie
 		if err != nil || urlStr == "" {
 			c.JSON(200, gin.H{"valid": false})
 			return
 		}
 	}
 
-	req, _ := buildReq("GET", urlStr, src, "bytes=0-1")
+	req, _ := buildReq("GET", urlStr, src, "bytes=0-1", resolvedCookie)
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
 
@@ -1196,7 +1206,7 @@ func validatePlayable(song *model.Song) bool {
 	if err != nil || urlStr == "" {
 		return false
 	}
-	req, err := buildReq("GET", urlStr, song.Source, "bytes=0-1")
+	req, err := buildReq("GET", urlStr, song.Source, "bytes=0-1", "")
 	if err != nil {
 		return false
 	}

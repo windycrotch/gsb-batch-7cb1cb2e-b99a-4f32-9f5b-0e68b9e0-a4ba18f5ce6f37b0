@@ -44,6 +44,68 @@ func TestQualityCompatibilityRoute(t *testing.T) {
 	}
 }
 
+func TestQualityProbeRejectsMultipleSourcesOnBothRoutes(t *testing.T) {
+	paths := []string{
+		"/api/v1/music/qualities?probe=true&sources=netease&sources=qq",
+		"/music/qualities?probe=true&sources=netease&sources=qq",
+		"/api/v1/music/qualities?probe=1&sources=netease&sources=qq",
+	}
+	for _, path := range paths {
+		recorder := serveJSON(path)
+		if recorder.Code != http.StatusBadRequest {
+			t.Errorf("GET %s status = %d, want 400; body = %s", path, recorder.Code, recorder.Body.String())
+		}
+	}
+}
+
+func TestQualityProbeAcceptsSingleSourceOnBothRoutes(t *testing.T) {
+	// The single-source guard runs before any network probe, so validation
+	// must accept the request shape on both standard and compatibility routes.
+	paths := []string{
+		"/api/v1/music/qualities?probe=true&source=kugou",
+		"/music/qualities?probe=true&source=kugou",
+	}
+	for _, path := range paths {
+		recorder := serveJSON(path)
+		if recorder.Code != http.StatusOK {
+			t.Errorf("GET %s status = %d, want 200; body = %s", path, recorder.Code, recorder.Body.String())
+		}
+	}
+}
+
+func TestQualityUnknownSourceReturnsExplicitErrorOnBothRoutes(t *testing.T) {
+	paths := []string{
+		"/api/v1/music/qualities?source=not-a-platform",
+		"/music/qualities?source=not-a-platform",
+		"/api/v1/music/qualities?probe=true&source=not-a-platform",
+	}
+	for _, path := range paths {
+		recorder := serveJSON(path)
+		if recorder.Code != http.StatusBadRequest {
+			t.Errorf("GET %s status = %d, want 400; body = %s", path, recorder.Code, recorder.Body.String())
+			continue
+		}
+		if !strings.Contains(recorder.Body.String(), "unsupported audio quality source") {
+			t.Errorf("GET %s body = %s, want explicit unsupported-source message", path, recorder.Body.String())
+		}
+	}
+}
+
+func TestQualityRoutesBehaveIdentically(t *testing.T) {
+	queries := []string{
+		"?source=netease",
+		"?probe=true&sources=netease&sources=qq",
+		"?source=not-a-platform",
+	}
+	for _, query := range queries {
+		standard := serveJSON("/api/v1/music/qualities" + query)
+		compat := serveJSON("/music/qualities" + query)
+		if standard.Code != compat.Code {
+			t.Errorf("query %q: standard status %d != compat status %d", query, standard.Code, compat.Code)
+		}
+	}
+}
+
 func TestRankingValidationRoutes(t *testing.T) {
 	tests := []struct {
 		path string
