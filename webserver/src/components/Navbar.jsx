@@ -34,7 +34,18 @@ export default function ResponsiveAppBar() {
   }
 
   function runCheckrr() {
-    http.post("./api/run", {});
+    // The API tells us whether a run actually started (202) or one was
+    // already in progress (409). Only show "Running" when the server
+    // confirmed the start; otherwise refresh the real state.
+    http.post("./api/run", {})
+      .then((data) => {
+        if (data && data.started) {
+          setrunning(true);
+        } else {
+          fetchData();
+        }
+      })
+      .catch(() => fetchData());
   }
 
   useEffect(() => {
@@ -66,7 +77,7 @@ export default function ResponsiveAppBar() {
             checkrr
           </Typography>
           <Box sx={{ flexGrow: 0}}>
-            <Button disabled={running} variant="contained" size="small" onClick={ () => {runCheckrr(); setrunning(true)}}>Run Now</Button>&nbsp;
+            <Button disabled={running} variant="contained" size="small" onClick={runCheckrr}>Run Now</Button>&nbsp;
           </Box>
           <Box sx={{ flexGrow: 1, display: { xs: "none", md: "flex" } }}>
             <Typography

@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aetaric/checkrr/logging"
@@ -34,7 +35,9 @@ import (
 type Checkrr struct {
 	Stats              features.Stats
 	DB                 *bolt.DB
-	Running            bool
+	runMu              sync.Mutex
+	running            bool
+	runHook            func() // test hook: invoked inside an active run
 	csv                features.CSV
 	notifications      notifications.Notifications
 	sonarr             []connections.Sonarr
@@ -58,22 +61,64 @@ type Checkrr struct {
 	Localizer          *i18n.Localizer
 }
 
-func (c *Checkrr) Run() {
+// TryAcquire attempts to claim the single run slot. It returns true if the
+// caller now owns the slot and may execute a run, or false if a run is
+// already in progress. This is the single decision point used by both the
+// cron scheduler and the web API.
+func (c *Checkrr) TryAcquire() bool {
+	c.runMu.Lock()
+	defer c.runMu.Unlock()
+	if c.running {
+		return false
+	}
+	c.running = true
+	return true
+}
 
-	// Prevent multiple checkrr goroutines from running
-	if !c.Running {
-		message := c.Localizer.MustLocalize(&i18n.LocalizeConfig{
-			MessageID: "CheckDebugMultiRun",
-		})
-		c.Logger.Debug(message)
-		c.Running = true
-	} else {
+// Release frees the run slot so future triggers can start a new run. It is
+// called automatically at the end of every run; it is exported so embedders
+// (and tests) that manage the slot manually via TryAcquire can pair with it.
+func (c *Checkrr) Release() {
+	c.runMu.Lock()
+	defer c.runMu.Unlock()
+	c.running = false
+}
+
+// IsRunning reports whether a check run is currently in progress.
+func (c *Checkrr) IsRunning() bool {
+	c.runMu.Lock()
+	defer c.runMu.Unlock()
+	return c.running
+}
+
+// Run implements the cron.Job interface. It executes a run synchronously,
+// unless one is already in progress, in which case it logs and returns.
+func (c *Checkrr) Run() {
+	if !c.TryAcquire() {
 		message := c.Localizer.MustLocalize(&i18n.LocalizeConfig{
 			MessageID: "CheckMultiRunError",
 		})
 		c.Logger.Error(message)
 		return
 	}
+	c.run()
+}
+
+// RunAsync starts a run in its own goroutine. It returns true if the run was
+// started, or false if a run was already in progress (in which case no new
+// goroutine is spawned and the caller is informed via the return value).
+func (c *Checkrr) RunAsync() bool {
+	if !c.TryAcquire() {
+		return false
+	}
+	go c.run()
+	return true
+}
+
+func (c *Checkrr) run() {
+	// The run slot must always be released, even if the walk errors out or
+	// something panics, so later triggers can never get stuck on "running".
+	defer c.Release()
 
 	c.Stats = features.Stats{Log: *c.Logger, DB: c.DB, Localizer: c.Localizer}
 	c.Stats.FromConfig(*c.FullConfig.Cut("stats"))
@@ -126,6 +171,14 @@ func (c *Checkrr) Run() {
 	matchers.Video[m2ts] = mpegtsMatcher
 
 	c.Stats.Start()
+
+	// Finalize the run (stats, notifications, CSV) no matter how the walk
+	// below ends, so a partial run never leaves stats marked as running.
+	defer c.finishRun()
+
+	if c.runHook != nil {
+		c.runHook()
+	}
 
 	c.Logger.Debug(c.config.Strings("checkpath"))
 
@@ -248,6 +301,12 @@ func (c *Checkrr) Run() {
 		}
 	}
 
+}
+
+// finishRun performs the end-of-run bookkeeping: notifications, stats,
+// CSV cleanup, and signaling the scheduler channel. It is deferred by run()
+// so it executes even when a run ends early due to an error or panic.
+func (c *Checkrr) finishRun() {
 	title := c.Localizer.MustLocalize(&i18n.LocalizeConfig{
 		MessageID: "NotificationsRunFinishTitle",
 	})
@@ -260,9 +319,13 @@ func (c *Checkrr) Run() {
 	if c.config.String("csvfile") != "" {
 		c.csv.Close()
 	}
-	c.Running = false
-	ch := *c.Chan
-	ch <- []string{"time"}
+	if c.Chan != nil {
+		// Never block the end of a run on a full or un-drained channel.
+		select {
+		case *c.Chan <- []string{"time"}:
+		default:
+		}
+	}
 }
 
 func (c *Checkrr) FromConfig(conf *koanf.Koanf) {

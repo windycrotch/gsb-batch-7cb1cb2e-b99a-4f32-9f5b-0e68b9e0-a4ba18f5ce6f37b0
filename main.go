@@ -5,7 +5,6 @@ package main
 
 import (
 	"embed"
-	"encoding/json"
 	"fmt"
 	"io/fs"
 	"os"
@@ -237,35 +236,26 @@ func main() {
 			logger.WithFields(log.Fields{"startup": true, "database": "setup"}).Fatal(message)
 		}
 
-		testRunning := false
-		statsCleanup := features.Stats{}
-
 		err = DB.Update(func(tx *bolt.Tx) error {
 			_, err := tx.CreateBucketIfNotExists([]byte("Checkrr-stats"))
 			if err != nil {
 				return fmt.Errorf("create bucket: %s", err)
 			}
-
-			b := tx.Bucket([]byte("Checkrr-stats"))
-			statdata := b.Get([]byte("current-stats"))
-			if len(statdata) != 0 {
-				err = json.Unmarshal(statdata, &statsCleanup)
-				if err != nil {
-					return err
-				}
-
-				if statsCleanup.Running {
-					message := localizer.MustLocalize(&i18n.LocalizeConfig{
-						MessageID: "DBCleanup",
-					})
-					logger.WithFields(log.Fields{"startup": true}).Warn(message)
-					statsCleanup.Running = false
-					testRunning = true
-				}
-			}
-
 			return nil
 		})
+		if err != nil {
+			message := localizer.MustLocalize(&i18n.LocalizeConfig{
+				MessageID: "DBSetupError",
+				TemplateData: map[string]interface{}{
+					"Error": err,
+				},
+			})
+			logger.WithFields(log.Fields{"startup": true, "database": "setup"}).Fatal(message)
+		}
+
+		// If the previous process died mid-run, the persisted stats still say
+		// "running". Clear that stale flag so this process starts clean.
+		wasRunning, err := features.ClearRunningFlag(DB)
 		if err != nil {
 			message := localizer.MustLocalize(&i18n.LocalizeConfig{
 				MessageID: "DBCleanupError",
@@ -275,26 +265,11 @@ func main() {
 			})
 			logger.WithFields(log.Fields{"startup": true, "database": "setup"}).Fatal(message)
 		}
-
-		if testRunning {
-			err := DB.Update(func(tx *bolt.Tx) error {
-				b := tx.Bucket([]byte("Checkrr-stats"))
-				jsonData, er := json.Marshal(statsCleanup)
-				if er != nil {
-					return er
-				}
-				err := b.Put([]byte("current-stats"), jsonData)
-				return err
+		if wasRunning {
+			message := localizer.MustLocalize(&i18n.LocalizeConfig{
+				MessageID: "DBCleanup",
 			})
-			if err != nil {
-				message := localizer.MustLocalize(&i18n.LocalizeConfig{
-					MessageID: "DBCleanupError",
-					TemplateData: map[string]interface{}{
-						"Error": err.Error(),
-					},
-				})
-				logger.WithFields(log.Fields{"Module": "Stats", "DB Update": "Failure"}).Warn(message)
-			}
+			logger.WithFields(log.Fields{"startup": true}).Warn(message)
 		}
 	} else {
 		message := localizer.MustLocalize(&i18n.LocalizeConfig{

@@ -111,30 +111,7 @@ func (w *Webserver) Run() {
 }
 
 func createServer(w *Webserver) *gin.Engine {
-	embeddedBuildFolder := newStaticFileSystem()
-	// use debug mode if chekrr.debug is true
-	if w.FullConfig.Bool("checkrr.debug") {
-		gin.SetMode(gin.DebugMode)
-	} else {
-		gin.SetMode(gin.ReleaseMode)
-	}
-
-	router := gin.Default()
-	err := router.SetTrustedProxies(w.trustedProxies)
-	if err != nil {
-		message := localizer.MustLocalize(&i18n.LocalizeConfig{
-			MessageID: "WebProxyFail",
-		})
-		checkrrLogger.Warn(message)
-	}
-	router.Use(static.Serve(w.BaseURL.String(), embeddedBuildFolder))
-	api := router.Group(w.BaseURL.String() + "api")
-	api.GET("/files/bad", getBadFiles)
-	api.POST("/files/bad", deleteBadFiles)
-	api.GET("/stats/current", getCurrentStats)
-	api.GET("/stats/historical", getHistoricalStats)
-	api.GET("/schedule", getSchedule)
-	api.POST("/run", runCheckrr)
+	router := setupRouter(w)
 
 	if w.tls {
 		message := localizer.MustLocalize(&i18n.LocalizeConfig{
@@ -159,7 +136,7 @@ func createServer(w *Webserver) *gin.Engine {
 			},
 		})
 		checkrrLogger.Info(message)
-		err = router.Run(fmt.Sprintf(":%v", w.Port))
+		err := router.Run(fmt.Sprintf(":%v", w.Port))
 		if err != nil {
 			message := localizer.MustLocalize(&i18n.LocalizeConfig{
 				MessageID: "WebFail",
@@ -167,6 +144,36 @@ func createServer(w *Webserver) *gin.Engine {
 			checkrrLogger.Warn(message)
 		}
 	}
+	return router
+}
+
+// setupRouter builds the gin engine with all routes registered, without
+// listening on a port. It is used by createServer and by tests.
+func setupRouter(w *Webserver) *gin.Engine {
+	embeddedBuildFolder := newStaticFileSystem()
+	// use debug mode if chekrr.debug is true
+	if w.FullConfig.Bool("checkrr.debug") {
+		gin.SetMode(gin.DebugMode)
+	} else {
+		gin.SetMode(gin.ReleaseMode)
+	}
+
+	router := gin.Default()
+	err := router.SetTrustedProxies(w.trustedProxies)
+	if err != nil {
+		message := localizer.MustLocalize(&i18n.LocalizeConfig{
+			MessageID: "WebProxyFail",
+		})
+		checkrrLogger.Warn(message)
+	}
+	router.Use(static.Serve(w.BaseURL.String(), embeddedBuildFolder))
+	api := router.Group(w.BaseURL.String() + "api")
+	api.GET("/files/bad", getBadFiles)
+	api.POST("/files/bad", deleteBadFiles)
+	api.GET("/stats/current", getCurrentStats)
+	api.GET("/stats/historical", getHistoricalStats)
+	api.GET("/schedule", getSchedule)
+	api.POST("/run", runCheckrr)
 	return router
 }
 
@@ -199,28 +206,18 @@ func getBadFiles(ctx *gin.Context) {
 	ctx.JSON(200, files)
 }
 
+// deleteBadFiles handles POST /api/files/bad. The request body is a JSON
+// array of file paths (the stable keys of the bad-file records), not list
+// indices, so deletions are immune to the list changing between requests.
+// Paths that do not exist are ignored and reported back to the caller.
 func deleteBadFiles(ctx *gin.Context) {
-	var files []badFileData
-	var postData []int
-	err := ctx.BindJSON(&postData)
-	if err != nil {
+	var postData []string
+	if err := ctx.BindJSON(&postData); err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "request body must be a JSON array of file paths"})
 		return
 	}
 
-	err = db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte("Checkrr-files"))
-		c := b.Cursor()
-		for k, v := c.First(); k != nil; k, v = c.Next() {
-			bad := check.BadFile{}
-			err := json.Unmarshal(v, &bad)
-			if err != nil {
-				return err
-			}
-			badfiledata := badFileData{Path: string(k), Data: &bad}
-			files = append(files, badfiledata)
-		}
-		return nil
-	})
+	deleted, notFound, err := deleteBadFilesByPath(postData)
 	if err != nil {
 		message := localizer.MustLocalize(&i18n.LocalizeConfig{
 			MessageID: "DBAccessFail",
@@ -228,29 +225,36 @@ func deleteBadFiles(ctx *gin.Context) {
 				"Error": err.Error(),
 			},
 		})
-		checkrrLogger.Fatal(message)
+		checkrrLogger.Error(message)
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
 	}
+	ctx.JSON(http.StatusOK, gin.H{"deleted": deleted, "notFound": notFound})
+}
 
-	for _, v := range postData {
-		err := db.Update(func(tx *bolt.Tx) error {
-			b := tx.Bucket([]byte("Checkrr-files"))
-			err := b.Delete([]byte(files[v-1].Path))
-			if err != nil {
+// deleteBadFilesByPath removes the bad-file records for the given paths in a
+// single transaction. It returns the paths that were actually deleted and the
+// paths that had no record (which are otherwise ignored). Running the whole
+// delete in one bolt transaction keeps it atomic with respect to concurrent
+// bad-file records written by an active check run.
+func deleteBadFilesByPath(paths []string) (deleted []string, notFound []string, err error) {
+	deleted = []string{}
+	notFound = []string{}
+	err = db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte("Checkrr-files"))
+		for _, path := range paths {
+			if b.Get([]byte(path)) == nil {
+				notFound = append(notFound, path)
+				continue
+			}
+			if err := b.Delete([]byte(path)); err != nil {
 				return err
 			}
-			return nil
-		})
-		if err != nil {
-			message := localizer.MustLocalize(&i18n.LocalizeConfig{
-				MessageID: "DBAccessFail",
-				TemplateData: map[string]interface{}{
-					"Error": err.Error(),
-				},
-			})
-			checkrrLogger.Fatal(message)
+			deleted = append(deleted, path)
 		}
-	}
-	ctx.JSON(200, files)
+		return nil
+	})
+	return deleted, notFound, err
 }
 
 func getCurrentStats(ctx *gin.Context) {
@@ -265,10 +269,17 @@ func getCurrentStats(ctx *gin.Context) {
 				return err
 			}
 			stats = &s
-			return nil
-		} else {
-			return nil
 		}
+		// The bad-file count is derived from the actual records in the same
+		// transaction, so the reported count can never drift from the list.
+		filesBucket := tx.Bucket([]byte("Checkrr-files"))
+		if filesBucket != nil {
+			if stats == nil {
+				stats = &Stats{}
+			}
+			stats.BadFiles = uint64(filesBucket.Stats().KeyN)
+		}
+		return nil
 	})
 	if err != nil {
 		message := localizer.MustLocalize(&i18n.LocalizeConfig{
@@ -322,9 +333,26 @@ func getSchedule(ctx *gin.Context) {
 	}
 }
 
+// runCheckrr handles POST /api/run. It goes through the same TryAcquire
+// decision point as the cron scheduler: only one run executes at a time, and
+// a trigger while a run is active gets an explicit 409 Conflict instead of
+// being silently dropped.
 func runCheckrr(ctx *gin.Context) {
-	go checkrrInstance.Run()
-	ctx.JSON(200, nil)
+	if !checkrrInstance.RunAsync() {
+		message := localizer.MustLocalize(&i18n.LocalizeConfig{
+			MessageID: "CheckMultiRunError",
+		})
+		ctx.JSON(http.StatusConflict, gin.H{
+			"started": false,
+			"running": true,
+			"message": message,
+		})
+		return
+	}
+	ctx.JSON(http.StatusAccepted, gin.H{
+		"started": true,
+		"running": true,
+	})
 }
 
 // file system code
@@ -389,6 +417,7 @@ type Stats struct {
 	AudioFiles        uint64        `json:"audioFiles"`
 	UnknownFileCount  uint64        `json:"unknownFileCount"`
 	NonVideo          uint64        `json:"nonVideo"`
+	BadFiles          uint64        `json:"badFiles"`
 	Running           bool          `json:"running"`
 	Diff              time.Duration `json:"timeDiff"`
 }

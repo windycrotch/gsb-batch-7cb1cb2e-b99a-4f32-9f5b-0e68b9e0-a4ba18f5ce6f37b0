@@ -52,8 +52,11 @@ export default function DataTable() {
   function fetchData() {
     http.get(`./api/files/bad`)
     .then(data => {
-        const rows = data?.map((l, i) => ({
-          id: i + 1,
+        // Use the file path as the row id: it is the stable key of the
+        // record, so selections stay correct even if the list changes
+        // between fetches.
+        const rows = data?.map((l) => ({
+          id: l.Path,
           date: timeConverter(l.Data.date),
           path: l.Path,
           reason: l.Data.reason,
@@ -139,9 +142,11 @@ export default function DataTable() {
           </Typography>
           <Grid>
               <Button color="warning" onClick={() => {
+              // selectedRows are file paths (the row ids), which the API
+              // uses as stable record keys.
               http.post('./api/files/bad', selectedRows).then(() => {
                 setdisplayModal(false)
-                window.location.reload(false)
+                fetchData()
           })}}>Delete</Button>
           </Grid>
           <Grid>

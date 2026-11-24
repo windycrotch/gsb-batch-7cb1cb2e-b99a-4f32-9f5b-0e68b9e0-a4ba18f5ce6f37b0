@@ -121,6 +121,41 @@ func (s *Stats) FromConfig(config koanf.Koanf) {
 	}
 }
 
+// ClearRunningFlag resets the persisted "running" flag in the current-stats
+// record. A previous process may have been terminated mid-run (SIGKILL, crash,
+// power loss) before it could mark the run as finished; without this cleanup
+// every subsequent run would look like it is still running. It returns true
+// if a stale running flag was found and cleared.
+func ClearRunningFlag(db *bolt.DB) (bool, error) {
+	wasRunning := false
+	err := db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte("Checkrr-stats"))
+		if b == nil {
+			return nil
+		}
+		statdata := b.Get([]byte("current-stats"))
+		if len(statdata) == 0 {
+			return nil
+		}
+		var stats map[string]interface{}
+		if err := json.Unmarshal(statdata, &stats); err != nil {
+			return err
+		}
+		running, ok := stats["running"].(bool)
+		if !ok || !running {
+			return nil
+		}
+		wasRunning = true
+		stats["running"] = false
+		jsonData, err := json.Marshal(stats)
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte("current-stats"), jsonData)
+	})
+	return wasRunning, err
+}
+
 func (s *Stats) Start() {
 	s.startTime = time.Now()
 	s.Running = true

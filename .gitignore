@@ -8,7 +8,8 @@ checkrr
 .vscode
 badfiles.csv
 checkrr.log
-webserver/build
+webserver/build/*
+!webserver/build/placeholder.txt
 webserver/node_modules
 .devenv/
 .direnv/
