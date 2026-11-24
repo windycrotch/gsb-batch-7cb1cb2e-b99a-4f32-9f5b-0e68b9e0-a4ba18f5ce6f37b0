@@ -1,0 +1,17 @@
+
+dist/
+test/
+*.db
+checkrr.yaml
+test-*.yaml
+checkrr
+.vscode
+badfiles.csv
+checkrr.log
+webserver/build
+webserver/node_modules
+.devenv/
+.direnv/
+.idea/
+.devenv.flake.nix
+/checkrr.log.json

@@ -1,0 +1,19 @@
+lang: "en-us"
+checkrr:
+  checkpath: 
+    - "./test"
+  database: ./checkrr.db
+  debug: true
+  cron: "@daily"
+  ignorehidden: true
+  ignorepaths:
+    - 'media/ignored'
+  ignoreexts:
+    - .txt
+    - .nfo
+    - .nzb
+    - .url
+logs:
+  stdout:
+    out: stdout
+    formatter: default
