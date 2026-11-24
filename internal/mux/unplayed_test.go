@@ -241,3 +241,102 @@ func testUnplayedSizeDiscardsWhatIsSentBeforeSeek(t *testing.T) {
 		t.Errorf("after Seek: UnplayedSize() = %d; want BufferedSize(), %d", got, want)
 	}
 }
+
+func TestUnplayedSizeFallsBackWhenTheReportGoesStale(t *testing.T) {
+	synctest.Test(t, testUnplayedSizeFallsBackWhenTheReportGoesStale)
+}
+
+func testUnplayedSizeFallsBackWhenTheReportGoesStale(t *testing.T) {
+	m := newMux(t)
+	p := newBufferedPlayer(t, m, 4800)
+	readFrames(m, reportedFrame)
+	// Frame 1,440, the next one mixed, is played in 1.5 seconds, so the report
+	// holds for a second and then goes stale.
+	m.SetPlayed(reportedFrame, time.Now().Add(1500*time.Millisecond))
+
+	time.Sleep(999 * time.Millisecond)
+	// While the report holds, the sent data that is not played yet is counted.
+	if got, want := p.UnplayedSize(), p.BufferedSize()+reportedFrame*bytesPerFrame; got != want {
+		t.Errorf("while the report holds: UnplayedSize() = %d; want %d", got, want)
+	}
+	// Once it is stale, the unplayed amount falls back to the buffered data
+	// instead of keeping the whole sent amount counted.
+	time.Sleep(2 * time.Millisecond)
+	if got, want := p.UnplayedSize(), p.BufferedSize(); got != want {
+		t.Errorf("when the report is stale: UnplayedSize() = %d; want BufferedSize(), %d", got, want)
+	}
+}
+
+func TestUnplayedSizeFollowsANewReport(t *testing.T) {
+	synctest.Test(t, testUnplayedSizeFollowsANewReport)
+}
+
+func testUnplayedSizeFollowsANewReport(t *testing.T) {
+	m := newMux(t)
+	p := newBufferedPlayer(t, m, 4800)
+	readFrames(m, reportedFrame)
+	reportPlayed(m)
+
+	// A newer report advances the played frame past everything sent, so nothing
+	// sent is unplayed any more.
+	m.SetPlayed(reportedFrame+delay, time.Now())
+	if got, want := p.UnplayedSize(), p.BufferedSize(); got != want {
+		t.Fatalf("after the newer report: UnplayedSize() = %d; want BufferedSize(), %d", got, want)
+	}
+	// An older report, as after a driver restart, must be followed anew rather
+	// than the values derived from the newer one being kept.
+	reportPlayed(m)
+	if got, want := p.UnplayedSize(), p.BufferedSize()+delay*bytesPerFrame; got != want {
+		t.Errorf("after the older report: UnplayedSize() = %d; want BufferedSize() and the delay, %d", got, want)
+	}
+}
+
+func TestUnplayedSizeDropsWhatIsSentBeforeSeekAfterPlaying(t *testing.T) {
+	synctest.Test(t, testUnplayedSizeDropsWhatIsSentBeforeSeekAfterPlaying)
+}
+
+func testUnplayedSizeDropsWhatIsSentBeforeSeekAfterPlaying(t *testing.T) {
+	m := newMux(t)
+	p := newBufferedPlayer(t, m, 4800)
+	readFrames(m, reportedFrame)
+	reportPlayed(m)
+	// The sent data that is not played yet is counted before the Seek.
+	if got, want := p.UnplayedSize(), p.BufferedSize()+delay*bytesPerFrame; got != want {
+		t.Fatalf("before Seek: UnplayedSize() = %d; want %d", got, want)
+	}
+	// The Seek discards the data sent before it, so it is no longer counted even
+	// though the old report still stands and the clock has not moved.
+	if _, err := p.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := p.UnplayedSize(), p.BufferedSize(); got != want {
+		t.Errorf("after Seek: UnplayedSize() = %d; want BufferedSize(), %d", got, want)
+	}
+}
+
+func TestUnplayedSizeKeepsWhatIsSentBeforePauseUntilPlayed(t *testing.T) {
+	synctest.Test(t, testUnplayedSizeKeepsWhatIsSentBeforePauseUntilPlayed)
+}
+
+func testUnplayedSizeKeepsWhatIsSentBeforePauseUntilPlayed(t *testing.T) {
+	m := newMux(t)
+	p := newBufferedPlayer(t, m, 4800)
+	readFrames(m, reportedFrame)
+	reportPlayed(m)
+	// Pausing and stopping reading must not discard the data already sent to the
+	// device; it is still unplayed until the device plays it.
+	p.PauseAndStopReading()
+	if got, want := p.UnplayedSize(), p.BufferedSize()+delay*bytesPerFrame; got != want {
+		t.Errorf("right after PauseAndStopReading: UnplayedSize() = %d; want %d", got, want)
+	}
+	time.Sleep(frameTime(delay))
+	if got, want := p.UnplayedSize(), p.BufferedSize(); got != want {
+		t.Errorf("a delay after PauseAndStopReading: UnplayedSize() = %d; want BufferedSize(), %d", got, want)
+	}
+	// Resuming keeps the buffer and the accounting consistent.
+	p.Play()
+	synctest.Wait()
+	if got, want := p.UnplayedSize(), p.BufferedSize(); got != want {
+		t.Errorf("after Play: UnplayedSize() = %d; want BufferedSize(), %d", got, want)
+	}
+}

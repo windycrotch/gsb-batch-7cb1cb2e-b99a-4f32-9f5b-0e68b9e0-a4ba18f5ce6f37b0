@@ -309,6 +309,17 @@ type playerImpl struct {
 	// seeks wait for it to finish.
 	seeking bool
 
+	// seekBuf holds the data at the old source position while a Seek is in
+	// flight: the data buffered before it, and the result of a Read that was in
+	// flight. The data is restored if the Seek fails, and dropped if it succeeds,
+	// so a failed Seek leaves the buffer as it was.
+	seekBuf []byte
+	// seekEof is the end-of-source state before the Seek, restored on failure.
+	seekEof bool
+	// seekSrcErr is a source error met while the Seek was in flight, restored on
+	// failure so that the data before it is still reported after it.
+	seekSrcErr error
+
 	// readCond is signaled when reading or seeking becomes false.
 	readCond *sync.Cond
 
@@ -470,6 +481,12 @@ func (p *playerImpl) pauseAndStopReadingImpl() {
 	// Wait until an ongoing read from the source finishes.
 	// The source must not be read after this returns (#288).
 	p.waitForReadImpl()
+
+	// A Seek can begin while this waits for the read: its beginSeek also waits
+	// for the read, and the two wake up together. Wait for it too, so that a
+	// control never returns while a source Seek is in flight, and the source is
+	// not both read and sought.
+	p.waitForSeekImpl()
 }
 
 // waitForReadImpl waits for an in-flight source Read to finish.
@@ -501,16 +518,28 @@ func (p *playerImpl) Seek(offset int64, whence int) (int64, error) {
 
 	defer p.mux.signal()
 
-	p.prepareSeek()
-	defer p.finishSeek()
+	// The buffered data is set aside while the source Seek is in flight: it is
+	// discarded if the Seek succeeds, and restored if it fails, so a failed Seek
+	// leaves the player and its buffer as they were.
+	p.beginSeek()
+	succeeded := false
+	defer func() {
+		p.endSeek(succeeded)
+	}()
 
 	// A source may block in Seek. Do not hold the player lock needed by the mixer.
-	return s.Seek(offset, whence)
+	pos, err := s.Seek(offset, whence)
+	succeeded = err == nil
+	return pos, err
 }
 
-// prepareSeek discards buffered data and waits for an ongoing Read without
-// changing a playing player's state.
-func (p *playerImpl) prepareSeek() {
+// beginSeek takes the buffered data out of the player and waits for an ongoing
+// Read, without changing the player's state.
+//
+// The data is not thrown away yet: a Seek that fails must leave the player with
+// its buffer and state usable, so the data read before and during the Seek, all
+// at the old position, is kept in seekBuf until endSeek knows the outcome.
+func (p *playerImpl) beginSeek() {
 	p.m.Lock()
 	defer p.m.Unlock()
 
@@ -518,13 +547,50 @@ func (p *playerImpl) prepareSeek() {
 	// Prevent new reads and other seeks, including while waiting for an ongoing read.
 	p.seeking = true
 
-	// Reset the internal buffer.
-	// The result of an ongoing read, if any, is data at the old position and must be discarded.
-	if p.state != playerClosed {
-		p.buf = p.buf[:0]
-		p.readPos = 0
-		p.eof = false
-		p.srcGen++
+	if p.state == playerClosed {
+		p.seekBuf = nil
+		return
+	}
+
+	// Set the buffered data aside, so BufferedSize and UnplayedSize report no
+	// buffered data while seeking.
+	p.seekBuf = append(p.seekBuf[:0], p.buf[p.readPos:]...)
+	p.returnBufferToPool()
+	p.seekEof = p.eof
+	p.seekSrcErr = nil
+	p.eof = false
+	// The result of an ongoing read is data at the old position too. finishSourceRead
+	// adds it to seekBuf instead of the buffer.
+	p.srcGen++
+
+	// Wait until an ongoing read from the source finishes. Otherwise the source
+	// would be sought while it is being read.
+	p.waitForReadImpl()
+}
+
+// endSeek finishes a Seek, discarding the data from the old position on success
+// and restoring it on failure. The player's state is left as it was on failure,
+// so a failed Seek does not change playing, buffering, or the source position.
+func (p *playerImpl) endSeek(succeeded bool) {
+	p.m.Lock()
+	defer p.m.Unlock()
+
+	if p.state == playerClosed {
+		p.seekBuf = nil
+		p.seekEof = false
+		p.seekSrcErr = nil
+		p.seeking = false
+		p.readCond.Broadcast()
+		return
+	}
+
+	if succeeded {
+		// The Seek went through: the data before is from the old position. The
+		// generation was already advanced by beginSeek, so an in-flight read from
+		// before is stale; none can start while seeking.
+		p.seekBuf = nil
+		p.seekEof = false
+		p.seekSrcErr = nil
 		// The data sent before is from the old position.
 		p.sent = p.sent[:0]
 
@@ -534,18 +600,30 @@ func (p *playerImpl) prepareSeek() {
 			p.state = playerPausedAndStopReading
 			p.mux.removePlayer(p)
 		}
-		// Wait until an ongoing read from the source finishes.
-		// Otherwise the source would be sought while it is being read.
-		p.waitForReadImpl()
 
 		// The buffered data is discarded, so a pending source error is reported now.
 		p.reportSourceErrorIfDrainedImpl()
-	}
-}
+	} else {
+		// The Seek failed: put the data back, so the player continues where it
+		// was. It is still the data at the source's current position, and the
+		// spans sent before still count as unplayed with it.
+		if len(p.seekBuf) > 0 {
+			p.buf = p.seekBuf
+			p.readPos = 0
+		}
+		p.eof = p.seekEof
+		if p.srcErr == nil {
+			p.srcErr = p.seekSrcErr
+		}
+		p.seekBuf = nil
+		p.seekEof = false
+		p.seekSrcErr = nil
 
-func (p *playerImpl) finishSeek() {
-	p.m.Lock()
-	defer p.m.Unlock()
+		// The restored data is from the current position, so a source error met
+		// while seeking is reported once that data has been played, or now if no
+		// whole sample is left.
+		p.reportSourceErrorIfDrainedImpl()
+	}
 
 	p.seeking = false
 	p.readCond.Broadcast()
@@ -636,26 +714,22 @@ func (p *playerImpl) UnplayedSize() int {
 	n := p.buffered()
 	played, ok := p.mux.played()
 	if !ok {
-		// What is sent stays, as it may be played once the driver reports again,
-		// as after Resume.
+		// The driver does not report reliably now. What is sent may have been
+		// played long ago, so it must not be counted as unplayed; the buffered
+		// data is the only amount known not to be played.
 		return n
 	}
-	p.dropPlayed(played)
+	// The unplayed amount is derived from the current report alone. The spans are
+	// kept rather than dropped as they are reported played: a later report can be
+	// older or smaller, as after a driver restart, and UnplayedSize must follow
+	// the new report instead of the values derived from the old one.
+	byteLength := p.mux.format.ByteLength()
 	for _, s := range p.sent {
-		n += int(s.end-max(s.start, played)) * p.mux.format.ByteLength()
+		if start := max(s.start, played); start < s.end {
+			n += int(s.end-start) * byteLength
+		}
 	}
 	return n
-}
-
-// dropPlayed drops the spans sent that end by sample played of the mix.
-//
-// When dropPlayed is called, the mutex m must be locked.
-func (p *playerImpl) dropPlayed(played int64) {
-	i := 0
-	for i < len(p.sent) && p.sent[i].end <= played {
-		i++
-	}
-	p.sent = append(p.sent[:0], p.sent[i:]...)
 }
 
 // recordSent records that the player's data went into samples start to end of
@@ -850,8 +924,23 @@ func (p *playerImpl) finishSourceRead(buf *[]byte, gen, n int, err error) int {
 	p.reading = false
 	p.readCond.Broadcast()
 
-	// Close or Seek might be called while reading. In this case, discard the read result.
-	if p.state == playerClosed || p.srcGen != gen {
+	if p.state == playerClosed {
+		return 0
+	}
+
+	// A Seek might be called while reading. The result is then at the old
+	// position: it must not reach the new buffer, but it is kept with the rest of
+	// the old-position data so that a Seek that fails can restore it.
+	if p.srcGen != gen {
+		if p.seeking {
+			p.seekBuf = append(p.seekBuf, (*buf)[:n]...)
+			switch {
+			case err == io.EOF:
+				p.seekEof = true
+			case err != nil:
+				p.seekSrcErr = err
+			}
+		}
 		return 0
 	}
 
