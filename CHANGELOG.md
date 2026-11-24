@@ -1,0 +1,107 @@
+# Changelog
+
+## 0.6.4 - Unreleased
+
+## 0.6.3 - 2026-11-15
+
+**Highlights:** Honor discovery timeouts and fix doctor connection-host parsing.
+
+- Honor the caller timeout for ONVIF device-information requests. Thanks @SebTardif.
+- Normalize doctor connection hosts consistently with capture URLs, including bracketed IPv6 and explicit ports. Thanks @SebTardif.
+- Update compatible Go dependencies and build with Go 1.27.4 while retaining the Go 1.27.0 source minimum.
+
+## 0.6.2 - 2026-10-23
+
+**Highlights:** Fetch ONVIF device information with a fresh timeout and show actionable discovery failures.
+
+- `discover --info` asks for device information with a fresh timeout after discovery finishes, and prints the failure with recovery guidance instead of hiding it. Thanks @SebTardif.
+
+## 0.6.1 - 2026-10-20
+
+**Highlights:** Fix certificate validation vulnerability GO-2026-6809 in release binaries.
+
+- Security: build with Go 1.27.3 to fix certificate validation vulnerability GO-2026-6809.
+- Move macOS CI and release builds to Xcode 27 runners, retaining macOS 14 compatibility and checking Intel binaries under Rosetta; add non-publishing release dry runs.
+- Build with Go 1.27.2 to fix reachable standard-library vulnerabilities while retaining the Go 1.27.0 source minimum; use a compatible golangci-lint release.
+
+## 0.6.0 - 2026-09-30
+
+**Highlights:** Linux camera discovery, flexible device selection, and PTZ through standard V4L2 absolute controls.
+
+- Add Linux V4L2 capture-device discovery, selection by node index or unambiguous name, default snapshots, and stable-path PTZ selection. Thanks @steipete (#20).
+- Add Linux PTZ through standard V4L2 absolute pan, tilt, and zoom controls. Physical motion is not yet hardware-verified; please report camera models, control support, and motion results.
+- Honor the full PTZ verification timeout when a camera repeats an intermediate position before reaching its target.
+- Use arrival timestamps for Linux V4L2 capture so stale relay timestamps do not break snapshot warmup or clip duration.
+- Build macOS release binaries for macOS 14 and later instead of inheriting the build runner's newer OS minimum.
+- Report the release version from published Docker images instead of `dev`, and verify it during release.
+- Update the native RTSP backend's Pion RTCP and transport dependencies.
+
+Verify downloaded archives against `checksums.txt`.
+
+## 0.5.2 - 2026-09-23
+
+- Fix CI code signing by loading the Apple Developer ID G2 intermediate and temporary signing keychain, enabling signed and notarized macOS releases.
+
+## 0.5.1 - 2026-09-22
+
+**Highlights:** Fix native RTSP snapshots, preserve fractional clip durations, and repair motion event output and action cleanup.
+
+- Fix native RTSP snapshots for cameras that supply H.264 decoding parameters in the session description, and discard undecodable video before the first keyframe.
+- Preserve fractional clip durations instead of rounding to whole seconds or producing empty subsecond recordings.
+- Emit valid motion JSON lines with escaped camera names and render action templates once per event.
+- Preserve the parent environment for motion actions, reap completed actions, and honor watch cancellation.
+- Stop ffmpeg when its log reader fails instead of leaving motion monitoring hung.
+- Use Go 1.27.1 for preferred source, CI, and container builds while retaining the Go 1.27.0 source minimum.
+
+## 0.5.0 - 2026-08-31
+- Add native single-session PTZ pan sweeps with verified frames, requested-versus-observed JSON manifests, and optional fail-fast handling.
+- Fix ONVIF discovery suggestions using the service port as the RTSP host, and support bare and scoped IPv6 camera hosts while preserving custom RTSP paths. Thanks @twidtwid (#15).
+- Refresh Go dependencies, switch YAML v3 to its maintained module, and update the Go build baseline to 1.27 and setup-go to v7.
+
+## 0.4.1 - 2026-08-24
+- Fix `ptz goto`, `move`, and `home` reporting success for movements the camera never performed.
+- Keep UVC PTZ cameras streaming during control and verify settled positions through a fresh control connection.
+- Add `--settle` and `--timeout` to the PTZ motion commands; `ptz` now requires macOS Camera permission.
+- Constrain the Objective-C bridges to darwin cgo builds and move darwin-only UVC constants into the cgo implementation, fixing Linux lint.
+
+## 0.4.0 - 2026-08-06
+- Add pan, tilt, zoom, status, and home controls for UVC USB cameras on macOS.
+- Rewrite the README around installation, first capture, and focused camera setup guides.
+
+## 0.3.0 - 2026-08-02
+- Show native webcam indices in the `devices` table alongside stable IDs, names, and default status.
+- Validate native webcam selectors before requesting macOS Camera permission.
+- Match native webcam names case-insensitively and report available or ambiguous matches.
+- Use the default native macOS webcam when `snap` is run without a camera or device.
+- Sort ffmpeg AVFoundation device indices numerically.
+- Fix native-to-ffmpeg snapshot fallback selecting the wrong camera when backend device orders differ.
+- Add native AVFoundation snapshots, device enumeration, and Camera permission handling to cgo-enabled macOS builds, plus plist-embedded and signed Darwin release artifacts.
+- Add first-class local webcam capture through macOS AVFoundation and Linux v4l2, including device enumeration, warm snapshot capture, video-only clips, motion watch, doctor probes, and TCC-aware errors.
+- Fix capture commands ignoring per-camera defaults when their flags had non-empty application defaults (PR #9).
+- Redact RTSP credentials from ffmpeg failures, restore private camera-config permissions on rewrite, and safely finalize gortsplib frame buffers.
+- Migrate the gortsplib RTSP backend to the maintained v5 release, adopt Go 1.26, and refresh runtime dependencies.
+
+## 0.2.2
+- Homebrew: install target-specific release binaries on macOS and Linux.
+
+## 0.2.1
+- Add Docker support with multi-arch GHCR publishing.
+- Add GoReleaser-based release automation for GitHub releases, Homebrew tap updates, and linux/arm64 artifacts.
+- Fix custom RTSP paths like `/av_stream/ch0` being duplicated when used by snap/clip/watch.
+- Update Go dependencies and move the source build baseline to Go 1.25.
+- Refresh release docs for Homebrew install verification, arm64 artifacts, and tap updates.
+
+## 0.2.0
+- Fix custom RTSP paths like `/av_stream/ch0` being duplicated when used by snap/clip/watch.
+- Add explicit `path` support to store tokenized RTSP URLs (e.g., UniFi Protect) and wire it through add/snap/clip/watch.
+- Preserve legacy stream handling while allowing custom paths and per-camera defaults.
+- Document Protect setup and path usage; expanded README examples.
+
+## 0.1.0
+- Initial CLI: add/list cameras; snap; clip; motion watch; discover; doctor.
+- Per-camera defaults for RTSP transport, stream, client, audio handling.
+- Positional camera names; temp output when `--out` omitted.
+- RTSP helper and config persistence with tests.
+- gortsplib fallback client and Tapo-friendly UDP/stream controls.
+- Colorized TTY output; lint/test Makefile; updated dependencies.
+- Config now uses XDG path `~/.config/camsnap/config.yaml`.

@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.4"
+          cache: true
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.15.0
+          args: --timeout=5m
+
+      - name: Test
+        run: go test ./...
+
+  lint-and-test-macos:
+    runs-on: xcode-27
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.4"
+          cache: true
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Lint with cgo
+        uses: golangci/golangci-lint-action@v9
+        env:
+          CGO_ENABLED: "1"
+        with:
+          version: v2.15.0
+          args: --timeout=5m
+
+      - name: Test with cgo
+        env:
+          CGO_ENABLED: "1"
+        run: make test
+
+      - name: Verify macOS deployment targets
+        run: |
+          arch -x86_64 /usr/bin/true || sudo softwareupdate --install-rosetta --agree-to-license
+          arch -x86_64 /usr/bin/true
+          for arch in amd64 arm64; do
+            CGO_ENABLED=1 GOARCH="$arch" make build
+            minos=$(otool -l camsnap | awk '/LC_BUILD_VERSION/ { load = 1 } load && /minos/ { print $2; load = 0 }')
+            if [ "$minos" != "$MACOSX_DEPLOYMENT_TARGET" ]; then
+              echo "::error::$arch binary requires macOS $minos; expected $MACOSX_DEPLOYMENT_TARGET"
+              exit 1
+            fi
+            if [ "$arch" = amd64 ]; then
+              arch -x86_64 ./camsnap --version
+            else
+              ./camsnap --version
+            fi
+          done

@@ -1,0 +1,186 @@
+package cli
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	osexec "os/exec"
+	gort "runtime"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/spf13/cobra"
+	"github.com/steipete/camsnap/internal/capture"
+	mediaexec "github.com/steipete/camsnap/internal/exec"
+)
+
+func newWatchCmd() *cobra.Command {
+	var cameraName string
+	var action string
+	var threshold float64
+	var cooldown time.Duration
+	var runtime time.Duration
+	var jsonOutput bool
+	var tmpl string
+	var authMode string
+	var transport string
+	var stream string
+	var path string
+	var device string
+	var framerate int
+	var videoSize string
+	var localBackend string
+
+	cmd := &cobra.Command{
+		Use:   "watch",
+		Short: "Run motion detection and execute an action",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if action == "" {
+				return fmt.Errorf("--action is required (e.g., \"say motion\" or \"touch /tmp/motion\")")
+			}
+			if threshold <= 0 || threshold >= 1 {
+				return fmt.Errorf("--threshold must be between 0 and 1 (e.g., 0.2)")
+			}
+			cam, selectedName, err := selectCaptureCamera(cmd, args, cameraName, device)
+			if err != nil {
+				return err
+			}
+			cameraName = selectedName
+			options, err := resolveCaptureOptions(cam, (captureFlagValues{
+				transport:    transport,
+				stream:       stream,
+				path:         path,
+				rtspAuth:     authMode,
+				device:       device,
+				framerate:    framerate,
+				videoSize:    videoSize,
+				localBackend: localBackend,
+			}).overrides(cmd))
+			if err != nil {
+				return err
+			}
+			if options.Kind == capture.KindRTSP {
+				if _, ok := parseRTSPAuth(authMode); !ok {
+					return fmt.Errorf("invalid --rtsp-auth (use auto|basic|digest)")
+				}
+			}
+			if !mediaexec.HasBinary("ffmpeg") {
+				return fmt.Errorf("ffmpeg not found in PATH")
+			}
+			ctx := cmd.Context()
+			if runtime > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, runtime)
+				defer cancel()
+			}
+
+			onLine := motionLineHandler(ctx, cameraName, cooldown, action, tmpl, jsonOutput, cmd)
+			if options.Kind == capture.KindLocal {
+				return runLocalCapture(ctx, localCaptureRequest{operation: localWatch, options: options, threshold: threshold, onLine: onLine, notice: cmd.PrintErrln})
+			}
+			ffArgs, err := capture.WatchArgs(options, threshold, gort.GOOS)
+			if err != nil {
+				return err
+			}
+			return watchMotion(ctx, ffArgs, onLine)
+		},
+	}
+
+	cmd.Flags().StringVar(&cameraName, "camera", "", "Camera name to monitor")
+	cmd.Flags().StringVar(&action, "action", "", "Command to execute when motion detected")
+	cmd.Flags().Float64Var(&threshold, "threshold", 0.2, "Scene change threshold (0-1, higher = less sensitive)")
+	cmd.Flags().DurationVar(&cooldown, "cooldown", 5*time.Second, "Cooldown between triggering actions")
+	cmd.Flags().DurationVar(&runtime, "duration", 0, "Optional max runtime (0 = until interrupted)")
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "Log motion events as JSON lines")
+	cmd.Flags().StringVar(&tmpl, "action-template", "", "Optional template to build action command (placeholders: {camera},{score},{time})")
+	cmd.Flags().StringVar(&authMode, "rtsp-auth", "auto", "RTSP auth mode: auto|basic|digest")
+	cmd.Flags().StringVar(&transport, "rtsp-transport", "tcp", "RTSP transport: tcp|udp")
+	cmd.Flags().StringVar(&stream, "stream", "", "RTSP path segment (stream1 or stream2); ignored if --path is set")
+	cmd.Flags().StringVar(&path, "path", "", "Custom RTSP path (overrides --stream), e.g., /Bfy... from UniFi Protect")
+	cmd.Flags().StringVar(&device, "device", "", "Local video device index, name, or /dev/videoN path")
+	cmd.Flags().IntVar(&framerate, "framerate", 30, "Local capture framerate")
+	cmd.Flags().StringVar(&videoSize, "video-size", "", "Local capture size (e.g., 1280x720)")
+	cmd.Flags().StringVar(&localBackend, "local-backend", "", "Local snapshot backend (native|ffmpeg; watch always uses ffmpeg)")
+
+	return cmd
+}
+
+func watchMotion(ctx context.Context, ffArgs []string, onLine func(string)) error {
+	logTail, exitErr, err := mediaexec.RunFFmpegWithStderrLines(ctx, ffArgs, onLine)
+	if err != nil {
+		return err
+	}
+	if exitErr != nil && ctx.Err() == nil {
+		class := mediaexec.ClassifyError(logTail)
+		return fmt.Errorf("ffmpeg exited: %w (%s)", exitErr, class)
+	}
+	return nil
+}
+
+func motionLineHandler(ctx context.Context, cameraName string, cooldown time.Duration, action string, tmpl string, jsonOutput bool, cmd *cobra.Command) func(string) {
+	lastTrigger := time.Time{}
+	return func(line string) {
+		if score, ok := parseSceneScore(line); ok {
+			now := time.Now()
+			if lastTrigger.IsZero() || now.Sub(lastTrigger) >= cooldown {
+				lastTrigger = now
+				act := action
+				if tmpl != "" {
+					act = applyTemplate(tmpl, cameraName, score, now)
+				}
+				if jsonOutput {
+					cameraJSON, _ := json.Marshal(cameraName)
+					cmd.Printf("{\"event\":\"motion\",\"camera\":%s,\"score\":%.3f,\"time\":\"%s\"}\n", cameraJSON, score, now.Format(time.RFC3339Nano))
+				} else {
+					cmd.Printf("event=motion camera=%s score=%.3f action=%q time=%s\n", cameraName, score, act, now.Format(time.RFC3339Nano))
+				}
+				if err := runAction(ctx, act, score, now, cameraName); err != nil && ctx.Err() == nil {
+					cmd.PrintErrf("start motion action: %v\n", err)
+				}
+			}
+		}
+	}
+}
+
+func parseSceneScore(line string) (float64, bool) {
+	idx := strings.Index(line, "scene_score=")
+	if idx < 0 || idx+12 >= len(line) {
+		return 0, false
+	}
+	part := line[idx+12:]
+	for i, r := range part {
+		if r != '.' && r != '-' && (r < '0' || r > '9') {
+			part = part[:i]
+			break
+		}
+	}
+	val, err := strconv.ParseFloat(part, 64)
+	if err != nil {
+		return 0, false
+	}
+	return val, true
+}
+
+func runAction(ctx context.Context, action string, score float64, t time.Time, camera string) error {
+	cmd := osexec.CommandContext(ctx, "sh", "-c", action)
+	cmd.Env = append(os.Environ(),
+		"CAMSNAP_SCORE="+fmt.Sprintf("%.3f", score),
+		"CAMSNAP_TIME="+t.Format(time.RFC3339Nano),
+		"CAMSNAP_CAMERA="+camera,
+	)
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	go func() { _ = cmd.Wait() }()
+	return nil
+}
+
+func applyTemplate(tmpl, camera string, score float64, t time.Time) string {
+	return strings.NewReplacer(
+		"{camera}", camera,
+		"{score}", fmt.Sprintf("%.3f", score),
+		"{time}", t.Format(time.RFC3339Nano),
+	).Replace(tmpl)
+}

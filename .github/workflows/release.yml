@@ -1,0 +1,371 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build archives without publishing, updating the tap, or pushing images"
+        type: boolean
+        default: true
+      tag:
+        description: "Tag to (re)release (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  RELEASE_INPUT_TAG: ${{ inputs.tag }}
+  PUBLISH_RELEASE: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && !inputs.dry_run) }}
+
+jobs:
+  goreleaser:
+    runs-on: xcode-27
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.4"
+          cache: true
+
+      - name: Check existing release assets
+        id: existing-release
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="$RELEASE_INPUT_TAG"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid release tag: $tag"
+            exit 1
+          fi
+          version="${tag#v}"
+
+          release_json=""
+          for attempt in {1..6}; do
+            if release_json=$(gh api \
+              "repos/${GITHUB_REPOSITORY}/releases/tags/$tag" 2>&1); then
+              break
+            fi
+            if grep -Fq "(HTTP 404)" <<< "$release_json"; then
+              echo "complete=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [ "$attempt" -eq 6 ]; then
+              echo "::error::Could not inspect existing release $tag"
+              printf '%s\n' "$release_json" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+
+          if ! jq -e '.draft == false and .published_at != null' <<< "$release_json" >/dev/null; then
+            echo "::error::Existing release $tag is not published"
+            exit 1
+          fi
+
+          assets=$(jq -r '
+            .assets[]
+            | select(.state == "uploaded" and (.size // 0) > 0)
+            | .name
+          ' <<< "$release_json")
+
+          expected=(
+            "camsnap_${version}_darwin_amd64.tar.gz"
+            "camsnap_${version}_darwin_arm64.tar.gz"
+            "camsnap_${version}_linux_amd64.tar.gz"
+            "camsnap_${version}_linux_arm64.tar.gz"
+            "camsnap_${version}_windows_amd64.zip"
+            "camsnap_${version}_windows_arm64.zip"
+            "checksums.txt"
+          )
+          missing=()
+          for asset in "${expected[@]}"; do
+            if ! grep -Fxq "$asset" <<< "$assets"; then
+              missing+=("$asset")
+            fi
+          done
+
+          if [ "${#missing[@]}" -ne 0 ]; then
+            for asset in "${missing[@]}"; do
+              echo "::error::Existing release $tag is missing asset: $asset"
+            done
+            exit 1
+          fi
+
+          echo "complete=true" >> "$GITHUB_OUTPUT"
+
+      - name: Stash GoReleaser config
+        run: cp .goreleaser.yaml /tmp/.goreleaser.yaml
+
+      - name: Checkout release tag
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.dry_run }}
+        run: git checkout "$RELEASE_INPUT_TAG"
+
+      - name: Check signing and notarization credentials
+        if: env.PUBLISH_RELEASE == 'true'
+        id: release-credentials
+        env:
+          MACOS_SIGN_P12_BASE64: ${{ secrets.MACOS_SIGN_P12_BASE64 }}
+          MACOS_SIGN_P12_PASSWORD: ${{ secrets.MACOS_SIGN_P12_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY_P8: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}
+        run: |
+          signing=false
+          notarization=false
+
+          signing_values=0
+          [ -n "$MACOS_SIGN_P12_BASE64" ] && signing_values=$((signing_values + 1))
+          [ -n "$MACOS_SIGN_P12_PASSWORD" ] && signing_values=$((signing_values + 1))
+          [ -n "$MACOS_SIGN_IDENTITY" ] && signing_values=$((signing_values + 1))
+          if [ "$signing_values" -eq 3 ]; then
+            signing=true
+          elif [ "$signing_values" -ne 0 ]; then
+            echo "::error::Set all three macOS signing secrets together"
+            exit 1
+          fi
+
+          notarization_values=0
+          [ -n "$APP_STORE_CONNECT_KEY_ID" ] && notarization_values=$((notarization_values + 1))
+          [ -n "$APP_STORE_CONNECT_ISSUER_ID" ] && notarization_values=$((notarization_values + 1))
+          [ -n "$APP_STORE_CONNECT_API_KEY_P8" ] && notarization_values=$((notarization_values + 1))
+          if [ "$notarization_values" -eq 3 ]; then
+            if [ "$signing" != true ]; then
+              echo "::error::Notarization requires the macOS signing secrets"
+              exit 1
+            fi
+            notarization=true
+          elif [ "$notarization_values" -ne 0 ]; then
+            echo "::error::Set all three notarization secrets together"
+            exit 1
+          fi
+
+          echo "signing=$signing" >> "$GITHUB_OUTPUT"
+          echo "notarization=$notarization" >> "$GITHUB_OUTPUT"
+
+      - name: GoReleaser
+        if: ${{ env.PUBLISH_RELEASE == 'true' && steps.existing-release.outputs.complete != 'true' }}
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: latest
+          # Signing hooks temporarily change the shared user keychain search list.
+          args: release --clean --parallelism 1 --config /tmp/.goreleaser.yaml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MACOS_SIGN_P12_BASE64: ${{ secrets.MACOS_SIGN_P12_BASE64 }}
+          MACOS_SIGN_P12_PASSWORD: ${{ secrets.MACOS_SIGN_P12_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          # Consumed by scripts/sign-darwin.sh in the goreleaser post-build
+          # hook, so notarization completes before any artifact is published.
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY_P8: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}
+
+      - name: Build dry-run archives
+        if: env.PUBLISH_RELEASE != 'true'
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: latest
+          args: release --clean --snapshot --parallelism 1 --config /tmp/.goreleaser.yaml
+
+      - name: Upload dry-run archives
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: dry-run-archives
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt
+          if-no-files-found: error
+          retention-days: 3
+
+  update-homebrew-tap:
+    if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && !inputs.dry_run) }}
+    runs-on: ubuntu-latest
+    needs: goreleaser
+    steps:
+      - name: Resolve release tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [[ ! "$RELEASE_INPUT_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Invalid release tag: $RELEASE_INPUT_TAG"
+              exit 1
+            fi
+            echo "RELEASE_TAG=$RELEASE_INPUT_TAG" >> "$GITHUB_ENV"
+          else
+            echo "RELEASE_TAG=${{ github.ref_name }}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Dispatch tap formula update
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Set HOMEBREW_TAP_TOKEN with workflow access to steipete/homebrew-tap"
+            exit 1
+          fi
+
+          request_id="camsnap-${RELEASE_TAG}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          expected_title="Update camsnap for ${RELEASE_TAG} (${request_id})"
+
+          gh workflow run update-formula.yml \
+            --repo steipete/homebrew-tap \
+            --ref main \
+            -f formula=camsnap \
+            -f tag="$RELEASE_TAG" \
+            -f repository=steipete/camsnap \
+            -f artifact_template="{formula}_{version}_{target}.tar.gz" \
+            -f request_id="$request_id"
+
+          run_id=""
+          for _ in {1..30}; do
+            run_id=$(gh run list \
+              --repo steipete/homebrew-tap \
+              --workflow update-formula.yml \
+              --branch main \
+              --event workflow_dispatch \
+              --limit 20 \
+              --json databaseId,displayTitle \
+              --jq ".[] | select(.displayTitle == \"$expected_title\") | .databaseId" | head -n1)
+            if [ -n "$run_id" ]; then
+              break
+            fi
+            sleep 5
+          done
+
+          if [ -z "$run_id" ]; then
+            echo "::error::Could not find tap workflow run with title: $expected_title"
+            exit 1
+          fi
+
+          api_failures=0
+          while true; do
+            if ! run_result=$(gh api \
+              "repos/steipete/homebrew-tap/actions/runs/$run_id" \
+              --jq '.status + "\t" + (.conclusion // "")' 2>&1); then
+              api_failures=$((api_failures + 1))
+              if [ "$api_failures" -ge 6 ]; then
+                echo "::error::Could not read tap workflow run $run_id after $api_failures attempts"
+                printf '%s\n' "$run_result" >&2
+                exit 1
+              fi
+
+              sleep 10
+              continue
+            fi
+            api_failures=0
+
+            case "$run_result" in
+              completed$'\t'success)
+                exit 0
+                ;;
+              completed$'\t'*)
+                echo "::error::Tap workflow run $run_id finished with: ${run_result#*$'\t'}"
+                exit 1
+                ;;
+            esac
+
+            sleep 10
+          done
+
+  docker:
+    if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && !inputs.dry_run) }}
+    runs-on: ubuntu-latest
+    needs: goreleaser
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Checkout release tag
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          if [[ ! "$RELEASE_INPUT_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid release tag: $RELEASE_INPUT_TAG"
+            exit 1
+          fi
+          git checkout "$RELEASE_INPUT_TAG"
+
+      - name: Resolve Docker tags
+        id: docker-tags
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            release_tag="$RELEASE_INPUT_TAG"
+          else
+            release_tag="${{ github.ref_name }}"
+          fi
+          version="${release_tag#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          minor="${version%.*}"
+          major="${version%%.*}"
+
+          {
+            echo "tags<<EOF"
+            echo "${IMAGE}:${version}"
+            echo "${IMAGE}:${minor}"
+            if [ "$major" != "0" ]; then
+              echo "${IMAGE}:${major}"
+            fi
+            echo "${IMAGE}:latest"
+            echo "EOF"
+            echo "labels<<EOF"
+            echo "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}"
+            echo "org.opencontainers.image.version=${version}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: VERSION=${{ steps.docker-tags.outputs.version }}
+          tags: ${{ steps.docker-tags.outputs.tags }}
+          labels: ${{ steps.docker-tags.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify published image version
+        env:
+          EXPECTED_VERSION: ${{ steps.docker-tags.outputs.version }}
+        run: |
+          actual=$(docker run --rm "${IMAGE}:${EXPECTED_VERSION}" --version)
+          if [ "$actual" != "$EXPECTED_VERSION" ]; then
+            echo "::error::Container version '$actual' does not match release '$EXPECTED_VERSION'"
+            exit 1
+          fi
