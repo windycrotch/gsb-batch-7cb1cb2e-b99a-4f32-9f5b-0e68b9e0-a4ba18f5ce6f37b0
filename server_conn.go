@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/bluenviron/gortmplib/pkg/amf0"
 	"github.com/bluenviron/gortmplib/pkg/bytecounter"
@@ -137,14 +138,31 @@ type ServerConn struct {
 	mrw            *message.ReadWriter
 	actionCommand  *message.CommandAMF0
 	actionAccepted bool
+
+	// initMu serializes Initialize calls on this connection. A second,
+	// concurrent initialization gets ErrHandshakeInProgress instead of
+	// interleaving two handshakes on RW.
+	initMu sync.Mutex
 }
 
 // Initialize initializes ServerConn.
 func (c *ServerConn) Initialize() error {
+	if !c.initMu.TryLock() {
+		return fmt.Errorf("ServerConn.Initialize: %w", handshake.ErrHandshakeInProgress)
+	}
+	defer c.initMu.Unlock()
+
+	// Clear read/write state left by any previous attempt. A failed
+	// handshake must not leave a stale message ReadWriter or key material
+	// that could make the connection look established/encrypted.
+	c.bc = nil
+	c.mrw = nil
+
 	c.bc = bytecounter.NewReadWriter(c.RW)
 
 	keyIn, keyOut, err := handshake.DoServer(c.bc, false)
 	if err != nil {
+		c.mrw = nil
 		return err
 	}
 
@@ -152,6 +170,7 @@ func (c *ServerConn) Initialize() error {
 	if keyIn != nil {
 		rw, err = rc4rw.New(c.bc, keyIn, keyOut)
 		if err != nil {
+			c.mrw = nil
 			return err
 		}
 	} else {

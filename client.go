@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/google/uuid"
 
@@ -180,10 +181,20 @@ type Client struct {
 	authState     int
 	authSalt      string
 	authChallenge string
+
+	// initMu rejects concurrent Initialize calls with
+	// ErrHandshakeInProgress instead of running/dialing two handshakes on
+	// the same Client.
+	initMu sync.Mutex
 }
 
 // Initialize initializes Client.
 func (c *Client) Initialize(ctx context.Context) error {
+	if !c.initMu.TryLock() {
+		return fmt.Errorf("Client.Initialize: %w", handshake.ErrHandshakeInProgress)
+	}
+	defer c.initMu.Unlock()
+
 	if c.DialContext == nil {
 		c.DialContext = (&net.Dialer{}).DialContext
 	}
