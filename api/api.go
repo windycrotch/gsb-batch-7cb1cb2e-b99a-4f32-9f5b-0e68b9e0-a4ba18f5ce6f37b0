@@ -21,6 +21,7 @@ import (
 	"github.com/onitake/restreamer/auth"
 	"github.com/onitake/restreamer/metrics"
 	"net/http"
+	"strings"
 )
 
 // connectChecker represents a type that can report its "connected" status.
@@ -294,18 +295,42 @@ func (api *streamControlApi) ServeHTTP(writer http.ResponseWriter, request *http
 	}
 
 	query := request.URL.Query()
-	if len(query["offline"]) > 0 {
-		api.inhibit.SetInhibit(true)
-		writer.WriteHeader(http.StatusAccepted)
-		if _, err := writer.Write([]byte("202 accepted")); err != nil {
-			logger.Logkv(
-				"event", eventApiError,
-				"error", errorApiWrite,
-				"message", err.Error(),
-			)
+	// flag interprets a control parameter: present-without-value ("?offline")
+	// is true; explicit 0/false/no/off is false; other present values are true.
+	flag := func(key string) (value bool, present bool) {
+		list, ok := query[key]
+		if !ok || len(list) == 0 {
+			return false, false
 		}
-	} else if len(query["online"]) > 0 {
-		api.inhibit.SetInhibit(false)
+		switch strings.ToLower(strings.TrimSpace(list[0])) {
+		case "0", "false", "no", "off":
+			return false, true
+		default: // includes the empty (bare parameter) case
+			return true, true
+		}
+	}
+	offline, offlinePresent := flag("offline")
+	online, onlinePresent := flag("online")
+
+	// Presence of "offline" takes precedence when both are supplied,
+	// matching the historical behaviour. Explicit falsy values are honoured.
+	var inhibit bool
+	var action bool
+	switch {
+	case offlinePresent && offline:
+		inhibit, action = true, true
+	case onlinePresent && online:
+		inhibit, action = false, true
+	case offlinePresent:
+		// e.g. offline=false
+		inhibit, action = false, true
+	case onlinePresent:
+		// e.g. online=false
+		inhibit, action = true, true
+	}
+
+	if action {
+		api.inhibit.SetInhibit(inhibit)
 		writer.WriteHeader(http.StatusAccepted)
 		if _, err := writer.Write([]byte("202 accepted")); err != nil {
 			logger.Logkv(

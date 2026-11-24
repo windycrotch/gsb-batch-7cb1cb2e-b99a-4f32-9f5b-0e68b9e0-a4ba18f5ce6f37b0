@@ -576,15 +576,11 @@ func (client *Client) pull(url *url.URL) error {
 						"url", url.String(),
 					)
 					queue = make(chan protocol.MpegTsPacket, client.queueSize)
-					go func() {
-						if err := client.streamer.Stream(queue); err != nil {
-							logger.Logkv(
-								"event", eventClientError,
-								"error", errorClientStream,
-								"message", err.Error(),
-							)
-						}
-					}()
+					// Acquire the Stream epoch synchronously, waiting for a
+					// previous epoch to fully stop if the source reconnected
+					// quickly. This avoids ErrAlreadyRunning leaving the new
+					// queue without a consumer.
+					client.streamer.spawnStream(queue)
 				}
 
 				// report the packet
@@ -615,6 +611,10 @@ func (client *Client) pull(url *url.URL) error {
 			"message", fmt.Sprintf("Killing queue on %s", url),
 		)
 		close(queue)
+		// Wait until the distributor epoch has fully converged before
+		// letting loop() reconnect. Together with spawnStream this makes
+		// fast upstream loss/reconnect cycles deterministic.
+		client.streamer.WaitStreamStopped()
 		client.stats.SourceDisconnected()
 		metricSourceConnected.With(prometheus.Labels{"stream": client.name, "url": url.String()}).Set(0.0)
 		logger.Logkv(

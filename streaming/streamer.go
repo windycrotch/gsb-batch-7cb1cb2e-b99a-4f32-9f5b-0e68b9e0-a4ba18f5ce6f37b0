@@ -151,6 +151,17 @@ type Streamer struct {
 	// incoming connections are allowed.
 	// If false, incoming connections are blocked.
 	running util.AtomicBool
+	// inhibited is the persistent offline/online desired state. It survives
+	// Stream epoch restarts (upstream reconnects), so a stream that was taken
+	// offline does not silently come back when the source reconnects.
+	inhibited util.AtomicBool
+	// epochMu serializes Stream epoch transitions and guards epochDone/active.
+	epochMu sync.Mutex
+	// active is true while a Stream epoch owns the request/pool loop.
+	active bool
+	// epochDone is closed when the active Stream epoch has fully stopped.
+	// It is nil when no epoch is active.
+	epochDone chan struct{}
 	// stats is the statistics collector for this stream
 	stats metrics.Collector
 	// request is an unbuffered queue for requests to add or remove a connection
@@ -211,16 +222,86 @@ func (streamer *Streamer) SetPreamble(preamble []byte) {
 	streamer.preamble = preamble
 }
 
+// SetInhibit switches the stream between offline (inhibit=true) and online
+// (inhibit=false).
+//
+// The desired state is recorded atomically before the command is enqueued, so
+// it is never lost while the command eater is active or across Stream epochs.
+// The unbuffered send synchronizes with the command loop: once it returns, the
+// command has been received, and any subsequently enqueued connection request
+// is processed after it. Repeated calls with the same value are idempotent.
 func (streamer *Streamer) SetInhibit(inhibit bool) {
 	if inhibit {
+		util.StoreBool(&streamer.inhibited, true)
 		streamer.request <- &ConnectionRequest{
 			Command: StreamerCommandInhibit,
 		}
 	} else {
+		util.StoreBool(&streamer.inhibited, false)
 		streamer.request <- &ConnectionRequest{
 			Command: StreamerCommandAllow,
 		}
 	}
+}
+
+// IsInhibited reports whether the stream is currently marked offline.
+func (streamer *Streamer) IsInhibited() bool {
+	return util.LoadBool(&streamer.inhibited)
+}
+
+// acquireEpoch reserves the single Stream processing epoch.
+// It returns ErrAlreadyRunning if another epoch is still active.
+func (streamer *Streamer) acquireEpoch() (chan struct{}, error) {
+	streamer.epochMu.Lock()
+	defer streamer.epochMu.Unlock()
+	if streamer.active {
+		return nil, ErrAlreadyRunning
+	}
+	streamer.active = true
+	util.StoreBool(&streamer.running, true)
+	done := make(chan struct{})
+	streamer.epochDone = done
+	return done, nil
+}
+
+// releaseEpoch marks the epoch stopped and wakes WaitStreamStopped callers.
+func (streamer *Streamer) releaseEpoch(done chan struct{}) {
+	streamer.epochMu.Lock()
+	if streamer.epochDone == done {
+		streamer.active = false
+		streamer.epochDone = nil
+		close(done)
+	}
+	streamer.epochMu.Unlock()
+	util.StoreBool(&streamer.running, false)
+}
+
+// WaitStreamStopped blocks until the currently active Stream epoch has fully
+// terminated. It returns immediately when no epoch is active.
+func (streamer *Streamer) WaitStreamStopped() {
+	streamer.epochMu.Lock()
+	done := streamer.epochDone
+	streamer.epochMu.Unlock()
+	if done != nil {
+		<-done
+	}
+}
+
+// spawnStream starts a Stream epoch for queue in a background goroutine.
+// If a previous epoch is still shutting down, it waits for convergence first,
+// which closes the upstream-reconnect race where a fresh queue hits
+// ErrAlreadyRunning and never gets consumed.
+func (streamer *Streamer) spawnStream(queue <-chan protocol.MpegTsPacket) {
+	var done chan struct{}
+	for {
+		var err error
+		done, err = streamer.acquireEpoch()
+		if err == nil {
+			break
+		}
+		streamer.WaitStreamStopped()
+	}
+	go streamer.runStream(queue, done)
 }
 
 // eatCommands is started in the background to drain the command
@@ -263,15 +344,21 @@ func (streamer *Streamer) eatCommands() {
 //
 // go streamer.Stream(queue)
 func (streamer *Streamer) Stream(queue <-chan protocol.MpegTsPacket) error {
-	// interlock and check for availability first
-	if !util.CompareAndSwapBool(&streamer.running, false, true) {
-		return ErrAlreadyRunning
+	done, err := streamer.acquireEpoch()
+	if err != nil {
+		// interlock and check for availability first
+		return err
 	}
+	streamer.runStream(queue, done)
+	return nil
+}
+
+// runStream is the actual Stream loop, bound to one acquired epoch.
+func (streamer *Streamer) runStream(queue <-chan protocol.MpegTsPacket, epochDone chan struct{}) {
+	defer streamer.releaseEpoch(epochDone)
 
 	// create the local outgoing connection pool
 	pool := make(map[*Connection]bool)
-	// prevent new connections if this is true
-	inhibit := false
 
 	// stop the eater process
 	streamer.request <- &ConnectionRequest{
@@ -321,23 +408,27 @@ func (streamer *Streamer) Stream(queue <-chan protocol.MpegTsPacket) error {
 			} else {
 				// channel closed, exit
 				running = false
-				// and stop everything
-				util.StoreBool(&streamer.running, false)
 			}
 		case request := <-streamer.request:
 			switch request.Command {
 			case StreamerCommandRemove:
-				logger.Logkv(
-					"event", eventStreamerClientRemove,
-					"message", fmt.Sprintf("Removing client %s from pool", request.Address),
-				)
-				if !request.Connection.Closed {
-					close(request.Connection.Queue)
+				if request.Connection != nil {
+					logger.Logkv(
+						"event", eventStreamerClientRemove,
+						"message", fmt.Sprintf("Removing client %s from pool", request.Address),
+					)
+					// Remove ownership from the pool first, then close the
+					// queue exactly once. This makes a late Remove racing an
+					// offline kick a harmless no-op instead of a double close.
+					delete(pool, request.Connection)
+					request.Connection.CloseQueue()
 				}
-				delete(pool, request.Connection)
 			case StreamerCommandAdd:
-				// check if the connection can be accepted
-				if !inhibit && streamer.broker.Accept(request.Address, streamer) {
+				// check if the connection can be accepted. The offline flag is
+				// the persistent desired state and may have been set before
+				// this epoch started.
+				inhibited := util.LoadBool(&streamer.inhibited)
+				if !inhibited && (streamer.broker == nil || streamer.broker.Accept(request.Address, streamer)) {
 					logger.Logkv(
 						"event", eventStreamerClientAdd,
 						"remote", request.Address,
@@ -359,19 +450,22 @@ func (streamer *Streamer) Stream(queue <-chan protocol.MpegTsPacket) error {
 					"event", eventStreamerInhibit,
 					"message", fmt.Sprintf("Turning stream offline"),
 				)
-				inhibit = true
-				// close all downstream connections
+				util.StoreBool(&streamer.inhibited, true)
+				// Kick and evict all downstream connections atomically with
+				// respect to packet distribution (same goroutine). Evicting
+				// before closing guarantees we never send on a closed queue,
+				// and Shutdown/CloseQueue are idempotent for late Removes and
+				// repeated inhibit commands.
 				for conn := range pool {
-					close(conn.Queue)
+					conn.Shutdown()
+					delete(pool, conn)
 				}
-				// TODO implement inhibit in the check api
 			case StreamerCommandAllow:
 				logger.Logkv(
 					"event", eventStreamerAllow,
 					"message", fmt.Sprintf("Turning stream online"),
 				)
-				inhibit = false
-				// TODO implement inhibit in the check api
+				util.StoreBool(&streamer.inhibited, false)
 			default:
 				logger.Logkv(
 					"event", eventStreamerError,
@@ -391,7 +485,7 @@ func (streamer *Streamer) Stream(queue <-chan protocol.MpegTsPacket) error {
 		// drain any leftovers
 	}
 	for conn := range pool {
-		close(conn.Queue)
+		conn.Shutdown()
 	}
 
 	// start the command eater again
@@ -401,15 +495,16 @@ func (streamer *Streamer) Stream(queue <-chan protocol.MpegTsPacket) error {
 		"event", eventStreamerStop,
 		"message", "Ending streaming",
 	)
-	return nil
 }
 
 // ServeHTTP handles an incoming HTTP connection.
 // Satisfies the http.Handler interface, so it can be used in an HTTP server.
 func (streamer *Streamer) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	// fail-fast: verify that this user can access this resource first
-	if !auth.HandleHttpAuthentication(streamer.auth, request, writer) {
-		return
+	if streamer.auth != nil {
+		if !auth.HandleHttpAuthentication(streamer.auth, request, writer) {
+			return
+		}
 	}
 
 	// create the connection object first
@@ -434,57 +529,73 @@ func (streamer *Streamer) ServeHTTP(writer http.ResponseWriter, request *http.Re
 		logger.Logkv(
 			"event", eventStreamerError,
 			"error", errorStreamerOffline,
-			"message", fmt.Sprintf("Refusing connection from %s, stream is offline", request.RemoteAddr),
+			"message", fmt.Sprintf("Refusing connection from %s, stream is offline or full", request.RemoteAddr),
 		)
+		// Return a suitable error.
+		// TODO This should be 503 or 504, but client support seems to be poor
+		// and the standards mandate nothing. Bummer.
+		ServeStreamError(writer, http.StatusNotFound)
+		return
 	}
 
-	if conn != nil {
-		// connection will be handled, report
-		streamer.stats.ConnectionAdded()
-		metricConnections.With(prometheus.Labels{"stream": streamer.name}).Inc()
-		// also notify the event queue
-		streamer.events.NotifyConnect(1)
-
-		logger.Logkv(
-			"event", eventStreamerStreaming,
-			"message", fmt.Sprintf("Streaming to %s", request.RemoteAddr),
-			"remote", request.RemoteAddr,
-		)
-
-		start := time.Now()
-		conn.Serve(streamer.preamble)
-		duration := time.Since(start)
-
-		// done, remove the stale connection
+	// connection was accepted. All teardown accounting is consolidated in
+	// this deferred call so it happens exactly once, even if Serve panics.
+	var serveDuration time.Duration
+	defer func() {
+		// remove the stale connection from the pool. The receiver is either
+		// the active Stream loop or the command eater during an epoch switch;
+		// both always drain the request channel.
 		streamer.request <- &ConnectionRequest{
 			Command:    StreamerCommandRemove,
 			Address:    request.RemoteAddr,
 			Connection: conn,
 		}
-		// and drain the queue AFTER we have sent the shutdown signal
+		// and drain the queue AFTER we have sent the shutdown signal. The
+		// queue is guaranteed to be closed by the Remove handler or by an
+		// offline kick, so this cannot block forever.
 		for range conn.Queue {
 			// drain any leftovers
 		}
+
+		// Release the policy capacity before updating the visible connection
+		// counters. This guarantees that once the health/stats API observes
+		// zero viewers, the connection limit has already been freed and a
+		// fresh connection cannot be misjudged as full.
+		if streamer.broker != nil {
+			streamer.broker.Release(streamer)
+		}
+
+		if streamer.events != nil {
+			streamer.events.NotifyConnect(-1)
+		}
+		streamer.stats.ConnectionRemoved()
+		metricConnections.With(prometheus.Labels{"stream": streamer.name}).Dec()
+		streamer.stats.StreamDuration(serveDuration)
+		metricDuration.With(prometheus.Labels{"stream": streamer.name}).Add(float64(serveDuration))
+
 		logger.Logkv(
 			"event", eventStreamerClosed,
 			"message", fmt.Sprintf("Connection from %s closed", request.RemoteAddr),
 			"remote", request.RemoteAddr,
-			"duration", duration,
+			"duration", serveDuration,
 		)
+	}()
 
-		// and report
-		streamer.events.NotifyConnect(-1)
-		streamer.stats.ConnectionRemoved()
-		metricConnections.With(prometheus.Labels{"stream": streamer.name}).Dec()
-		streamer.stats.StreamDuration(duration)
-		metricDuration.With(prometheus.Labels{"stream": streamer.name}).Add(float64(duration))
-
-		// also notify the broker
-		streamer.broker.Release(streamer)
-	} else {
-		// Return a suitable error
-		// TODO This should be 503 or 504, but client support seems to be poor
-		// and the standards mandate nothing. Bummer.
-		ServeStreamError(writer, http.StatusNotFound)
+	// connection will be handled, report
+	streamer.stats.ConnectionAdded()
+	metricConnections.With(prometheus.Labels{"stream": streamer.name}).Inc()
+	// also notify the event queue, if one is configured
+	if streamer.events != nil {
+		streamer.events.NotifyConnect(1)
 	}
+
+	logger.Logkv(
+		"event", eventStreamerStreaming,
+		"message", fmt.Sprintf("Streaming to %s", request.RemoteAddr),
+		"remote", request.RemoteAddr,
+	)
+
+	start := time.Now()
+	conn.Serve(streamer.preamble)
+	serveDuration = time.Since(start)
 }

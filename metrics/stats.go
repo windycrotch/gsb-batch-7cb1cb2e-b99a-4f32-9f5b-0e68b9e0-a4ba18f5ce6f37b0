@@ -191,8 +191,9 @@ type Statistics interface {
 // realStatistics implements a full statistics collector and API endpoint generator.
 type realStatistics struct {
 	lock     sync.RWMutex
-	running  bool
-	shutdown chan bool
+	lifeLock sync.Mutex
+	stop     chan struct{}
+	done     chan struct{}
 	internal map[string]*realCollector
 	streams  map[string]*StreamStatistics
 	global   *StreamStatistics
@@ -206,7 +207,7 @@ type realStatistics struct {
 // Snapshots of the aggregated statistics can then be fetched with the Get...() methods.
 func NewStatistics(maxconns uint, fullcons uint) Statistics {
 	stats := &realStatistics{
-		shutdown: make(chan bool),
+		stop:     make(chan struct{}),
 		internal: make(map[string]*realCollector),
 		streams:  make(map[string]*StreamStatistics),
 		global: &StreamStatistics{
@@ -284,70 +285,104 @@ func (stats *realStatistics) update(delta time.Duration, change map[string]*real
 	stats.lock.Unlock()
 }
 
-// delta calculates the difference between a previous internal state
-// and the current state and returns a copy of the current state.
-// The previous state (the argument) is replaced with the difference.
-func (stats *realStatistics) delta(previous map[string]*realCollector) map[string]*realCollector {
+// snapshotInternal clones all current per-stream collectors.
+func (stats *realStatistics) snapshotInternal() map[string]*realCollector {
 	stats.lock.RLock()
-	current := make(map[string]*realCollector)
-	for name, stream := range stats.internal {
-		update := stream.clone()
-		previous[name].invsub(update)
-		current[name] = update
-	}
-	stats.lock.RUnlock()
-	return current
-}
-
-// loop runs a ticker to update all statistics periodically.
-func (stats *realStatistics) loop() {
-	running := true
-	// TODO make the interval configurable
-	ticker := time.NewTicker(1 * time.Second)
-
-	// pre-init - store the current time and state
-	before := time.Now()
-	stats.lock.RLock()
-	previous := make(map[string]*realCollector)
+	previous := make(map[string]*realCollector, len(stats.internal))
 	for name, stream := range stats.internal {
 		previous[name] = stream.clone()
 	}
 	stats.lock.RUnlock()
+	return previous
+}
 
-	for running {
+// delta calculates the difference between a previous state and the current
+// state. It returns the per-stream diffs to accumulate and a fresh snapshot
+// to use as the next previous state. Streams missing from the previous map
+// (for example registered after Start) are treated as zero state, so this
+// never dereferences a nil entry.
+func (stats *realStatistics) delta(previous map[string]*realCollector) (map[string]*realCollector, map[string]*realCollector) {
+	stats.lock.RLock()
+	diffs := make(map[string]*realCollector, len(stats.internal))
+	current := make(map[string]*realCollector, len(stats.internal))
+	for name, stream := range stats.internal {
+		update := stream.clone()
+		current[name] = update
+		old := previous[name]
+		if old == nil {
+			old = &realCollector{}
+		}
+		diffs[name] = &realCollector{
+			connections:     update.connections - old.connections,
+			packetsReceived: update.packetsReceived - old.packetsReceived,
+			packetsSent:     update.packetsSent - old.packetsSent,
+			packetsDropped:  update.packetsDropped - old.packetsDropped,
+			connected:       update.connected,
+			duration:        update.duration - old.duration,
+		}
+	}
+	stats.lock.RUnlock()
+	return diffs, current
+}
+
+// loop runs a ticker to update all statistics periodically.
+func (stats *realStatistics) loop(stop <-chan struct{}, done chan struct{}) {
+	defer close(done)
+
+	// TODO make the interval configurable
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	// pre-init - store the current time and state
+	before := time.Now()
+	previous := stats.snapshotInternal()
+
+	for {
 		select {
-		case <-stats.shutdown:
-			running = false
+		case <-stop:
+			return
 		case <-ticker.C:
 			// calculate the elapsed time
 			now := time.Now()
 			// calculate the state delta and update the stored state
-			delta := previous
-			previous = stats.delta(previous)
+			diff, current := stats.delta(previous)
 			// and update
-			stats.update(now.Sub(before), delta)
-			// stash the current time
+			stats.update(now.Sub(before), diff)
+			// stash the current time and state
 			before = now
+			previous = current
 		}
 	}
-	// this should close the channel as well
-	ticker.Stop()
-	stats.running = false
 }
 
 // Start starts the updater thread.
 func (stats *realStatistics) Start() {
-	if !stats.running {
-		stats.running = true
-		go stats.loop()
+	stats.lifeLock.Lock()
+	defer stats.lifeLock.Unlock()
+	if stats.done != nil {
+		return
 	}
+	// a fresh stop channel per generation also makes Stop/Start cycles work
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	stats.stop = stop
+	stats.done = done
+	go stats.loop(stop, done)
 }
 
-// Stop stops the updater thread.
+// Stop stops the updater thread. It is idempotent and waits for the loop to exit.
 func (stats *realStatistics) Stop() {
-	if stats.running {
-		stats.shutdown <- true
+	stats.lifeLock.Lock()
+	stop := stats.stop
+	done := stats.done
+	stats.stop = nil
+	stats.done = nil
+	stats.lifeLock.Unlock()
+	if done == nil {
+		return
 	}
+	close(stop)
+	<-done
 }
 
 // RegisterStream adds a new stream to the map.
@@ -371,10 +406,20 @@ func (stats *realStatistics) RemoveStream(name string) {
 
 // GetStreamStatistics fetches the statistics for a stream.
 // The returned object is a copy does not need to be handled with care.
+// A missing stream returns a zero-valued statistics object.
 func (stats *realStatistics) GetStreamStatistics(name string) *StreamStatistics {
 	stats.lock.RLock()
-	stream := *stats.streams[name]
+	var stream StreamStatistics
+	if stored, ok := stats.streams[name]; ok && stored != nil {
+		stream = *stored
+	}
+	collector := stats.internal[name]
 	stats.lock.RUnlock()
+	// report the authoritative live connection gauge immediately instead of
+	// waiting for the next periodic aggregation tick
+	if collector != nil {
+		stream.Connections = atomic.LoadInt64(&collector.connections)
+	}
 	return &stream
 }
 
@@ -396,7 +441,15 @@ func (stats *realStatistics) GetAllStreamStatistics() map[string]*StreamStatisti
 func (stats *realStatistics) GetGlobalStatistics() *StreamStatistics {
 	stats.lock.RLock()
 	global := *stats.global
+	// Sum the authoritative live connection gauges so the health/stats APIs
+	// reflect the real online count immediately, not only after the next
+	// periodic aggregation tick.
+	var connections int64
+	for _, collector := range stats.internal {
+		connections += atomic.LoadInt64(&collector.connections)
+	}
 	stats.lock.RUnlock()
+	global.Connections = connections
 	return &global
 }
 
