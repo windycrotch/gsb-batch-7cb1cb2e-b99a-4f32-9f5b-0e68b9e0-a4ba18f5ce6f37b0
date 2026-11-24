@@ -1,0 +1,104 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/elura",
+    "crates/elura-core",
+    "crates/elura-runtime",
+    "crates/elura-gateway",
+    "crates/elura-world",
+    "crates/elura-room",
+    "crates/elura-aoi",
+    "crates/elura-simulation",
+    "crates/elura-netcode",
+    "crates/elura-replication",
+    "crates/elura-lag-compensation",
+    "crates/elura-net-sim",
+    "crates/elura-monolith",
+    "crates/elura-testkit",
+    "crates/elura-providers",
+    "crates/elura-adapters",
+    "tools/elura-cli",
+    "tools/elura-load",
+    "tools/elura-perf",
+]
+exclude = ["examples/tiny-network-game", "examples/realtime-gameplay"]
+
+[workspace.package]
+version = "0.3.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.97"
+authors = ["Elura Contributors"]
+readme = "README.md"
+homepage = "https://elura.rustyspottedcat.dev/"
+repository = "https://github.com/Arion-Dsh/elura"
+
+[workspace.dependencies]
+aes = "0.9.1"
+aes-gcm = "0.11.0"
+argon2 = "0.5.3"
+async-trait = "0.1.89"
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22.1"
+bytes = { version = "1.12.1", features = ["serde"] }
+cbc = { version = "0.2.1", features = ["alloc"] }
+chrono = { version = "0.4", features = ["serde"] }
+criterion = "0.8"
+futures-util = { version = "0.3.32", features = ["sink"] }
+hex = "0.4.3"
+hmac = "0.13.0"
+http = "1.4.2"
+elura-core = { version = "0.3.1", path = "crates/elura-core" }
+elura-runtime = { version = "0.3.1", path = "crates/elura-runtime" }
+elura-gateway = { version = "0.3.1", path = "crates/elura-gateway" }
+elura-world = { version = "0.3.1", path = "crates/elura-world" }
+elura-room = { version = "0.3.1", path = "crates/elura-room" }
+elura-aoi = { version = "0.3.1", path = "crates/elura-aoi" }
+elura-simulation = { version = "0.3.1", path = "crates/elura-simulation" }
+elura-netcode = { version = "0.3.1", path = "crates/elura-netcode" }
+elura-replication = { version = "0.3.1", path = "crates/elura-replication" }
+elura-lag-compensation = { version = "0.3.1", path = "crates/elura-lag-compensation" }
+elura-net-sim = { version = "0.3.1", path = "crates/elura-net-sim" }
+elura-monolith = { version = "0.3.1", path = "crates/elura-monolith" }
+elura-adapters = { version = "0.3.1", path = "crates/elura-adapters", default-features = false }
+elura-providers = { version = "0.3.1", path = "crates/elura-providers", default-features = false }
+md-5 = "0.11.0"
+ipnet = "2"
+prost = "0.14.4"
+k8s-openapi = { version = "0.28", features = ["v1_32"] }
+kube = { version = "4", default-features = false, features = ["client", "runtime", "rustls-tls"] }
+quick-xml = { version = "0.41.0", features = ["serialize"] }
+quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rand = "0.10.2"
+redis = { version = "1", features = ["tokio-comp", "connection-manager", "cluster-async"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
+ring = "0.17.14"
+rustls-pki-types = "1.15.0"
+pem-rfc7468 = { version = "1.0.0", features = ["alloc"] }
+rustls = { version = "0.23.42", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.150", features = ["raw_value"] }
+sha1 = "0.11.0"
+sha2 = { version = "0.11.0", features = ["oid"] }
+socket2 = "0.6.5"
+p256 = { version = "0.14", features = ["ecdsa", "pem", "pkcs8"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "mysql", "uuid", "json"] }
+subtle = "2.6.1"
+tokio = { version = "1.52.3", features = ["full"] }
+tokio-util = { version = "0.7.18", features = ["codec", "rt"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
+tokio-tungstenite = "0.30.0"
+tower = { version = "0.5.3", features = ["util"] }
+tracing = "0.1.44"
+tracing-opentelemetry = "0.33"
+url = "2.5.8"
+uuid = { version = "1.24.0", features = ["v4", "serde", "fast-rng"] }
+webpki-roots = "1.0.8"
+wtransport = { version = "0.7.1", default-features = false, features = ["ring"] }
+x509-parser = { version = "0.18", features = ["verify"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

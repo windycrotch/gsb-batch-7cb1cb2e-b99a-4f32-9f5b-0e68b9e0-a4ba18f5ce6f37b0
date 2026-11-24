@@ -1,0 +1,20 @@
+[package]
+name = "elura-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+homepage.workspace = true
+repository.workspace = true
+description = "Project scaffold generator for Elura applications"
+documentation = "https://docs.rs/elura-cli"
+include = [
+    "src/**",
+]
+
+[[bin]]
+name = "elura"
+path = "src/main.rs"
+doc = false

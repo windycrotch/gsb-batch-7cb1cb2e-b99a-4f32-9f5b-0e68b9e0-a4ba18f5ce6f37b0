@@ -1,0 +1,76 @@
+[package]
+name = "elura"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+homepage.workspace = true
+repository.workspace = true
+description = "Rust framework for authoritative realtime gameplay and extensible online game services"
+documentation = "https://docs.rs/elura"
+keywords = ["game-server", "game-backend", "multiplayer", "netcode", "realtime"]
+categories = ["game-development", "network-programming", "asynchronous"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = ["gateway", "world"]
+core = ["dep:elura-core"]
+runtime = ["core", "dep:elura-runtime"]
+gateway = ["runtime", "dep:elura-gateway"]
+world = ["runtime", "dep:elura-world"]
+room = ["dep:elura-room"]
+aoi = ["dep:elura-aoi"]
+simulation = ["dep:elura-simulation"]
+netcode = ["dep:elura-netcode"]
+replication = ["dep:elura-replication"]
+lag-compensation = ["dep:elura-lag-compensation"]
+net-sim = ["dep:elura-net-sim"]
+monolith = ["gateway", "world", "dep:elura-monolith"]
+adapters = ["runtime", "dep:elura-adapters", "elura-adapters/discovery"]
+redis = ["adapters", "gateway", "world", "elura-adapters/redis"]
+sql = ["adapters", "elura-adapters/sql"]
+kubernetes = ["adapters", "gateway", "elura-adapters/kubernetes"]
+admin = ["adapters", "elura-adapters/admin"]
+providers = ["core", "dep:elura-providers"]
+identity = [
+    "providers",
+    "elura-providers/identity",
+    "elura-gateway?/identity-http",
+]
+notification-alisms = ["providers", "elura-providers/notification-alisms"]
+otp = ["providers", "elura-providers/otp"]
+payment-alipay = ["providers", "elura-providers/payment-alipay"]
+payment-apple = ["providers", "elura-providers/payment-apple"]
+payment-douyin = ["providers", "elura-providers/payment-douyin"]
+payment-quicksdk = ["providers", "elura-providers/payment-quicksdk"]
+payment-wechat-mini = ["providers", "elura-providers/payment-wechat-mini"]
+payment-wechat-pay = ["providers", "elura-providers/payment-wechat-pay"]
+full = [
+    "room", "aoi", "simulation", "netcode", "replication", "lag-compensation", "net-sim", "redis", "sql", "kubernetes", "admin", "identity", "notification-alisms", "otp",
+    "payment-alipay", "payment-apple", "payment-douyin", "payment-quicksdk",
+    "payment-wechat-mini", "payment-wechat-pay",
+]
+
+[dependencies]
+elura-core = { workspace = true, optional = true }
+elura-runtime = { workspace = true, optional = true }
+elura-gateway = { workspace = true, optional = true }
+elura-world = { workspace = true, optional = true }
+elura-room = { workspace = true, optional = true }
+elura-aoi = { workspace = true, optional = true }
+elura-simulation = { workspace = true, optional = true }
+elura-netcode = { workspace = true, optional = true }
+elura-replication = { workspace = true, optional = true }
+elura-lag-compensation = { workspace = true, optional = true }
+elura-net-sim = { workspace = true, optional = true }
+elura-monolith = { workspace = true, optional = true }
+elura-adapters = { workspace = true, optional = true, default-features = false }
+elura-providers = { workspace = true, optional = true, default-features = false }
+
+[dev-dependencies]
+prost.workspace = true
+tokio.workspace = true

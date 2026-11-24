@@ -1,0 +1,25 @@
+{
+  "gateway": {
+    "ticket": {
+      "issuer": "game-login",
+      "audience": "game-gateway",
+      "login_ttl": { "secs": 60, "nanos": 0 },
+      "reconnect_ttl": { "secs": 1800, "nanos": 0 }
+    }
+  },
+  "world": {
+    "handler_timeout": { "secs": 5, "nanos": 0 }
+  },
+  "admin": {
+    "listen": "127.0.0.1:17001",
+    "component": "monolith",
+    "instance_id": "monolith-1"
+  },
+  "tcp": {
+    "listen": "127.0.0.1:17000"
+  },
+  "profile": {
+    "display_name_prefix": "Player-",
+    "welcome_message": "Welcome to the world."
+  }
+}
