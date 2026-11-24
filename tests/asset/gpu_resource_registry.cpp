@@ -1,0 +1,373 @@
+#include "asset/gpu_resource_registry.h"
+#include "asset/asset_manager.h"
+#include "asset/res/material_asset.h"
+#include "asset/res/texture_asset.h"
+#include "base/binary_io.h"
+#include "gfx/context.h"
+#include "render/renderer.h"
+#include "scene/scene.h"
+#include "scene/scene_extractor.h"
+
+#include <SDL3/SDL.h>
+#include <filesystem>
+#include <fstream>
+#include <gtest/gtest.h>
+#include <memory>
+#include <stdexcept>
+
+namespace {
+
+vulcal::render::MeshData triangle() {
+    vulcal::render::MeshData mesh;
+    mesh.vertices_ = {
+        { { -0.5f, -0.5f, 0.0f }, { 0.0f, 0.0f, 1.0f } },
+        {  { 0.5f, -0.5f, 0.0f }, { 0.0f, 0.0f, 1.0f } },
+        {   { 0.0f, 0.5f, 0.0f }, { 0.0f, 0.0f, 1.0f } },
+    };
+    mesh.indices_ = { 0, 1, 2 };
+    return mesh;
+}
+
+class GPUResourceRegistryTest : public testing::Test {
+protected:
+    void SetUp() override {
+        directory_ = std::filesystem::temp_directory_path() / ("vulcal_gpu_resources_" + base::UUID::generate().to_string());
+        std::filesystem::create_directories(directory_);
+        vulcal::gfx::Context::prepare_attributes();
+        window_ = SDL_CreateWindow("GPU resource registry test", 64, 64, SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
+        ASSERT_NE(window_, nullptr) << SDL_GetError();
+        context_       = std::make_unique<vulcal::gfx::Context>(window_);
+        renderer_      = std::make_unique<vulcal::render::Renderer>();
+        gpu_resources_ = std::make_unique<vulcal::asset::GPUResourceRegistry>(assets_, *renderer_);
+        mesh_id_       = assets_.add_mesh(triangle());
+        material_id_ = assets_.add_material({});
+        vulcal::render::TextureData texture;
+        texture.width_  = 1;
+        texture.height_ = 1;
+        texture.pixels_ = { 255, 255, 255, 255 };
+        texture_id_     = assets_.add_texture(std::move(texture));
+    }
+
+    void TearDown() override {
+        gpu_resources_.reset();
+        renderer_.reset();
+        context_.reset();
+        if (window_) SDL_DestroyWindow(window_);
+        SDL_QuitSubSystem(SDL_INIT_VIDEO);
+        std::filesystem::remove_all(directory_);
+    }
+
+    void draw(vulcal::render::MeshHandle mesh, vulcal::render::MaterialHandle material) {
+        vulcal::render::RenderData data;
+        data.items_.push_back({ mesh, material, glm::mat4{ 1.0f } });
+        renderer_->render(data);
+    }
+
+    void write_triangle(vulcal::asset::MeshAssetID id, float x) {
+        std::ofstream output(directory_ / (id.to_string() + ".vmesh"), std::ios::binary);
+        output.write("VULMESH\0", 8);
+        base::binary::write_u32_le(output, 1);
+        base::binary::write_u64_le(output, 3);
+        base::binary::write_u64_le(output, 3);
+        auto mesh                    = triangle();
+        mesh.vertices_[0].position.x = x;
+        for (const auto& vertex: mesh.vertices_) {
+            for (float value:
+                 { vertex.position.x, vertex.position.y, vertex.position.z, vertex.normal.x, vertex.normal.y, vertex.normal.z }) {
+                base::binary::write_float_le(output, value);
+            }
+        }
+        for (const auto index: mesh.indices_) base::binary::write_u32_le(output, index);
+    }
+
+    std::filesystem::path directory_;
+    SDL_Window* window_ = nullptr;
+    std::unique_ptr<vulcal::gfx::Context> context_;
+    std::unique_ptr<vulcal::render::Renderer> renderer_;
+    vulcal::asset::AssetManager assets_;
+    std::unique_ptr<vulcal::asset::GPUResourceRegistry> gpu_resources_;
+    vulcal::asset::MeshAssetID mesh_id_;
+    vulcal::asset::MaterialAssetID material_id_;
+    vulcal::asset::TextureAssetID texture_id_;
+};
+
+TEST_F(GPUResourceRegistryTest, ReusesHandlesAcrossFrames) {
+    const auto mesh     = gpu_resources_->resolve(mesh_id_);
+    const auto material = gpu_resources_->resolve(material_id_);
+    ASSERT_NE(mesh.value_, 0u);
+    ASSERT_NE(material.value_, 0u);
+    EXPECT_EQ(gpu_resources_->resolve(mesh_id_), mesh);
+    EXPECT_EQ(gpu_resources_->resolve(material_id_), material);
+    EXPECT_NO_THROW(draw(mesh, material));
+}
+
+TEST_F(GPUResourceRegistryTest, UsesSharedDefaultOnlyForNilMaterialId) {
+    const auto first = gpu_resources_->resolve(vulcal::asset::MaterialAssetID{});
+    EXPECT_NE(first.value_, 0u);
+    EXPECT_EQ(gpu_resources_->resolve(vulcal::asset::MaterialAssetID{}), first);
+    EXPECT_EQ(gpu_resources_->resolve(vulcal::asset::MaterialAssetID{ 123 }).value_, 0u);
+    EXPECT_EQ(gpu_resources_->resolve(vulcal::asset::MeshAssetID{}).value_, 0u);
+}
+
+TEST_F(GPUResourceRegistryTest, CpuInvalidationRemovesStaleHandles) {
+    const auto mesh     = gpu_resources_->resolve(mesh_id_);
+    const auto material = gpu_resources_->resolve(material_id_);
+    assets_.invalidate(mesh_id_);
+    EXPECT_EQ(gpu_resources_->resolve(mesh_id_).value_, 0u);
+    EXPECT_THROW(draw(mesh, material), std::invalid_argument);
+    EXPECT_EQ(gpu_resources_->resolve(material_id_), material);
+}
+
+TEST_F(GPUResourceRegistryTest, CanRebuildGpuResourcesWithoutReloadingCpuData) {
+    const auto mesh     = gpu_resources_->resolve(mesh_id_);
+    const auto material = gpu_resources_->resolve(material_id_);
+    const auto cpu_mesh = assets_.load_mesh(mesh_id_);
+    gpu_resources_->invalidate(mesh_id_);
+    EXPECT_EQ(assets_.load_mesh(mesh_id_), cpu_mesh);
+    EXPECT_THROW(draw(mesh, material), std::invalid_argument);
+    const auto replacement = gpu_resources_->resolve(mesh_id_);
+    EXPECT_NE(replacement, mesh);
+    EXPECT_EQ(gpu_resources_->resolve(material_id_), material);
+    EXPECT_NO_THROW(draw(replacement, material));
+}
+
+TEST_F(GPUResourceRegistryTest, InvalidatingOneCategoryKeepsOtherHandlesWithTheSameNumericId) {
+    assets_.set_library(directory_);
+    const vulcal::asset::MeshAssetID mesh_id{ 7 };
+    const vulcal::asset::MaterialAssetID material_id{ 7 };
+    const vulcal::asset::TextureAssetID texture_id{ 7 };
+    write_triangle(mesh_id, -0.5f);
+    vulcal::asset::MaterialAsset::write(directory_ / (material_id.to_string() + ".vmatc"), {});
+    vulcal::render::TextureData texture_data;
+    texture_data.width_  = 1;
+    texture_data.height_ = 1;
+    texture_data.pixels_ = { 255, 255, 255, 255 };
+    vulcal::asset::TextureAsset::write(directory_ / (texture_id.to_string() + ".vtex"), texture_data);
+
+    auto mesh          = gpu_resources_->resolve(mesh_id);
+    auto material      = gpu_resources_->resolve(material_id);
+    const auto texture = gpu_resources_->resolve(texture_id);
+    ASSERT_NE(mesh.value_, 0u);
+    ASSERT_NE(material.value_, 0u);
+    ASSERT_NE(texture.value_, 0u);
+    const auto cpu_mesh     = assets_.load_mesh(mesh_id);
+    const auto cpu_material = assets_.load_material(material_id);
+    const auto cpu_texture  = assets_.load_texture(texture_id);
+
+    gpu_resources_->invalidate(mesh_id);
+    EXPECT_THROW(draw(mesh, material), std::invalid_argument);
+    EXPECT_EQ(gpu_resources_->resolve(material_id), material);
+    EXPECT_EQ(gpu_resources_->resolve(texture_id), texture);
+    const auto new_mesh = gpu_resources_->resolve(mesh_id);
+    EXPECT_NE(new_mesh, mesh);
+    mesh = new_mesh;
+    EXPECT_NO_THROW(draw(mesh, material));
+
+    gpu_resources_->invalidate(material_id);
+    EXPECT_THROW(draw(mesh, material), std::invalid_argument);
+    EXPECT_EQ(gpu_resources_->resolve(mesh_id), mesh);
+    EXPECT_EQ(gpu_resources_->resolve(texture_id), texture);
+    const auto new_material = gpu_resources_->resolve(material_id);
+    EXPECT_NE(new_material, material);
+    material = new_material;
+    EXPECT_NO_THROW(draw(mesh, material));
+
+    gpu_resources_->invalidate(texture_id);
+    EXPECT_EQ(gpu_resources_->resolve(mesh_id), mesh);
+    EXPECT_EQ(gpu_resources_->resolve(material_id), material);
+    const auto new_texture = gpu_resources_->resolve(texture_id);
+    EXPECT_NE(new_texture, texture);
+    vulcal::render::RenderData data;
+    data.items_.push_back(vulcal::render::RenderItem{
+        .kind_   = vulcal::render::RenderItemKind::Sprite,
+        .sprite_ = vulcal::render::SpriteData{ .texture_ = texture },
+    });
+    EXPECT_THROW(renderer_->render(data), std::invalid_argument);
+    data.items_[0].sprite_.texture_ = new_texture;
+    EXPECT_NO_THROW(renderer_->render(data));
+    EXPECT_EQ(assets_.load_mesh(mesh_id), cpu_mesh);
+    EXPECT_EQ(assets_.load_material(material_id), cpu_material);
+    EXPECT_EQ(assets_.load_texture(texture_id), cpu_texture);
+}
+
+TEST_F(GPUResourceRegistryTest, ReimportReplacesOnlyChangedHandle) {
+    assets_.set_library(directory_);
+    const vulcal::asset::MeshAssetID id{ 7 };
+    write_triangle(id, -0.5f);
+    const auto material = gpu_resources_->resolve(vulcal::asset::MaterialAssetID{});
+    const auto old      = gpu_resources_->resolve(id);
+    ASSERT_NE(old.value_, 0u);
+
+    write_triangle(id, -0.25f);
+    EXPECT_EQ(gpu_resources_->resolve(id), old);
+    assets_.invalidate(id);
+    const auto replacement = gpu_resources_->resolve(id);
+    EXPECT_NE(replacement, old);
+    EXPECT_NE(replacement.value_, 0u);
+    EXPECT_EQ(gpu_resources_->resolve(vulcal::asset::MaterialAssetID{}), material);
+    EXPECT_THROW(draw(old, material), std::invalid_argument);
+    EXPECT_NO_THROW(draw(replacement, material));
+    EXPECT_FLOAT_EQ(assets_.load_mesh(id)->vertices_[0].position.x, -0.25f);
+}
+
+TEST_F(GPUResourceRegistryTest, SeparateRenderersUseSeparateHandlesForSharedAssets) {
+    vulcal::render::Renderer other_renderer;
+    vulcal::asset::GPUResourceRegistry other_registry(assets_, other_renderer);
+    const auto mesh           = gpu_resources_->resolve(mesh_id_);
+    const auto material       = gpu_resources_->resolve(material_id_);
+    const auto other_mesh     = other_registry.resolve(mesh_id_);
+    const auto other_material = other_registry.resolve(material_id_);
+    EXPECT_NE(other_mesh, mesh);
+    EXPECT_NE(other_material, material);
+    other_registry.clear();
+    EXPECT_NO_THROW(draw(mesh, material));
+}
+
+TEST_F(GPUResourceRegistryTest, ClearAndDestructionReleaseOnlyOwnedHandles) {
+    const auto external_mesh     = renderer_->create_mesh(triangle());
+    const auto external_material = renderer_->create_material({});
+    const auto mesh              = gpu_resources_->resolve(mesh_id_);
+    const auto material          = gpu_resources_->resolve(material_id_);
+    gpu_resources_->clear();
+    EXPECT_THROW(draw(mesh, external_material), std::invalid_argument);
+    EXPECT_THROW(draw(external_mesh, material), std::invalid_argument);
+    EXPECT_NO_THROW(draw(external_mesh, external_material));
+
+    const auto next_mesh     = gpu_resources_->resolve(mesh_id_);
+    const auto next_material = gpu_resources_->resolve(material_id_);
+    gpu_resources_.reset();
+    EXPECT_THROW(draw(next_mesh, external_material), std::invalid_argument);
+    EXPECT_THROW(draw(external_mesh, next_material), std::invalid_argument);
+    EXPECT_NO_THROW(draw(external_mesh, external_material));
+    renderer_->destroy_mesh(external_mesh);
+    renderer_->destroy_material(external_material);
+}
+
+TEST_F(GPUResourceRegistryTest, ReusesTextureHandlesAcrossFrames) {
+    const auto texture = gpu_resources_->resolve(texture_id_);
+    ASSERT_NE(texture.value_, 0u);
+    EXPECT_EQ(gpu_resources_->resolve(texture_id_), texture);
+    EXPECT_EQ(gpu_resources_->resolve(vulcal::asset::TextureAssetID{}).value_, 0u);
+}
+
+TEST_F(GPUResourceRegistryTest, ExtractorEmitsSpriteItemsWithResolvedTextures) {
+    vulcal::scene::Scene scene;
+    auto textured            = scene.create_entity("Textured");
+    auto& sprite             = textured.add_component<vulcal::scene::SpriteRendererComponent>();
+    sprite.texture_asset_id_ = texture_id_;
+    sprite.color_            = { 0.25f, 0.5f, 0.75f, 0.8f };
+    sprite.uv_rect_          = { 0.1f, 0.2f, 0.9f, 0.8f };
+    sprite.pivot_            = { 0.0f, 0.0f };
+    sprite.flip_x_           = true;
+    sprite.sorting_order_    = 7;
+    textured.get_component<vulcal::scene::TransformComponent>().translation_ = { 1.0f, 2.0f, 3.0f };
+
+    auto hidden                                                              = scene.create_entity("Hidden");
+    auto& hidden_sprite             = hidden.add_component<vulcal::scene::SpriteRendererComponent>();
+    hidden_sprite.texture_asset_id_ = texture_id_;
+    hidden_sprite.visible_          = false;
+
+    auto untextured                 = scene.create_entity("Untextured");
+    untextured.add_component<vulcal::scene::SpriteRendererComponent>();
+
+    auto missing                                                                      = scene.create_entity("Missing");
+    missing.add_component<vulcal::scene::SpriteRendererComponent>().texture_asset_id_ = vulcal::asset::TextureAssetID{ 123 };
+
+    vulcal::scene::SceneExtractor extractor(*gpu_resources_);
+    vulcal::scene::SceneExtractor::Options options;
+    options.camera_override_ = vulcal::render::CameraData{};
+    const auto data          = extractor.extract(scene, options);
+
+    ASSERT_EQ(data.items_.size(), 2u);
+    const vulcal::render::RenderItem* textured_item   = nullptr;
+    const vulcal::render::RenderItem* untextured_item = nullptr;
+    for (const auto& item: data.items_) {
+        if (item.sprite_.texture_.value_ != 0) textured_item = &item;
+        else
+            untextured_item = &item;
+    }
+    ASSERT_NE(textured_item, nullptr);
+    ASSERT_NE(untextured_item, nullptr);
+
+    EXPECT_EQ(textured_item->kind_, vulcal::render::RenderItemKind::Sprite);
+    EXPECT_EQ(textured_item->sprite_.texture_, gpu_resources_->resolve(texture_id_));
+    EXPECT_EQ(textured_item->sprite_.color_, sprite.color_);
+    EXPECT_EQ(textured_item->sprite_.uv_rect_, sprite.uv_rect_);
+    EXPECT_EQ(textured_item->sprite_.pivot_, sprite.pivot_);
+    EXPECT_TRUE(textured_item->sprite_.flip_x_);
+    EXPECT_FALSE(textured_item->sprite_.flip_y_);
+    EXPECT_EQ(textured_item->sprite_.sorting_order_, 7);
+    EXPECT_EQ(glm::vec3(textured_item->world_transform_[3]), (glm::vec3{ 1.0f, 2.0f, 3.0f }));
+
+    EXPECT_EQ(untextured_item->kind_, vulcal::render::RenderItemKind::Sprite);
+    EXPECT_EQ(untextured_item->sprite_.texture_.value_, 0u);
+}
+
+TEST_F(GPUResourceRegistryTest, RendersSpritesWithTexturesAndWhiteFallback) {
+    const auto texture = gpu_resources_->resolve(texture_id_);
+
+    vulcal::render::RenderData data;
+    data.items_.push_back(vulcal::render::RenderItem{
+        .world_transform_ = glm::mat4{ 1.0f },
+        .kind_            = vulcal::render::RenderItemKind::Sprite,
+        .sprite_ =
+                vulcal::render::SpriteData{
+                                      .texture_       = texture,
+                                      .color_         = { 1.0f, 0.5f, 0.25f, 0.75f },
+                                      .uv_rect_       = { 0.0f, 0.0f, 1.0f, 1.0f },
+                                      .pivot_         = { 0.5f, 0.5f },
+                                      .sorting_order_ = 1,
+                                      },
+    });
+    data.items_.push_back(vulcal::render::RenderItem{
+        .world_transform_ = glm::mat4{ 1.0f },
+        .kind_            = vulcal::render::RenderItemKind::Sprite,
+        .sprite_          = vulcal::render::SpriteData{ .texture_ = {}, .sorting_order_ = 2 },
+    });
+
+    EXPECT_NO_THROW(renderer_->render(data));
+}
+
+TEST_F(GPUResourceRegistryTest, RejectsInvalidSpriteTextureHandle) {
+    vulcal::render::RenderData data;
+    data.items_.push_back(vulcal::render::RenderItem{
+        .kind_   = vulcal::render::RenderItemKind::Sprite,
+        .sprite_ = vulcal::render::SpriteData{ .texture_ = vulcal::render::TextureHandle{ 999 } },
+    });
+
+    EXPECT_THROW(renderer_->render(data), std::invalid_argument);
+}
+
+TEST_F(GPUResourceRegistryTest, ExtractorUsesBoundRegistryAndSkipsMissingOrInvisibleAssets) {
+    vulcal::scene::Scene scene;
+    auto entity                                                            = scene.create_entity("Visible");
+    auto& mesh                                                             = entity.add_component<vulcal::scene::MeshRendererComponent>();
+    mesh.mesh_asset_id_                                                    = mesh_id_;
+    entity.get_component<vulcal::scene::TransformComponent>().translation_ = { 1.0f, 2.0f, 3.0f };
+    auto hidden                                                            = scene.create_entity("Hidden");
+    auto& hidden_mesh                                                      = hidden.add_component<vulcal::scene::MeshRendererComponent>();
+    hidden_mesh.mesh_asset_id_                                             = mesh_id_;
+    hidden_mesh.visible_                                                   = false;
+    scene.create_entity("Unassigned").add_component<vulcal::scene::MeshRendererComponent>();
+
+    vulcal::scene::SceneExtractor extractor(*gpu_resources_);
+    vulcal::scene::SceneExtractor::Options options;
+    options.camera_override_ = vulcal::render::CameraData{};
+    const auto first         = extractor.extract(scene, options);
+    ASSERT_EQ(first.items_.size(), 1u);
+    EXPECT_EQ(first.items_[0].mesh_, gpu_resources_->resolve(mesh_id_));
+    EXPECT_EQ(first.items_[0].material_, gpu_resources_->resolve(vulcal::asset::MaterialAssetID{}));
+    EXPECT_EQ(glm::vec3(first.items_[0].world_transform_[3]), (glm::vec3{ 1.0f, 2.0f, 3.0f }));
+    EXPECT_EQ(extractor.extract(scene, options).items_[0].mesh_, first.items_[0].mesh_);
+
+    // EnTT may move components when adding another entity with the same component.
+    auto& current              = entity.get_component<vulcal::scene::MeshRendererComponent>();
+    current.material_asset_id_ = vulcal::asset::MaterialAssetID{ 123 };
+    EXPECT_TRUE(extractor.extract(scene, options).items_.empty());
+    current.material_asset_id_ = material_id_;
+    EXPECT_EQ(extractor.extract(scene, options).items_.size(), 1u);
+    assets_.invalidate(mesh_id_);
+    EXPECT_TRUE(extractor.extract(scene, options).items_.empty());
+}
+
+} // namespace

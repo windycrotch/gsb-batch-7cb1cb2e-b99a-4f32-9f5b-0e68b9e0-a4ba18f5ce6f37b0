@@ -1,0 +1,186 @@
+#include "vulcal_editor/editor_context.h"
+
+#include "base/logger.h"
+#include "base/string_utils.h"
+
+#include <stdexcept>
+#include <utility>
+
+namespace editor {
+namespace {
+
+base::UUID selection_id(vulcal::scene::Entity entity) {
+    return entity ? entity.get_component<vulcal::scene::IDComponent>().id_ : base::UUID{};
+}
+
+} // namespace
+
+void EditorContext::require_edit_mode() const {
+    if (playing()) throw std::logic_error("Stop playing before editing or replacing the scene or project");
+}
+
+bool EditorContext::uses_primary_camera() const {
+    if (!playing()) return false;
+    const auto cameras = scene().registry().view<const vulcal::scene::CameraComponent>();
+    for (const auto entity: cameras) {
+        if (cameras.get<const vulcal::scene::CameraComponent>(entity).primary_) return true;
+    }
+    return false;
+}
+
+void EditorContext::begin_play() {
+    if (playing()) return;
+    const auto id = selection_id(selected_entity());
+    auto copy = std::make_unique<vulcal::scene::Scene>(scene());
+    selected_ = copy->find_by_id(id);
+    runtime_scene_ = std::move(copy);
+}
+
+void EditorContext::end_play() {
+    if (!playing()) return;
+    const auto id = selection_id(selected_entity());
+    selected_ = project_manager_.current_scene()->find_by_id(id);
+    runtime_scene_.reset();
+}
+
+vulcal::scene::Scene& EditorContext::scene() {
+    auto* scene = playing() ? runtime_scene_.get() : project_manager_.current_scene();
+    if (!scene) throw std::logic_error("No scene is currently open");
+    return *scene;
+}
+
+const vulcal::scene::Scene& EditorContext::scene() const {
+    const auto* scene = playing() ? runtime_scene_.get() : project_manager_.current_scene();
+    if (!scene) throw std::logic_error("No scene is currently open");
+    return *scene;
+}
+
+void EditorContext::set_scene(std::unique_ptr<vulcal::scene::Scene> scene) {
+    require_edit_mode();
+    project_manager_.set_scene(std::move(scene));
+    selected_ = {};
+}
+
+void EditorContext::new_scene() {
+    require_edit_mode();
+    set_scene(project_manager_.create_scene());
+    base::log::debug("EditorContext: created a new scene and cleared selection");
+}
+
+void EditorContext::open_scene(const std::filesystem::path& scene_file) {
+    require_edit_mode();
+    project_manager_.open_scene(scene_file);
+    selected_ = {};
+}
+
+EditorContext::SaveResult EditorContext::save_scene() {
+    require_edit_mode();
+    if (!project_manager_.has_scene()) throw std::logic_error("No scene is currently open");
+    if (project_manager_.current_scene_file().empty()) {
+        base::log::debug("EditorContext: scene has no file path; Save As is required");
+        return SaveResult::NeedsPath;
+    }
+    project_manager_.save_scene();
+    return SaveResult::Saved;
+}
+
+void EditorContext::save_scene_as(std::filesystem::path scene_file) {
+    require_edit_mode();
+    if (!base::has_extension(scene_file, ".vscene")) scene_file.replace_extension(".vscene");
+    project_manager_.save_as_scene(scene_file);
+}
+
+void EditorContext::create_project(const std::filesystem::path& directory, const std::string& name) {
+    require_edit_mode();
+    project_manager_.create_project(directory, name);
+    new_scene();
+}
+
+void EditorContext::open_project(const std::filesystem::path& project_file) {
+    require_edit_mode();
+    project_manager_.open_project(project_file);
+
+    const auto last_scene = project_manager_.resolved_last_edited_scene();
+    if (!last_scene.empty()) {
+        std::error_code check_error;
+        if (std::filesystem::is_regular_file(last_scene, check_error)) {
+            try {
+                open_scene(last_scene);
+                return;
+            } catch (const std::exception& open_error) {
+                base::log::warn("Failed to open last edited scene '{}': {}", last_scene.string(), open_error.what());
+            }
+        } else {
+            base::log::warn("Last edited scene '{}' is missing; starting a new scene", last_scene.string());
+        }
+    }
+    new_scene();
+}
+
+std::filesystem::path EditorContext::project_directory() const { return project_manager_.current_project_dir(); }
+
+std::filesystem::path EditorContext::project_file() const { return project_manager_.current_project_file(); }
+
+std::filesystem::path EditorContext::assets_directory() const { return project_manager_.current_assets_dir(); }
+
+std::filesystem::path EditorContext::library_directory() const { return project_manager_.current_library_dir(); }
+
+std::filesystem::path EditorContext::build_directory() const { return project_manager_.current_build_dir(); }
+
+const ProjectInfo& EditorContext::project_info() const { return project_manager_.current_project_info(); }
+
+void EditorContext::set_build_info(BuildInfo build_info) { project_manager_.set_build_info(std::move(build_info)); }
+
+std::filesystem::path EditorContext::scene_dialog_directory() const {
+    auto directory = project_manager_.current_scene_file().parent_path();
+    if (directory.empty()) directory = project_manager_.current_project_dir();
+    if (directory.empty()) directory = std::filesystem::current_path();
+    return directory;
+}
+
+std::filesystem::path EditorContext::suggested_scene_name() const {
+    const auto scene_file = project_manager_.current_scene_file();
+    return scene_file.empty() ? std::filesystem::path{ "Untitled.vscene" } : scene_file.filename();
+}
+
+vulcal::scene::Entity EditorContext::selected_entity() const {
+    const auto* scene = playing() ? runtime_scene_.get() : project_manager_.current_scene();
+    return scene && scene->contains(selected_) ? selected_ : vulcal::scene::Entity{};
+}
+
+void EditorContext::select(vulcal::scene::Entity entity) {
+    if (entity) {
+        const auto* scene = playing() ? runtime_scene_.get() : project_manager_.current_scene();
+        if (!scene || !scene->contains(entity)) throw std::invalid_argument("Entity belongs to a different scene");
+    }
+    const auto selection = entity ? entity : vulcal::scene::Entity{};
+    if (selection != selected_) {
+        if (selection) {
+            base::log::trace("EditorContext: selected entity '{}' ({})", selection.get_component<vulcal::scene::TagComponent>().name_,
+                             selection.get_component<vulcal::scene::IDComponent>().id_.to_string());
+        } else {
+            base::log::trace("EditorContext: cleared selection");
+        }
+    }
+    selected_ = selection;
+}
+
+vulcal::scene::Entity EditorContext::create_entity() {
+    require_edit_mode();
+    auto entity = scene().create_entity();
+    select(entity);
+    return entity;
+}
+
+void EditorContext::destroy_entity(vulcal::scene::Entity entity) {
+    require_edit_mode();
+    if (!entity) return;
+    if (!scene().contains(entity)) {
+        base::log::error("Cannot destroy an entity that belongs to a different scene");
+        throw std::invalid_argument("Entity belongs to a different scene");
+    }
+    if (selected_ == entity) selected_ = {};
+    scene().destroy_entity(entity);
+}
+
+} // namespace editor

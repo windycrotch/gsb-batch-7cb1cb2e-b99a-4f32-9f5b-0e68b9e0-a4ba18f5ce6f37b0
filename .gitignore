@@ -1,0 +1,18 @@
+build/
+build-release/
+build-msvc/
+build-msvc-release/
+.vulcal_engine/
+build-gcc/
+build-gcc-release/
+imgui.ini
+vulcal_editor.ini
+docs/superpowers/
+log/
+
+# CMake-generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+/third_party/glad/Makefile

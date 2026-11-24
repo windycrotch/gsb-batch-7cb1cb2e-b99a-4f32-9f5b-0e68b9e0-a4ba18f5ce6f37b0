@@ -1,0 +1,459 @@
+#include "vulcal_editor/editor_camera.h"
+#include "vulcal_editor/editor_context.h"
+#include "vulcal_editor/project/project.h"
+
+#include "base/path_utils.h"
+
+#include <chrono>
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <gtest/gtest.h>
+#include <memory>
+#include <stdexcept>
+#include <string>
+
+namespace {
+
+std::filesystem::path temporary_directory() {
+    const auto suffix = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    return std::filesystem::temp_directory_path() / ("vulcal_editor_test_" + suffix);
+}
+
+TEST(EditorContext, StartsWithoutSceneAndRejectsEntityCreation) {
+    editor::EditorContext context;
+    EXPECT_FALSE(context.has_scene());
+    EXPECT_FALSE(context.selected_entity());
+    EXPECT_THROW(context.create_entity(), std::logic_error);
+}
+
+TEST(EditorContext, SceneReplacementClearsSelectionBeforeOldSceneIsDestroyed) {
+    editor::EditorContext context;
+    context.set_scene(std::make_unique<vulcal::scene::Scene>());
+    context.create_entity();
+    auto replacement = std::make_unique<vulcal::scene::Scene>();
+    replacement->create_entity("Replacement");
+    context.set_scene(std::move(replacement));
+    EXPECT_FALSE(context.selected_entity());
+    EXPECT_EQ(context.scene().registry().view<vulcal::scene::TagComponent>().size(), 1u);
+}
+
+TEST(EditorContext, RejectsSelectionFromAnotherScene) {
+    editor::EditorContext context;
+    vulcal::scene::Scene other;
+    EXPECT_THROW(context.select(other.create_entity()), std::invalid_argument);
+    EXPECT_FALSE(context.selected_entity());
+}
+
+TEST(EditorContext, DeletingSelectedEntityClearsSelection) {
+    editor::EditorContext context;
+    context.set_scene(std::make_unique<vulcal::scene::Scene>());
+    auto selected = context.create_entity();
+    context.destroy_entity(selected);
+    EXPECT_FALSE(selected);
+    EXPECT_FALSE(context.selected_entity());
+}
+
+TEST(EditorContext, DeletingOtherEntityPreservesSelection) {
+    editor::EditorContext context;
+    context.set_scene(std::make_unique<vulcal::scene::Scene>());
+    auto other = context.create_entity();
+    auto selected = context.create_entity();
+    context.destroy_entity(other);
+    EXPECT_EQ(context.selected_entity(), selected);
+}
+
+TEST(EditorContext, ExternalDeletionDoesNotSelectRecycledHandle) {
+    editor::EditorContext context;
+    context.set_scene(std::make_unique<vulcal::scene::Scene>());
+    auto selected = context.create_entity();
+    context.scene().destroy_entity(selected);
+    context.scene().create_entity("New entity");
+    EXPECT_FALSE(context.selected_entity());
+}
+
+TEST(EditorContext, NullSceneReplacementPreservesExistingSceneAndSelection) {
+    editor::EditorContext context;
+    context.set_scene(std::make_unique<vulcal::scene::Scene>());
+    auto selected = context.create_entity();
+    EXPECT_THROW(context.set_scene(nullptr), std::invalid_argument);
+    EXPECT_EQ(context.selected_entity(), selected);
+}
+
+TEST(EditorContext, NewSceneCreatesDefaultSceneAndClearsSelection) {
+    editor::EditorContext context;
+    context.set_scene(std::make_unique<vulcal::scene::Scene>());
+    context.create_entity();
+    context.new_scene();
+    EXPECT_FALSE(context.selected_entity());
+    EXPECT_EQ(context.scene().registry().view<vulcal::scene::TagComponent>().size(), 3u);
+}
+
+TEST(EditorContext, SaveWithoutPathRequestsSaveAs) {
+    editor::EditorContext context;
+    context.new_scene();
+    EXPECT_EQ(context.save_scene(), editor::EditorContext::SaveResult::NeedsPath);
+}
+
+TEST(EditorContext, SaveAsAddsSceneExtensionAndRemembersPath) {
+    const auto directory = temporary_directory();
+    std::filesystem::create_directories(directory);
+
+    editor::EditorContext context;
+    context.new_scene();
+    context.save_scene_as(directory / "level");
+
+    EXPECT_TRUE(std::filesystem::exists(directory / "level.vscene"));
+    EXPECT_EQ(context.scene_dialog_directory(), directory);
+    EXPECT_EQ(context.suggested_scene_name(), std::filesystem::path{ "level.vscene" });
+    EXPECT_EQ(context.save_scene(), editor::EditorContext::SaveResult::Saved);
+
+    std::filesystem::remove_all(directory);
+}
+
+TEST(EditorContext, CreateProjectStartsDefaultScene) {
+    const auto directory = temporary_directory();
+    std::filesystem::create_directories(directory);
+
+    editor::EditorContext context;
+    context.create_project(directory, "Demo");
+
+    EXPECT_TRUE(std::filesystem::exists(directory / "Demo.vproj"));
+    EXPECT_TRUE(std::filesystem::is_directory(directory / "assets"));
+    EXPECT_TRUE(std::filesystem::is_directory(directory / ".vulcal_engine"));
+    EXPECT_TRUE(std::filesystem::is_directory(directory / "build"));
+    EXPECT_EQ(context.scene().registry().view<vulcal::scene::TagComponent>().size(), 3u);
+
+    std::filesystem::remove_all(directory);
+}
+
+TEST(EditorContext, OpenProjectStartsDefaultScene) {
+    const auto directory = temporary_directory();
+    std::filesystem::create_directories(directory);
+    {
+        editor::EditorContext creator;
+        creator.create_project(directory, "Demo");
+    }
+
+    editor::EditorContext context;
+    context.open_project(directory / "Demo.vproj");
+
+    EXPECT_EQ(context.scene().registry().view<vulcal::scene::TagComponent>().size(), 3u);
+
+    std::filesystem::remove_all(directory);
+}
+
+TEST(ProjectInfo, RoundTripsLastEditedScene) {
+    const auto directory = temporary_directory();
+    std::filesystem::create_directories(directory);
+
+    editor::ProjectInfo info;
+    info.name              = "Demo";
+    info.description       = "Description";
+    info.author            = "Author";
+    info.assets_path       = "assets";
+    info.last_edited_scene = "assets/scenes/level.vscene";
+    ASSERT_TRUE(editor::save_project_info(directory / "Demo.vproj", info));
+
+    editor::ProjectInfo loaded;
+    ASSERT_TRUE(editor::load_project_info(directory / "Demo.vproj", loaded));
+    EXPECT_EQ(loaded.last_edited_scene, info.last_edited_scene);
+
+    std::filesystem::remove_all(directory);
+}
+
+TEST(ProjectInfo, RoundTripsBuildInfoAndKeepsItOptionalForOlderProjects) {
+    const auto directory = temporary_directory();
+    std::filesystem::create_directories(directory);
+
+    editor::ProjectInfo info;
+    info.name = "Demo";
+    info.assets_path = "assets";
+    info.build_info = editor::BuildInfo{
+        .open_scene = "assets/scenes/main.vscene",
+        .build_dir = std::filesystem::absolute(directory / "release"),
+    };
+    ASSERT_TRUE(editor::save_project_info(directory / "Demo.vproj", info));
+
+    editor::ProjectInfo loaded;
+    ASSERT_TRUE(editor::load_project_info(directory / "Demo.vproj", loaded));
+    ASSERT_TRUE(loaded.build_info.has_value());
+    EXPECT_EQ(loaded.build_info->open_scene, info.build_info->open_scene);
+    EXPECT_EQ(loaded.build_info->build_dir, info.build_info->build_dir);
+
+    {
+        std::ofstream old_project(directory / "Old.vproj");
+        old_project << "name: Old\ndescription: ''\nauthor: ''\nassets_path: assets\nlast_edited_scene: ''\n";
+    }
+    editor::ProjectInfo old_info;
+    ASSERT_TRUE(editor::load_project_info(directory / "Old.vproj", old_info));
+    EXPECT_FALSE(old_info.build_info.has_value());
+
+    std::filesystem::remove_all(directory);
+}
+
+TEST(ProjectInfo, RoundTripsUtf8BuildPathsAndProjectFilename) {
+    const auto directory = temporary_directory();
+    std::filesystem::create_directories(directory);
+    editor::ProjectInfo info;
+    info.name = "Unicode";
+    info.assets_path = std::filesystem::path{ u8"\u8d44\u6e90" };
+    info.last_edited_scene = info.assets_path / std::filesystem::path{ u8"\u5f00\u573a.vscene" };
+    info.build_info = editor::BuildInfo{
+        .open_scene = info.last_edited_scene,
+        .build_dir = directory / std::filesystem::path{ u8"\u53d1\u5e03_\U0001f680" },
+    };
+    const auto project_file = directory / std::filesystem::path{ u8"\u6e38\u620f.vproj" };
+    ASSERT_TRUE(editor::save_project_info(project_file, info));
+    std::ifstream input(project_file);
+    const auto yaml = YAML::Load(input);
+    input.close();
+    const auto expected_utf8 = base::path_to_utf8(info.build_info->build_dir);
+    EXPECT_EQ(yaml["build_info"]["build_dir"].as<std::string>(), expected_utf8);
+
+    editor::ProjectInfo loaded;
+    ASSERT_TRUE(editor::load_project_info(project_file, loaded));
+    ASSERT_TRUE(loaded.build_info);
+    EXPECT_EQ(loaded.assets_path, info.assets_path);
+    EXPECT_EQ(loaded.last_edited_scene, info.last_edited_scene);
+    EXPECT_EQ(loaded.build_info->open_scene, info.build_info->open_scene);
+    EXPECT_EQ(loaded.build_info->build_dir, info.build_info->build_dir);
+    std::filesystem::remove_all(directory);
+}
+
+TEST(ProjectManager, ResolvesConfiguredBuildDirectoryOrProjectDefault) {
+    const auto directory = temporary_directory();
+    std::filesystem::create_directories(directory);
+
+    editor::ProjectManager project;
+    project.create_project(directory, "Demo");
+    EXPECT_EQ(project.current_build_dir(), directory / "build");
+
+    project.set_build_info(editor::BuildInfo{
+        .open_scene = "assets/scenes/main.vscene",
+        .build_dir = std::filesystem::absolute(directory / "release"),
+    });
+    EXPECT_EQ(project.current_build_dir(), std::filesystem::absolute(directory / "release"));
+
+    std::filesystem::remove_all(directory);
+}
+
+TEST(EditorContext, SaveSceneRecordsRelativeLastEditedScene) {
+    const auto directory = temporary_directory();
+    std::filesystem::create_directories(directory);
+
+    editor::EditorContext context;
+    context.create_project(directory, "Demo");
+    const auto scene_file = directory / "assets" / "scenes" / "level.vscene";
+    std::filesystem::create_directories(scene_file.parent_path());
+    context.save_scene_as(scene_file);
+
+    editor::ProjectInfo info;
+    ASSERT_TRUE(editor::load_project_info(directory / "Demo.vproj", info));
+    EXPECT_EQ(info.last_edited_scene, std::filesystem::path{ "assets/scenes/level.vscene" });
+
+    std::filesystem::remove_all(directory);
+}
+
+TEST(EditorContext, RejectsSavingSceneOutsideProject) {
+    const auto directory = temporary_directory();
+    std::filesystem::create_directories(directory);
+
+    editor::EditorContext context;
+    context.create_project(directory, "Demo");
+    const auto outside = directory.parent_path() / (directory.filename().string() + "_outside.vscene");
+
+    EXPECT_THROW(context.save_scene_as(outside), std::invalid_argument);
+    EXPECT_FALSE(std::filesystem::exists(outside));
+
+    std::filesystem::remove_all(directory);
+}
+
+TEST(EditorContext, RejectsOpeningSceneOutsideProject) {
+    const auto directory = temporary_directory();
+    std::filesystem::create_directories(directory);
+
+    editor::EditorContext context;
+    context.create_project(directory, "Demo");
+    const auto outside = directory.parent_path() / (directory.filename().string() + "_outside.vscene");
+
+    EXPECT_THROW(context.open_scene(outside), std::invalid_argument);
+
+    std::filesystem::remove_all(directory);
+}
+
+TEST(EditorContext, RejectsAssetsPathOutsideProject) {
+    const auto directory = temporary_directory();
+    std::filesystem::create_directories(directory);
+    {
+        editor::EditorContext creator;
+        creator.create_project(directory, "Demo");
+    }
+
+    editor::ProjectInfo info;
+    ASSERT_TRUE(editor::load_project_info(directory / "Demo.vproj", info));
+    info.assets_path = "../assets";
+    ASSERT_TRUE(editor::save_project_info(directory / "Demo.vproj", info));
+
+    editor::EditorContext context;
+    EXPECT_THROW(context.open_project(directory / "Demo.vproj"), std::runtime_error);
+
+    std::filesystem::remove_all(directory);
+}
+
+TEST(EditorContext, OpenProjectIgnoresLastEditedSceneOutsideProject) {
+    const auto directory = temporary_directory();
+    std::filesystem::create_directories(directory);
+    {
+        editor::EditorContext creator;
+        creator.create_project(directory, "Demo");
+    }
+
+    editor::ProjectInfo info;
+    ASSERT_TRUE(editor::load_project_info(directory / "Demo.vproj", info));
+    info.last_edited_scene = "../escape.vscene";
+    ASSERT_TRUE(editor::save_project_info(directory / "Demo.vproj", info));
+
+    editor::EditorContext context;
+    context.open_project(directory / "Demo.vproj");
+
+    EXPECT_EQ(context.scene().registry().view<vulcal::scene::TagComponent>().size(), 3u);
+    EXPECT_EQ(context.suggested_scene_name(), std::filesystem::path{ "Untitled.vscene" });
+
+    std::filesystem::remove_all(directory);
+}
+
+TEST(EditorContext, OpenProjectRestoresLastEditedScene) {
+    const auto directory = temporary_directory();
+    std::filesystem::create_directories(directory);
+    {
+        editor::EditorContext creator;
+        creator.create_project(directory, "Demo");
+        creator.create_entity().get_component<vulcal::scene::TagComponent>().name_ = "Marker";
+        const auto scene_file                                                      = directory / "assets" / "scenes" / "level.vscene";
+        std::filesystem::create_directories(scene_file.parent_path());
+        creator.save_scene_as(scene_file);
+    }
+
+    editor::EditorContext context;
+    context.open_project(directory / "Demo.vproj");
+
+    EXPECT_EQ(context.scene_dialog_directory(), directory / "assets" / "scenes");
+    EXPECT_EQ(context.suggested_scene_name(), std::filesystem::path{ "level.vscene" });
+    bool found = false;
+    for (const auto entity: context.scene().registry().view<vulcal::scene::TagComponent>()) {
+        found |= context.scene().registry().get<vulcal::scene::TagComponent>(entity).name_ == "Marker";
+    }
+    EXPECT_TRUE(found);
+
+    std::filesystem::remove_all(directory);
+}
+
+TEST(EditorContext, OpenProjectFallsBackToDefaultSceneWhenLastEditedSceneIsMissing) {
+    const auto directory = temporary_directory();
+    std::filesystem::create_directories(directory);
+    const auto scene_file = directory / "level.vscene";
+    {
+        editor::EditorContext creator;
+        creator.create_project(directory, "Demo");
+        creator.save_scene_as(scene_file);
+    }
+    std::filesystem::remove(scene_file);
+
+    editor::EditorContext context;
+    context.open_project(directory / "Demo.vproj");
+
+    EXPECT_EQ(context.scene().registry().view<vulcal::scene::TagComponent>().size(), 3u);
+    EXPECT_EQ(context.suggested_scene_name(), std::filesystem::path{ "Untitled.vscene" });
+
+    std::filesystem::remove_all(directory);
+}
+
+TEST(EditorContext, FailedProjectOpenPreservesPreviousProjectAndScene) {
+    const auto directory = temporary_directory();
+    const auto previous  = directory / "previous";
+    const auto broken    = directory / "broken";
+    std::filesystem::create_directories(previous);
+    std::filesystem::create_directories(broken);
+    {
+        editor::EditorContext creator;
+        creator.create_project(broken, "Broken");
+    }
+    std::filesystem::remove(broken / "build");
+    std::ofstream(broken / "build").put('x');
+
+    editor::EditorContext context;
+    context.create_project(previous, "Previous");
+    const auto selected = context.create_entity();
+    const auto* scene   = &context.scene();
+
+    EXPECT_THROW(context.open_project(broken / "Broken.vproj"), std::filesystem::filesystem_error);
+    EXPECT_EQ(context.assets_directory(), previous / "assets");
+    EXPECT_EQ(context.library_directory(), previous / ".vulcal_engine");
+    EXPECT_EQ(&context.scene(), scene);
+    EXPECT_EQ(context.selected_entity(), selected);
+
+    std::filesystem::remove_all(directory);
+}
+
+TEST(EditorCamera, MovementIsIndependentOfFrameRate) {
+    editor::EditorCamera whole;
+    editor::EditorCamera split;
+    const editor::EditorCamera::Input input{ .movement = { 0.0f, 0.0f, 1.0f } };
+    whole.update(input, 1.0f);
+    for (int i = 0; i < 100; ++i) split.update(input, 0.01f);
+    EXPECT_LT(glm::length(whole.data(1.0f).position_ - split.data(1.0f).position_), 1e-3f);
+}
+
+TEST(EditorCamera, DiagonalMovementHasTheSameSpeedAsForwardMovement) {
+    editor::EditorCamera forward;
+    editor::EditorCamera diagonal;
+    const auto origin = forward.data(1.0f).position_;
+    forward.update({ .movement = { 0.0f, 0.0f, 1.0f } }, 1.0f);
+    diagonal.update({ .movement = { 1.0f, 1.0f, 1.0f } }, 1.0f);
+    EXPECT_NEAR(glm::length(forward.data(1.0f).position_ - origin), forward.speed(), 1e-4f);
+    EXPECT_NEAR(glm::length(diagonal.data(1.0f).position_ - origin), forward.speed(), 1e-4f);
+}
+
+TEST(EditorCamera, VerticalMovementUsesWorldUp) {
+    editor::EditorCamera camera;
+    const auto origin = camera.data(1.0f).position_;
+    camera.update({ .movement = { 0.0f, 1.0f, 0.0f } }, 1.0f);
+    const auto delta = camera.data(1.0f).position_ - origin;
+    EXPECT_NEAR(delta.x, 0.0f, 1e-4f);
+    EXPECT_NEAR(delta.z, 0.0f, 1e-4f);
+    EXPECT_NEAR(delta.y, camera.speed(), 1e-4f);
+}
+
+TEST(EditorCamera, WheelChangesSpeedWithinFinitePositiveBounds) {
+    editor::EditorCamera camera;
+    const float initial = camera.speed();
+    camera.update({ .wheel = 1.0f }, 0.0f);
+    EXPECT_GT(camera.speed(), initial);
+    camera.update({ .wheel = -1.0f }, 0.0f);
+    EXPECT_NEAR(camera.speed(), initial, 1e-4f);
+    for (int i = 0; i < 100; ++i) camera.update({ .wheel = -100.0f }, 0.0f);
+    EXPECT_TRUE(std::isfinite(camera.speed()));
+    EXPECT_GT(camera.speed(), 0.0f);
+    for (int i = 0; i < 100; ++i) camera.update({ .wheel = 100.0f }, 0.0f);
+    EXPECT_TRUE(std::isfinite(camera.speed()));
+    EXPECT_LT(camera.speed(), 10000.0f);
+}
+
+TEST(EditorCamera, ExtremePitchRemainsUprightAndFinite) {
+    editor::EditorCamera camera;
+    camera.update({ .look_delta = { 0.0f, -100000.0f } }, 0.0f);
+    const auto view = camera.data(1.0f).view_;
+    for (int col = 0; col < 4; ++col)
+        for (int row = 0; row < 4; ++row) EXPECT_TRUE(std::isfinite(view[col][row]));
+    EXPECT_GT(view[1][1], 0.0f);
+}
+
+TEST(EditorCamera, ProjectionUsesViewportAspect) {
+    editor::EditorCamera camera;
+    const auto projection = camera.data(2.0f).projection_;
+    EXPECT_NEAR(projection[1][1] / projection[0][0], 2.0f, 1e-4f);
+    EXPECT_THROW(camera.data(0.0f), std::invalid_argument);
+}
+
+} // namespace

@@ -1,0 +1,189 @@
+#include "scene/scene_serializer.h"
+
+#include "base/profiler.h"
+
+#include "base/logger.h"
+#include "base/path_utils.h"
+#include "resource/directory_provider.h"
+#include "resource/resource_provider.h"
+#include "base/yaml.h"
+#include "scene/components.h"
+
+#include <cstdint>
+#include <fstream>
+#include <string>
+#include <yaml-cpp/yaml.h>
+
+namespace vulcal::scene {
+namespace {
+constexpr std::uint32_t scene_format_version = 1;
+
+template<typename T>
+void field(YAML::Node node, const char* key, T& value, bool loading) {
+    if (loading) value = node[key].as<T>();
+    else
+        node[key] = value;
+}
+
+template<glm::length_t N>
+void field(YAML::Node node, const char* key, glm::vec<N, float>& value, bool loading) {
+    if (loading) {
+        value = base::yaml::read_vec<N>(node, key);
+    } else {
+        YAML::Node data(YAML::NodeType::Sequence);
+        data.SetStyle(YAML::EmitterStyle::Flow);
+        for (glm::length_t i = 0; i < N; ++i) data.push_back(value[i]);
+        node[key] = data;
+    }
+}
+
+void fields(YAML::Node n, TransformComponent& c, bool load) {
+    field(n, "translation", c.translation_, load);
+    field(n, "rotation", c.rotation_, load);
+    field(n, "scale", c.scale_, load);
+}
+
+void fields(YAML::Node n, MeshRendererComponent& c, bool load) {
+    if (load) {
+        c.mesh_asset_id_     = vulcal::asset::MeshAssetID{ n["mesh_asset_id"].as<std::uint64_t>() };
+        c.material_asset_id_ = vulcal::asset::MaterialAssetID{ n["material_asset_id"].as<std::uint64_t>() };
+        c.visible_           = n["visible"].as<bool>();
+    } else {
+        n["mesh_asset_id"]     = c.mesh_asset_id_.value();
+        n["material_asset_id"] = c.material_asset_id_.value();
+        n["visible"]           = c.visible_;
+    }
+}
+
+void fields(YAML::Node n, SpriteRendererComponent& c, bool load) {
+    if (load) {
+        c.texture_asset_id_ = vulcal::asset::TextureAssetID{ n["texture_asset_id"].as<std::uint64_t>() };
+    } else {
+        n["texture_asset_id"] = c.texture_asset_id_.value();
+    }
+    field(n, "color", c.color_, load);
+    field(n, "uv_rect", c.uv_rect_, load);
+    field(n, "pivot", c.pivot_, load);
+    field(n, "flip_x", c.flip_x_, load);
+    field(n, "flip_y", c.flip_y_, load);
+    field(n, "sorting_order", c.sorting_order_, load);
+    field(n, "visible", c.visible_, load);
+}
+
+void fields(YAML::Node n, CameraComponent& c, bool load) {
+    std::string projection = c.projection_type_ == CameraComponent::ProjectionType::Perspective ? "perspective" : "orthographic";
+    field(n, "projection", projection, load);
+    if (projection == "perspective") c.projection_type_ = CameraComponent::ProjectionType::Perspective;
+    else
+        c.projection_type_ = CameraComponent::ProjectionType::Orthographic;
+    field(n, "primary", c.primary_, load);
+    field(n, "perspective_fov_y", c.perspective_fov_y_, load);
+    field(n, "perspective_near", c.perspective_near_, load);
+    field(n, "perspective_far", c.perspective_far_, load);
+    field(n, "orthographic_left", c.orthographic_left_, load);
+    field(n, "orthographic_right", c.orthographic_right_, load);
+    field(n, "orthographic_bottom", c.orthographic_bottom_, load);
+    field(n, "orthographic_top", c.orthographic_top_, load);
+    field(n, "orthographic_near", c.orthographic_near_, load);
+    field(n, "orthographic_far", c.orthographic_far_, load);
+}
+
+void fields(YAML::Node n, LightComponent& c, bool load) {
+    std::string type = "directional";
+    field(n, "type", type, load);
+    field(n, "color", c.color_, load);
+    field(n, "intensity", c.intensity_, load);
+    field(n, "shadow_enabled", c.shadow_enabled_, load);
+    field(n, "shadow_map_size", c.shadow_map_size_, load);
+    field(n, "shadow_center", c.shadow_center_, load);
+    field(n, "shadow_extent", c.shadow_extent_, load);
+    field(n, "shadow_near", c.shadow_near_, load);
+    field(n, "shadow_far", c.shadow_far_, load);
+    field(n, "shadow_depth_bias", c.shadow_depth_bias_, load);
+    field(n, "shadow_normal_bias", c.shadow_normal_bias_, load);
+}
+
+void fields(YAML::Node n, EnvironmentComponent& c, bool load) {
+    field(n, "ambient_color", c.ambient_color_, load);
+    field(n, "clear_color", c.clear_color_, load);
+}
+
+template<typename T>
+void save_component(YAML::Node node, const char* key, const entt::registry& registry, entt::entity entity) {
+    if (const auto* component = registry.try_get<T>(entity)) {
+        auto copy = *component;
+        fields(node[key], copy, false);
+    }
+}
+
+template<typename T>
+void load_component(const YAML::Node& node, const char* key, Entity entity) {
+    if (auto data = node[key]) {
+        auto& component = entity.add_component<T>();
+        fields(data, component, true);
+    }
+}
+} // namespace
+
+void SceneSerializer::serialize(const Scene& scene, const std::filesystem::path& path) {
+    VULCAL_PROFILE_SCOPE();
+    YAML::Node root;
+    root["format_version"] = scene_format_version;
+    auto entities = root["entities"] = YAML::Node(YAML::NodeType::Sequence);
+    const auto& registry             = scene.registry();
+    for (const auto entity: registry.view<const IDComponent, const TagComponent, const TransformComponent>()) {
+        YAML::Node node;
+        node["id"]   = registry.get<IDComponent>(entity).id_.value();
+        node["name"] = registry.get<TagComponent>(entity).name_;
+        save_component<TransformComponent>(node, "transform", registry, entity);
+        save_component<MeshRendererComponent>(node, "mesh_renderer", registry, entity);
+        save_component<SpriteRendererComponent>(node, "sprite_renderer", registry, entity);
+        save_component<CameraComponent>(node, "camera", registry, entity);
+        save_component<LightComponent>(node, "light", registry, entity);
+        save_component<EnvironmentComponent>(node, "environment", registry, entity);
+        if (const auto* script = registry.try_get<vulcal::scene::ScriptComponent>(entity)) {
+            node["script"]["path"] = script->script_path_;
+        }
+        entities.push_back(node);
+    }
+    base::log::debug("SceneSerializer: writing {} (version {}, {} entities)", base::path_to_utf8(path), scene_format_version, entities.size());
+    std::ofstream output(path, std::ios::binary);
+    output << root;
+    output.close();
+    if (!output) throw std::runtime_error("Could not write scene: " + base::path_to_utf8(path));
+}
+
+std::unique_ptr<Scene> SceneSerializer::deserialize(const std::filesystem::path& path) {
+    VULCAL_PROFILE_SCOPE();
+    base::log::debug("SceneSerializer: reading {}", base::path_to_utf8(path));
+    const auto absolute = std::filesystem::absolute(path);
+    const resource::DirectoryProvider resources(absolute.parent_path());
+    return deserialize(resources, base::path_to_utf8(absolute.filename()));
+}
+
+std::unique_ptr<Scene> SceneSerializer::deserialize(const resource::ResourceProvider& resources, std::string_view logical_path) {
+    VULCAL_PROFILE_SCOPE();
+    base::log::debug("SceneSerializer: reading {}", logical_path);
+    const auto root    = YAML::Load(resources.read_text(logical_path));
+    const auto version = root["format_version"].as<std::uint32_t>();
+    if (version != scene_format_version) throw std::runtime_error("Unsupported scene format version");
+    const auto entities = root["entities"];
+    auto scene          = std::make_unique<Scene>();
+    for (const auto& node: entities) {
+        const auto id                           = node["id"].as<std::uint64_t>();
+        auto entity                             = scene->create_entity(node["name"].as<std::string>());
+        entity.get_component<IDComponent>().id_ = base::UUID{ id };
+        fields(node["transform"], entity.get_component<TransformComponent>(), true);
+        load_component<MeshRendererComponent>(node, "mesh_renderer", entity);
+        load_component<SpriteRendererComponent>(node, "sprite_renderer", entity);
+        load_component<CameraComponent>(node, "camera", entity);
+        load_component<LightComponent>(node, "light", entity);
+        load_component<EnvironmentComponent>(node, "environment", entity);
+        if (const auto script = node["script"]) {
+            entity.add_component<ScriptComponent>().script_path_ = script["path"].as<std::string>();
+        }
+    }
+    base::log::debug("SceneSerializer: read {} (version {}, {} entities)", logical_path, version, entities.size());
+    return scene;
+}
+} // namespace vulcal::scene
