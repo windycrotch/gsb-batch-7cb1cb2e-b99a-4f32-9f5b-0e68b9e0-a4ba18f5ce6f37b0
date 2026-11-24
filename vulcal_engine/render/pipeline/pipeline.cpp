@@ -17,6 +17,15 @@ Pipeline::Pipeline() {
     passes_.push_back(std::make_unique<SpritePass>());
 }
 
+std::vector<const char*> Pipeline::pass_names() const {
+    std::vector<const char*> names;
+    names.reserve(passes_.size());
+    for (const auto& pass: passes_) {
+        names.push_back(pass->name());
+    }
+    return names;
+}
+
 void Pipeline::render(const RenderData& data, gfx::RenderTarget* target,
         const std::vector<DrawItem>& items) {
     PassContext ctx{ .data_ = data, .target_ = target, .viewport_ = gfx::Command::viewport() };

@@ -19,6 +19,10 @@ public:
 
     void render(const RenderData& data, gfx::RenderTarget* target, const std::vector<DrawItem>& items);
 
+    // Ordered pass names, in execution order. Exposed for diagnostics and
+    // tests that assert the shadow -> forward -> sprite sequence.
+    std::vector<const char*> pass_names() const;
+
 private:
     std::vector<std::unique_ptr<Pass>> passes_;
 };

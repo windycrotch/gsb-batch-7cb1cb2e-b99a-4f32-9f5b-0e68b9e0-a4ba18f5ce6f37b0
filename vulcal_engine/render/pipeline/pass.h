@@ -59,7 +59,13 @@ public:
 
     virtual void prepare(PassContext& ctx) = 0;
     virtual void draw(PassContext& ctx, const DrawItem& item) = 0;
-    virtual void finish(PassContext& ctx) = 0;
+    // Derived overrides must end with Pass::finish(ctx) so no fixed-function
+    // state (depth writes, blending, polygon offset, ...) escapes the pass.
+    virtual void finish(PassContext& ctx);
+
+    // Restores the canonical GPU state shared between passes/frames. Exposed
+    // so custom pipelines can enforce the same boundary after a pass.
+    static void reset_gpu_state();
 
 protected:
     explicit Pass(const gfx::PipelineState::Spec& pipeline_spec = {});

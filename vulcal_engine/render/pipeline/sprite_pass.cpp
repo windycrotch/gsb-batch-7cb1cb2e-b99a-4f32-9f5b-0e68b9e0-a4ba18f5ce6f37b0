@@ -112,6 +112,7 @@ void SpritePass::finish(PassContext& ctx) {
     gfx::Program::unuse();
     gfx::VertexArray::unbind();
     gfx::RenderTarget::unbind();
+    Pass::finish(ctx);
 }
 
 } // namespace vulcal::render

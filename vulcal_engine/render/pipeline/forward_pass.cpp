@@ -8,6 +8,8 @@
 #include "render/resources/mesh_gpu.h"
 #include "render/shaders/embedded_shaders.h"
 
+#include <glad/glad.h>
+
 namespace vulcal::render {
 namespace {
 struct alignas(16) CameraUBO {
@@ -58,6 +60,12 @@ void ForwardPass::prepare(PassContext& ctx) {
         }
     } else {
         program_.set("u_shadow_enabled", 0);
+        // Detach any shadow map a previous frame left on this unit. With
+        // u_shadow_enabled == 0 the shader does not sample it, and the unbind
+        // guarantees no stale depth texture can feed the forward pass.
+        glActiveTexture(GL_TEXTURE0 + kShadowMapUnit);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glBindSampler(kShadowMapUnit, 0);
     }
 
     set_light(ctx.data_);
@@ -90,6 +98,7 @@ void ForwardPass::finish(PassContext& ctx) {
     gfx::Program::unuse();
     gfx::VertexArray::unbind();
     gfx::RenderTarget::unbind();
+    Pass::finish(ctx);
 }
 
 } // namespace vulcal::render

@@ -23,4 +23,19 @@ void Pass::bind_pipeline() {
     program_.use();
 }
 
+void Pass::finish(PassContext& /*ctx*/) {
+    reset_gpu_state();
+}
+
+void Pass::reset_gpu_state() {
+    // Re-issue every fixed-function toggle from a neutral spec. Invalidating
+    // the global state cache first guarantees the driver actually receives the
+    // calls even if another pass left the cache out of sync with the GL state.
+    static const gfx::PipelineState neutral{ gfx::PipelineState::Spec{} };
+    gfx::PipelineState::reset_cache();
+    gfx::Command::apply(neutral);
+    gfx::Program::unuse();
+    gfx::VertexArray::unbind();
+}
+
 } // namespace vulcal::render
