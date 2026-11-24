@@ -1,0 +1,78 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# Go workspace file
+go.work
+
+/build/*
+!/build/appicon.png
+!/build/dmg/
+!/build/Taskfile.yml
+!/build/config.yml
+!/build/darwin/
+!/build/windows/
+/build/darwin/icons.icns
+/build/windows/icon.ico
+
+node_modules/
+/frontend/build
+
+.vscode/
+.DS_Store
+*.log
+*.dmg
+frontend_build/
+
+*-darwin-amd64
+*-darwin-arm64
+*-windows-amd64.exe
+*-linux-amd64
+*-linux-arm64
+*.zip
+/cmd/uiautodev-server/uiautodev-server
+/cmd/uiautodev-server/frontend_build/
+/frontend/bindings/github.com/uiautodev/
+/plugins/
+dist/
+devimages/
+version.txt
+public_key_hash.go
+screenshot*.png
+*.pem
+selfIdentity.plist
+license.key
+version/version.json
+.agent/
+/binaries/
+.claude/
+.opencode/
+.github/*
+!.github/workflows/
+!.github/actions/
+!.github/FUNDING.yml
+/main
+/uiautodev
+/uiautodev-server
+
+# npm registry auth token
+.npmrc
+
+.playwright-cli/
+.playwright-mcp/
+.task/
+
+*.swp
+/release

@@ -1,0 +1,40 @@
+{
+  "name": "uiautodev",
+  "version": "0.4.2",
+  "description": "CLI to download and run UIAutoDev server binary",
+  "type": "commonjs",
+  "main": "src/index.js",
+  "bin": {
+    "uiautodev": "bin/uiautodev.js"
+  },
+  "files": [
+    "bin",
+    "src"
+  ],
+  "dependencies": {
+    "commander": "^12.1.0",
+    "debug": "^4.4.3"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "keywords": [
+    "uiautodev",
+    "uiauto",
+    "automation",
+    "device"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/uiautodev/uiautodev/tree/master/npm#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/uiautodev/uiautodev.git",
+    "directory": "npm"
+  },
+  "bugs": {
+    "url": "https://github.com/uiautodev/uiautodev/issues"
+  }
+}
