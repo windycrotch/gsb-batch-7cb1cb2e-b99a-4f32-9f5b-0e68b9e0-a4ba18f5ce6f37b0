@@ -7,15 +7,15 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
-	"github.com/theredrad/udpsocket/crypto"
-	"github.com/theredrad/udpsocket/encoding"
-	"github.com/theredrad/udpsocket/encoding/pb"
 	"io/ioutil"
 	"log"
 	"net"
 	"sync"
 	"time"
+
+	"github.com/theredrad/udpsocket/crypto"
+	"github.com/theredrad/udpsocket/encoding"
+	"github.com/theredrad/udpsocket/encoding/pb"
 )
 
 // HandlerFunc is called when a custom message type is received from the client
@@ -33,6 +33,8 @@ var (
 	ErrMinimumPayloadSizeLimit      = errors.New("minimum payload size limit")
 	ErrClientCookieIsInvalid        = errors.New("client cookie is invalid")
 	ErrInvalidPayloadBodySize       = errors.New("payload body size is invalid")
+	ErrClientSessionExpired         = errors.New("client session expired due to heartbeat timeout")
+	ErrDuplicateHandshake           = errors.New("duplicate handshake request ignored")
 )
 
 const (
@@ -77,6 +79,11 @@ type Client struct {
 
 	lastHeartbeat *time.Time // last time when a record has been received from the client.
 
+	// removed is set once the client is deleted by expiration/cleanup. It lets
+	// in-flight broadcast goroutines skip the write instead of sending to a
+	// deleted client. Guarded by the embedded mutex.
+	removed bool
+
 	sync.Mutex
 }
 
@@ -101,6 +108,22 @@ type Server struct {
 	logger                  *log.Logger         // Logger
 	stop                    chan bool           // stop channel to stop listening
 	wg                      *sync.WaitGroup
+
+	// mu guards clients, sessions and handshakeCache.
+	mu sync.RWMutex
+	// handlerMu guards the user Handler callback.
+	handlerMu sync.RWMutex
+	// handshakeCache makes identical cookie-bearing handshakes idempotent.
+	handshakeCache map[string]*handshakeLease
+	handshakeTTL   time.Duration
+
+	// serveMu serializes Serve/Stop lifecycle transitions.
+	serveMu   sync.Mutex
+	serving   bool
+	serveDone chan struct{}
+
+	// bcastMu makes WaitGroup accounting safe against concurrent Stop/Wait.
+	bcastMu sync.Mutex
 }
 
 // NewServer accepts UDP connection & configs & returns a new instance of the Server
@@ -109,8 +132,9 @@ func NewServer(conn *net.UDPConn, options ...Option) (*Server, error) {
 	s := Server{
 		conn: conn,
 
-		clients:  make(map[string]*Client),
-		sessions: make(map[string]*Client),
+		clients:        make(map[string]*Client),
+		sessions:       make(map[string]*Client),
+		handshakeCache: make(map[string]*handshakeLease),
 
 		garbageCollectionStop: make(chan bool, 1),
 		stop:                  make(chan bool, 1),
@@ -130,6 +154,10 @@ func NewServer(conn *net.UDPConn, options ...Option) (*Server, error) {
 
 	if s.minimumPayloadSize == 0 {
 		s.minimumPayloadSize = defaultMinimumPayloadSize
+	}
+
+	if s.handshakeTTL == 0 {
+		s.handshakeTTL = defaultHandshakeReplayTTL
 	}
 
 	if s.symmCrypto == nil {
@@ -164,62 +192,204 @@ func NewServer(conn *net.UDPConn, options ...Option) (*Server, error) {
 	return &s, nil
 }
 
-// SetHandler sets the handler function as a callback to call when a custom record type is received from the client
+// SetHandler sets the handler function as a callback to call when a custom record type is received from the client.
+// It is safe to call while the server is serving.
 func (s *Server) SetHandler(f HandlerFunc) {
+	s.handlerMu.Lock()
 	s.handler = f
+	s.handlerMu.Unlock()
+}
+
+func (s *Server) getHandler() HandlerFunc {
+	s.handlerMu.RLock()
+	h := s.handler
+	s.handlerMu.RUnlock()
+	return h
 }
 
 func (s *Server) handleRawRecords() {
-	for r := range s.rawRecords {
+	s.serveMu.Lock()
+	records := s.rawRecords
+	s.serveMu.Unlock()
+	s.handleRawRecordsFrom(records)
+}
+
+// handleRawRecordsFrom processes records read from the provided epoch channel.
+func (s *Server) handleRawRecordsFrom(records <-chan rawRecord) {
+	for r := range records {
 		s.handleRecord(r.payload, r.addr)
 	}
 }
 
-// Serve starts listening to the UDP port for incoming bytes & then sends payload and sender address into the rawRecords channel if no error is found
+// Serve starts listening to the UDP port for incoming bytes & then sends payload and sender address into the rawRecords channel if no error is found.
+//
+// Serve is single-active: a second call while the server is already serving is
+// a safe no-op. After Stop returns, Serve can be called again on the same
+// connection: the new epoch starts from an empty session registry and freshly
+// rotated cookie/session secrets.
 func (s *Server) Serve() {
-	if s.heartbeatExpiration > 0 {
-		if s.garbageCollectionTicker != nil {
-			s.garbageCollectionTicker.Stop()
-		}
-		s.garbageCollectionTicker = time.NewTicker(s.heartbeatExpiration)
-		s.garbageCollectionStop = make(chan bool, 1)
-		go s.clientGarbageCollection()
+	s.serveMu.Lock()
+	if s.serving {
+		s.serveMu.Unlock()
+		s.logger.Println("Serve called while the server is already serving, ignoring")
+		return
 	}
 
-	s.rawRecords = make(chan rawRecord)
-	go s.handleRawRecords()
+	stopCh := make(chan bool, 1)
+	gcStopCh := make(chan bool, 1)
+	records := make(chan rawRecord)
+	done := make(chan struct{})
 
-	s.conn.SetReadDeadline(time.Time{}) // reset read deadline @TODO: handle error
-	s.stop = make(chan bool, 1)         // reset the stop channel
+	var ticker *time.Ticker
+	if s.heartbeatExpiration > 0 {
+		ticker = time.NewTicker(s.heartbeatExpiration)
+	}
+
+	s.serving = true
+	s.serveDone = done
+	s.stop = stopCh
+	s.garbageCollectionStop = gcStopCh
+	s.rawRecords = records
+	s.garbageCollectionTicker = ticker
+
+	s.bcastMu.Lock()
+	s.wg = &sync.WaitGroup{}
+	s.bcastMu.Unlock()
+	s.serveMu.Unlock()
+
+	// NOTE: state is intentionally not reset here. NewServer starts from fresh
+	// maps/secrets, and Stop converges the state (clears sessions and rotates
+	// secrets) before returning. Resetting again on Serve would race clients
+	// that compute cookies from the shared sessionManager immediately after
+	// `go Serve()`.
+
+	if err := s.conn.SetReadDeadline(time.Time{}); err != nil { // no deadline
+		s.logger.Printf("error while resetting read deadline: %s", err)
+	}
+
+	procDone := make(chan struct{})
+	go func() {
+		defer close(procDone)
+		s.handleRawRecordsFrom(records)
+	}()
+	if ticker != nil {
+		go s.garbageCollectionLoop(gcStopCh, ticker)
+	}
+
+	s.readLoop(records, stopCh)
+
+	// This epoch's read loop has exited; tear its auxiliary goroutines down.
+	select {
+	case gcStopCh <- true:
+	default:
+	}
+	if ticker != nil {
+		ticker.Stop()
+	}
+	close(records)
+	<-procDone // no record handler can repopulate state after Stop's reset
+
+	s.serveMu.Lock()
+	s.serving = false
+	if s.serveDone == done {
+		s.serveDone = nil
+	}
+	s.serveMu.Unlock()
+	close(done)
+}
+
+// readLoop reads datagrams and forwards them to the record processor. It is
+// unblocked from ReadFromUDP by Stop setting a past read deadline; stopCh then
+// makes it exit promptly instead of spinning or leaking across restarts.
+func (s *Server) readLoop(records chan<- rawRecord, stopCh <-chan bool) {
 	for {
 		select {
-		case <-s.stop:
+		case <-stopCh:
 			return
 		default:
-			buf := make([]byte, s.readBufferSize)
-			n, addr, err := s.conn.ReadFromUDP(buf)
-			if err != nil {
-				if errors.Is(err, net.ErrClosed) {
-					continue
-				}
+		}
 
-				s.logger.Printf("error while reading from udp: %s", err)
+		buf := make([]byte, s.readBufferSize)
+		n, addr, err := s.conn.ReadFromUDP(buf)
+		if err != nil {
+			select {
+			case <-stopCh:
+				return
+			default:
+			}
+
+			if errors.Is(err, net.ErrClosed) {
+				s.logger.Printf("udp connection closed, stopping read loop: %s", err)
+				return
+			}
+
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				// The past deadline poked by Stop; re-check the stop signal
+				// (it may win the race against the first timeout).
+				select {
+				case <-stopCh:
+					return
+				default:
+				}
 				continue
 			}
-			s.rawRecords <- rawRecord{
-				payload: buf[0:n],
-				addr:    addr,
-			}
+
+			s.logger.Printf("error while reading from udp: %s", err)
+			continue
+		}
+
+		rec := rawRecord{payload: buf[0:n], addr: addr}
+		select {
+		case <-stopCh:
+			return
+		case records <- rec:
 		}
 	}
 }
 
+// Stop stops the current Serve epoch. It is idempotent and safe to call even
+// if Serve was never started. It waits for in-flight broadcasts so callers can
+// rely on all writes having completed when Stop returns. Session state is
+// cleared and signing secrets rotated, making every old session/cookie invalid.
 func (s *Server) Stop() {
-	s.conn.SetReadDeadline(time.Unix(0, 1)) // set read deadline to a longtime ago @TODO: handle error
-	s.stop <- true
-	s.garbageCollectionStop <- true
-	close(s.rawRecords)
-	s.wg.Wait()
+	s.serveMu.Lock()
+	if s.conn != nil {
+		if err := s.conn.SetReadDeadline(time.Unix(0, 1)); err != nil && s.logger != nil { // past deadline unblocks ReadFromUDP
+			s.logger.Printf("error while setting stop read deadline: %s", err)
+		}
+	}
+	if s.stop != nil {
+		select {
+		case s.stop <- true:
+		default:
+		}
+	}
+	done := s.serveDone
+	s.serveMu.Unlock()
+
+	// Wait for broadcasts while holding bcastMu: a concurrent Broadcast blocks
+	// before Add until Wait has returned, so WaitGroup accounting stays safe.
+	s.bcastMu.Lock()
+	var wg *sync.WaitGroup
+	if s.wg != nil {
+		wg = s.wg
+	}
+	if wg != nil {
+		wg.Wait()
+	}
+	s.bcastMu.Unlock()
+
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			s.logger.Println("timeout while waiting for serve loop to stop")
+		}
+	}
+
+	// Invalidate everything this epoch (and any earlier epoch) left behind.
+	s.resetSessionState()
 }
 
 // handlerRecord validate & parse incoming bytes to a record instance, then process it depends on the record type
@@ -304,12 +474,21 @@ func (s *Server) handleHandshakeRecord(ctx context.Context, addr *net.UDPAddr, r
 	} else {
 		cookie := s.sessionManager.GetAddrCookieHMAC(addr, []byte(handshake.GetClientVersion()), handshake.GetSessionId(), handshake.GetRandom()) //TODO session id is empty
 		if !crypto.HMACEqual(handshake.GetCookie(), cookie) {
-			s.logger.Printf("error while validation HelloVerify record cookie: %s", ErrClientCookieIsInvalid)
+			s.logger.Printf("error while validation HelloVerify record cookie from %s: %s", addrKey(addr), ErrClientCookieIsInvalid)
 			return
 		}
 
 		if len(handshake.GetKey()) < insecureSymmKeySize {
 			s.logger.Printf("error while validating HelloVerify record key: %s", ErrInsecureEncryptionKeySize)
+			return
+		}
+
+		// Idempotency key: same source address + same cookie + same client
+		// random. A retransmission inside the short window must authenticate
+		// at most once and must not register again or rotate the session.
+		fingerprint := handshakeFingerprint(addr, handshake.GetCookie(), handshake.GetRandom())
+		if existing, ok := s.findRecentHandshake(fingerprint); ok {
+			s.logger.Printf("%s from %s: keeping existing session %s", ErrDuplicateHandshake, addrKey(addr), existing.ID)
 			return
 		}
 
@@ -325,14 +504,21 @@ func (s *Server) handleHandshakeRecord(ctx context.Context, addr *net.UDPAddr, r
 		var ID string
 		ID, err = s.authClient.Authenticate(ctx, token)
 		if err != nil {
-			s.logger.Printf("error while authenticating client token: %s", err)
+			s.logger.Printf("error while authenticating client token from %s: %s", addrKey(addr), err)
 			return
 		}
 
 		var cl *Client
-		cl, err = s.registerClient(addr, ID, handshake.GetKey())
+		var duplicate bool
+		cl, duplicate, err = s.registerAuthenticatedClient(addr, ID, handshake.GetKey(), fingerprint)
 		if err != nil {
 			s.logger.Printf("error while registering client: %s", err)
+			return
+		}
+		if duplicate {
+			// Lost a check-then-act race with an identical request that is
+			// already registering: never send a second ServerHello.
+			s.logger.Printf("%s (race) from %s: keeping existing session %s", ErrDuplicateHandshake, addrKey(addr), cl.ID)
 			return
 		}
 
@@ -359,7 +545,14 @@ func (s *Server) handleHandshakeRecord(ctx context.Context, addr *net.UDPAddr, r
 func (s *Server) handlePingRecord(ctx context.Context, addr *net.UDPAddr, r *record) {
 	cl, ok := s.findClientByAddr(addr)
 	if !ok {
-		s.logger.Printf("error while authenticating ping record: %s", ErrClientAddressIsNotRegistered)
+		s.logger.Printf("error while authenticating ping record from %s: %s", addrKey(addr), ErrClientAddressIsNotRegistered)
+		s.unAuthenticated(addr)
+		return
+	}
+
+	if s.expireClientIfNeeded(cl) {
+		s.logger.Printf("rejecting expired ping session for %s (%s): %s", addrKey(addr), cl.ID, ErrClientSessionExpired)
+		s.unAuthenticated(addr)
 		return
 	}
 
@@ -410,48 +603,58 @@ func (s *Server) handlePingRecord(ctx context.Context, addr *net.UDPAddr, r *rec
 		return
 	}
 
-	now := time.Now()
-	cl.Lock()
-	cl.lastHeartbeat = &now
-	cl.Unlock()
+	cl.touchHeartbeat()
 }
 
 // handleCustomRecord handle custom record with authorizing the record and call the handler func if is set
 func (s *Server) handleCustomRecord(ctx context.Context, addr *net.UDPAddr, r *record) {
 	cl, ok := s.findClientByAddr(addr)
 	if !ok {
-		s.logger.Printf("error while authenticating other type record: %s", ErrClientAddressIsNotRegistered)
+		s.logger.Printf("error while authenticating other type record from %s: %s", addrKey(addr), ErrClientAddressIsNotRegistered)
+		s.unAuthenticated(addr)
+		return
+	}
+
+	// Enforce expiration on the request path as well, so an expired session is
+	// rejected even before the garbage collector happens to run.
+	if s.expireClientIfNeeded(cl) {
+		s.logger.Printf("rejecting expired client session for %s (%s): %s", addrKey(addr), cl.ID, ErrClientSessionExpired)
 		s.unAuthenticated(addr)
 		return
 	}
 
 	payload, err := s.symmCrypto.Decrypt(r.Body, cl.eKey)
 	if err != nil {
-		s.logger.Printf("error while decrypting other type record: %s", err)
+		s.logger.Printf("error while decrypting other type record from %s: %s", addrKey(addr), err)
 		return
 	}
 
 	var sessionID, body []byte
 	sessionID, body, err = parseSessionID(payload, len(cl.sessionID))
 	if err != nil {
-		s.logger.Printf("error while parsing session id for ping: %s", err)
+		s.logger.Printf("error while parsing session id for custom record from %s: %s", addrKey(addr), err)
 		return
 	}
 
 	if !cl.ValidateSessionID(sessionID) {
-		s.logger.Printf("error while validating client session for other type record: %s", ErrClientSessionNotFound)
+		s.logger.Printf("error while validating client session for other type record from %s: %s", addrKey(addr), ErrClientSessionNotFound)
 		s.unAuthenticated(addr)
 		return
 	}
 
-	if s.handler != nil {
-		s.handler(cl.ID, r.Type, body)
+	// Re-check expiration after decryption/validation: the heartbeat may have
+	// gone stale while the record was being processed.
+	if s.expireClientIfNeeded(cl) {
+		s.logger.Printf("rejecting stale client session before handler for %s (%s): %s", addrKey(addr), cl.ID, ErrClientSessionExpired)
+		s.unAuthenticated(addr)
+		return
 	}
 
-	now := time.Now()
-	cl.Lock()
-	cl.lastHeartbeat = &now
-	cl.Unlock()
+	if handler := s.getHandler(); handler != nil {
+		handler(cl.ID, r.Type, body)
+	}
+
+	cl.touchHeartbeat()
 }
 
 // parseSessionID parses the session ID from the record decrypted body, the session ID must prepend to the body before encryption in the client
@@ -460,57 +663,6 @@ func parseSessionID(p []byte, sLen int) ([]byte, []byte, error) {
 		return nil, nil, ErrInvalidPayloadBodySize
 	}
 	return p[:sLen], p[sLen:], nil
-}
-
-// registerClient generates a new session ID & registers an address with token ID & encryption key as a Client
-func (s *Server) registerClient(addr *net.UDPAddr, ID string, eKey []byte) (*Client, error) {
-	sessionID, err := s.sessionManager.GenerateSessionID(addr, ID)
-	if err != nil {
-		return nil, err
-	}
-
-	now := time.Now()
-	cl := &Client{
-		ID:            ID,
-		sessionID:     sessionID,
-		addr:          addr,
-		eKey:          eKey,
-		lastHeartbeat: &now,
-	}
-	s.clients[ID] = cl
-	s.sessions[fmt.Sprintf("%s_%d", addr.IP.String(), addr.Port)] = cl
-
-	return cl, nil
-}
-
-// returns the Client by the Session ID
-func (s *Server) findClientBySessionID(sessionID []byte) (*Client, bool) {
-	for _, client := range s.clients {
-		if bytes.Equal(client.sessionID, sessionID) {
-			return client, true
-		}
-	}
-	return nil, false
-}
-
-// returns the Client ID by the session ID
-func (s *Server) findClientIDBySessionID(sessionID []byte) (string, bool) {
-	cl, ok := s.findClientBySessionID(sessionID)
-	if !ok {
-		return "", ok
-	}
-
-	return cl.ID, true
-}
-
-// returns the Client by IP & Port
-func (s *Server) findClientByAddr(addr *net.UDPAddr) (*Client, bool) {
-	cl, ok := s.sessions[fmt.Sprintf("%s_%d", addr.IP.String(), addr.Port)]
-	if !ok {
-		return nil, ok
-	}
-
-	return cl, true
 }
 
 // sendToAddr writes record bytes to the UDP address
@@ -529,44 +681,98 @@ func (s *Server) sendToClient(client *Client, typ byte, payload []byte) error {
 	return s.sendToAddr(client.addr, payload)
 }
 
-// SendToClientByID sends bytes to the Client by ID
+// SendToClientByID sends bytes to the Client by ID.
+// It returns ErrClientNotFound when the ID is not registered or the client has
+// already been removed by expiration cleanup.
 func (s *Server) SendToClientByID(clientID string, typ byte, payload []byte) error {
-	cl, ok := s.clients[clientID]
+	cl, ok := s.findClientByID(clientID)
 	if !ok {
+		s.logger.Printf("rejecting send to unknown client id %q: %s", clientID, ErrClientNotFound)
+		return ErrClientNotFound
+	}
+
+	cl.Lock()
+	defer cl.Unlock()
+	if cl.removed {
+		s.logger.Printf("rejecting send to removed client id %q: %s", clientID, ErrClientNotFound)
 		return ErrClientNotFound
 	}
 
 	return s.sendToClient(cl, typ, payload)
 }
 
+// clientGarbageCollection keeps the historical parameterless entry point. It
+// reads the epoch channels under serveMu so it cannot race with a restart.
 func (s *Server) clientGarbageCollection() {
+	s.serveMu.Lock()
+	stopCh := s.garbageCollectionStop
+	ticker := s.garbageCollectionTicker
+	s.serveMu.Unlock()
+	s.garbageCollectionLoop(stopCh, ticker)
+}
+
+// garbageCollectionLoop periodically removes heartbeat-expired clients.
+// Dependencies are passed explicitly to stay stable across Serve/Stop cycles.
+func (s *Server) garbageCollectionLoop(stopCh <-chan bool, ticker *time.Ticker) {
+	if ticker == nil {
+		return
+	}
+
 	for {
 		select {
-		case <-s.garbageCollectionStop:
-			if s.garbageCollectionTicker != nil {
-				s.garbageCollectionTicker.Stop()
-			}
-			break
-		case <-s.garbageCollectionTicker.C:
-			for _, c := range s.clients {
-				if c.lastHeartbeat != nil && time.Now().After(c.lastHeartbeat.Add(s.heartbeatExpiration)) {
-					delete(s.clients, c.ID)
-					delete(s.sessions, fmt.Sprintf("%s_%d", c.addr.IP.String(), c.addr.Port))
-				}
-			}
+		case <-stopCh:
+			ticker.Stop()
+			return
+		case <-ticker.C:
+			s.collectExpiredClients()
 		}
 	}
 }
 
-// BroadcastToClients broadcasts bytes to all registered Clients
+// collectExpiredClients takes a stable snapshot and removes every client whose
+// heartbeat has expired. All map/index mutations go through removeClient, so
+// this is safe to run concurrently with broadcasts and record handling.
+func (s *Server) collectExpiredClients() {
+	if s.heartbeatExpiration <= 0 {
+		return
+	}
+
+	for _, c := range s.snapshotClients() {
+		if !s.reapExpiredClient(c) {
+			continue
+		}
+		s.logger.Printf("garbage collector removed expired client id=%s addr=%s: %s", c.ID, addrKey(c.addr), ErrClientSessionExpired)
+	}
+}
+
+// BroadcastToClients broadcasts bytes to all registered Clients.
+//
+// The client set is snapshotted under the registry lock, so expiration cleanup
+// never races with map iteration. Each send holds the client's own lock for
+// the removed-check + write: a client that cleanup has marked removed is never
+// written to, while a send that started first completes before removal.
 func (s *Server) BroadcastToClients(typ byte, payload []byte) {
-	for _, cl := range s.clients {
-		s.wg.Add(1)
+	clients := s.snapshotClients()
+	for _, cl := range clients {
+		s.bcastMu.Lock()
+		wg := s.wg
+		if wg == nil {
+			wg = &sync.WaitGroup{}
+			s.wg = wg
+		}
+		wg.Add(1)
+		s.bcastMu.Unlock()
+
 		go func(c *Client) {
-			defer s.wg.Done()
-			err := s.sendToClient(c, typ, payload)
-			if err != nil {
-				s.logger.Printf("error while writing to the client: %s", err)
+			defer wg.Done()
+
+			c.Lock()
+			defer c.Unlock()
+			if c.removed {
+				return
+			}
+			if err := s.sendToClient(c, typ, payload); err != nil {
+				s.logger.Printf("error while writing broadcast to the client %s: %s", c.ID, err)
 			}
 		}(cl)
 	}
@@ -606,6 +812,9 @@ func parseRecord(rec []byte) (*record, error) {
 	}
 
 	bodySize := 256*int(rec[3]) + int(rec[4])
+	if bodySize < 0 || bodySize+5 > len(rec) {
+		return nil, ErrInvalidPayloadBodySize
+	}
 
 	return &record{
 		Type:       rec[0],
@@ -684,5 +893,13 @@ func WithAuthClient(ac AuthClient) Option {
 func WithLogger(l *log.Logger) Option {
 	return func(s *Server) {
 		s.logger = l
+	}
+}
+
+// WithHandshakeIdempotencyTTL sets the short window in which identical
+// cookie-bearing handshakes (same address, cookie & random) are deduplicated.
+func WithHandshakeIdempotencyTTL(d time.Duration) Option {
+	return func(s *Server) {
+		s.handshakeTTL = d
 	}
 }
