@@ -1,145 +1,101 @@
 package message
 
 import (
-	"bytes"
 	"fmt"
-	"strings"
 	"sync"
 
 	"github.com/gorilla/websocket"
+	"github.com/telepace/voiceflow/internal/server/recording"
 	"github.com/telepace/voiceflow/internal/storage"
 	"github.com/telepace/voiceflow/internal/stt"
 	"github.com/telepace/voiceflow/internal/tts"
-	"github.com/telepace/voiceflow/pkg/logger"
 )
 
+// BinaryMessageHandler 处理一条连接上的录音会话。音频缓冲、会话级 one_shot
+// 标记和收尾流程由 recording.Manager 统一管理，因此多个会话互不影响。
 type BinaryMessageHandler struct {
-	stt          stt.Service
-	tts          tts.Service
-	storage      storage.Service
-	audioBuffers map[string]*bytes.Buffer
-	bufferMutex  sync.RWMutex
-	oneShot      bool
+	mu      sync.Mutex
+	manager *recording.Manager
+	writers map[*websocket.Conn]recording.Writer
 }
 
-func NewBinaryMessageHandler(stt stt.Service, tts tts.Service, storage storage.Service) *BinaryMessageHandler {
+func NewBinaryMessageHandler(sttSvc stt.Service, ttsSvc tts.Service, storageSvc storage.Service) *BinaryMessageHandler {
+	// ttsSvc 由文本消息处理器使用；此处保留参数以维持既有构造签名。
+	_ = ttsSvc
 	return &BinaryMessageHandler{
-		stt:          stt,
-		tts:          tts,
-		storage:      storage,
-		audioBuffers: make(map[string]*bytes.Buffer),
-		bufferMutex:  sync.RWMutex{},
+		manager: recording.NewManager(sttSvc, storageSvc),
+		writers: make(map[*websocket.Conn]recording.Writer),
 	}
 }
 
-// HandleStart 处理音频开始信号
+// HandleStart 处理音频开始信号。one_shot 按会话保存，不影响其它会话。
 func (h *BinaryMessageHandler) HandleStart(sessionID string, oneShot bool) error {
-	h.bufferMutex.Lock()
-	defer h.bufferMutex.Unlock()
-
-	if _, exists := h.audioBuffers[sessionID]; exists {
-		return fmt.Errorf("session already exists: %s", sessionID)
+	if err := h.manager.Start(sessionID, oneShot); err != nil {
+		return fmt.Errorf("failed to start session: %w", err)
 	}
-
-	h.audioBuffers[sessionID] = &bytes.Buffer{}
-	h.oneShot = oneShot
 	return nil
 }
 
-// HandleAudioData 处理音频二进制数据
+// HandleAudioData 处理音频二进制数据。会话结束后的数据会被拒绝。
 func (h *BinaryMessageHandler) HandleAudioData(sessionID string, data []byte) error {
-	h.bufferMutex.Lock()
-	defer h.bufferMutex.Unlock()
-
-	buffer, exists := h.audioBuffers[sessionID]
-	if !exists {
-		return fmt.Errorf("no active session found: %s", sessionID)
-	}
-
-	_, err := buffer.Write(data)
-	if err != nil {
+	if err := h.manager.Append(sessionID, data); err != nil {
 		return fmt.Errorf("failed to write audio data: %w", err)
 	}
-
 	return nil
 }
 
-// HandleEnd 处理音频结束信号
+// HandleEnd 处理音频结束信号：完成存储与识别并回传结果，一次性会话在
+// 结果消息发出后才关闭连接。重复的结束信号返回错误且不会重复处理。
 func (h *BinaryMessageHandler) HandleEnd(sessionID string, conn *websocket.Conn) error {
-	// 1. 获取并清理音频数据
-	audioData, err := h.getAndCleanAudioData(sessionID)
-	if err != nil {
-		return fmt.Errorf("failed to get audio data: %w", err)
-	}
-
-	// 2. 存储到 MinIO
-	audioURL, err := h.storage.StoreAudio(audioData)
-	if err != nil {
-		return fmt.Errorf("failed to store audio: %w", err)
-	}
-
-	// 3. 立即发送存储成功的响应
-	err = conn.WriteJSON(map[string]interface{}{
-		"type":       "audio_stored",
-		"session_id": sessionID,
-		"audio_url":  audioURL,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to send audio storage response: %w", err)
-	}
-
-	// 4. 异步进行语音识别
-	go func() {
-		text, err := h.stt.Recognize(audioData, audioURL)
-		if err != nil {
-			// 检查是否是最终错误（重试后仍然失败）
-			if strings.Contains(err.Error(), "使用默认语言重试失败") {
-				conn.WriteJSON(map[string]interface{}{
-					"type":       "recognition_error",
-					"session_id": sessionID,
-					"error":      err.Error(),
-				})
-				return
-			}
-
-			// 如果是其他错误，记录日志但继续等待重试结果
-			logger.Warnf("语音识别出现错误（可能正在重试）: %v", err)
-			return
-		}
-
-		// 发送识别结果
-		conn.WriteJSON(map[string]interface{}{
-			"type":       "recognition_complete",
-			"session_id": sessionID,
-			"text":       text,
-		})
-	}()
-
-	if h.oneShot {
-		defer conn.Close()
-	}
-
-	return nil
+	return h.handleEnd(sessionID, h.writerFor(conn))
 }
 
-// getAndCleanAudioData 获取并清理音频数据
-func (h *BinaryMessageHandler) getAndCleanAudioData(sessionID string) ([]byte, error) {
-	h.bufferMutex.Lock()
-	defer h.bufferMutex.Unlock()
-
-	buffer, exists := h.audioBuffers[sessionID]
-	if !exists {
-		return nil, fmt.Errorf("no audio data found for session: %s", sessionID)
-	}
-
-	audioData := buffer.Bytes()
-	delete(h.audioBuffers, sessionID)
-	return audioData, nil
+// handleEnd 是 HandleEnd 与 recording.Writer 的组合，便于在不建立真实
+// WebSocket 连接的情况下复用收尾流程。
+func (h *BinaryMessageHandler) handleEnd(sessionID string, w recording.Writer) error {
+	_, err := h.manager.End(sessionID, w)
+	return err
 }
 
-// CleanupSession 清理指定会话的资源
+// CleanupSession 清理指定会话的资源。
 func (h *BinaryMessageHandler) CleanupSession(sessionID string) {
-	h.bufferMutex.Lock()
-	defer h.bufferMutex.Unlock()
-	delete(h.audioBuffers, sessionID)
+	h.manager.Cleanup(sessionID)
+}
+
+// ReleaseConnection 释放与一条连接相关的会话和写入器，应在连接关闭时调用，
+// 避免 writers map 随连接数无界增长。
+func (h *BinaryMessageHandler) ReleaseConnection(conn *websocket.Conn) {
+	h.mu.Lock()
+	delete(h.writers, conn)
+	h.mu.Unlock()
+}
+
+func (h *BinaryMessageHandler) writerFor(conn *websocket.Conn) recording.Writer {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if w, ok := h.writers[conn]; ok {
+		return w
+	}
+	w := &serialWriter{conn: conn}
+	h.writers[conn] = w
+	return w
+}
+
+// serialWriter 串行化同一连接上的写操作，满足 recording.Writer 接口。
+type serialWriter struct {
+	mu   sync.Mutex
+	conn *websocket.Conn
+}
+
+func (w *serialWriter) WriteJSON(v interface{}) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.conn.WriteJSON(v)
+}
+
+func (w *serialWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.conn.Close()
 }

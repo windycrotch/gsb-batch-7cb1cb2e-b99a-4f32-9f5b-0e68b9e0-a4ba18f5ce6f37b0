@@ -25,15 +25,20 @@ function createWebSocket() {
                         
                     case 'recognition_complete':
                         appendMessage('你', response.text);
-                        if (isOneShotMode) {
-                            appendSystemMessage('单次模式：识别完成，连接将关闭');
-                            // 给用户一点时间看到结果
-                            setTimeout(() => {
-                                ws.close();
-                            }, 2000);
+                        break;
+
+                    case 'storage_error':
+                        appendSystemMessage(`音频存储失败: ${response.error}`);
+                        break;
+
+                    case 'session_end':
+                        // 服务端已完成本次录音的收尾。一次性会话由服务端在
+                        // 结果消息发出后关闭连接，这里不需要客户端主动断开。
+                        if (response.one_shot) {
+                            appendSystemMessage('单次模式：已收到全部结果，连接将关闭');
                         }
                         break;
-                        
+
                     case 'recognition_error':
                         appendSystemMessage(`识别错误: ${response.error}`);
                         break;
