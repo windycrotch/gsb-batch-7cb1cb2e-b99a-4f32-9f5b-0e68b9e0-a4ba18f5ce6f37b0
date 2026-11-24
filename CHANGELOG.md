@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `quantize_palette` now applies the palette and the pixel remapping atomically
+  - Palette, pixel remapping and color-mode conversion run inside one Aseprite
+    transaction; the sprite is saved only after every step succeeds
+  - On any failure the `.aseprite` file is restored from a pre-write snapshot and
+    an error is returned instead of reporting success on a corrupted sprite
+  - Dithering no longer flattens the sprite into a single layer: pixels are
+    remapped per cel, preserving layer and frame structure
+  - Returned `palette`, `quantized_colors` and `color_mode` are validated against
+    the sprite re-opened from disk, so they always describe the saved file
+  - `convert_to_indexed=false` now reports the sprite's actual color mode rather
+    than a hard-coded value
+  - Transparent entries may push the palette one past `target_colors`; the hard
+    256-color limit is enforced by failing before writing instead of truncating
+  - Concurrent `quantize_palette` calls on the same sprite path are serialized,
+    so the file is never a mix of two batches
+  - Temporary directories are removed on success, failure and concurrency alike
+
 ## [0.5.0] - 2025-10-18
 
 ### Added

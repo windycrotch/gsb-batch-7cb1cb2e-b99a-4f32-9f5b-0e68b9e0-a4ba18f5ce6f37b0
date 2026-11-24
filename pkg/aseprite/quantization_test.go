@@ -392,6 +392,99 @@ func TestQuantizePaletteWithTransparency(t *testing.T) {
 	})
 }
 
+// TestQuantizePaletteTransparencyMayExceedTarget verifies that a transparent
+// entry may push the palette one past targetColors, matching the historical
+// behavior, while the hard 256-color limit is still never exceeded.
+func TestQuantizePaletteTransparencyMayExceedTarget(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 8, 8))
+	colors := []color.RGBA{
+		{R: 255, G: 0, B: 0, A: 255},
+		{R: 0, G: 255, B: 0, A: 255},
+		{R: 0, G: 0, B: 255, A: 255},
+		{R: 255, G: 255, B: 0, A: 255},
+		{R: 255, G: 0, B: 255, A: 255},
+		{R: 0, G: 255, B: 255, A: 255},
+	}
+	for y := 0; y < 8; y++ {
+		for x := 0; x < 8; x++ {
+			img.Set(x, y, colors[(x+y)%len(colors)])
+		}
+	}
+	img.Set(0, 0, color.RGBA{R: 0, G: 0, B: 0, A: 0}) // transparent pixel
+
+	palette, _, err := QuantizePalette(img, 3, "median_cut", true)
+	if err != nil {
+		t.Fatalf("QuantizePalette() error: %v", err)
+	}
+
+	// Transparent entry plus up to targetColors opaque colors.
+	if len(palette) > 3+1 {
+		t.Errorf("palette length = %d, want at most %d (target %d + transparency)", len(palette), 4, 3)
+	}
+	if len(palette) == 0 || palette[0] != "#00000000" {
+		t.Errorf("expected transparent color first, got %v", palette)
+	}
+	if len(palette) > MaxPaletteColors {
+		t.Errorf("palette exceeds hard maximum: %d", len(palette))
+	}
+}
+
+// TestQuantizePaletteEnforcesMaxColors verifies that requesting a palette larger
+// than the hard limit fails rather than being truncated.
+func TestQuantizePaletteEnforcesMaxColors(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 4, 4))
+	for y := 0; y < 4; y++ {
+		for x := 0; x < 4; x++ {
+			img.Set(x, y, color.RGBA{R: uint8(x * 40), G: uint8(y * 40), B: 0, A: 255})
+		}
+	}
+
+	if _, _, err := QuantizePalette(img, MaxPaletteColors+1, "median_cut", false); err == nil {
+		t.Error("expected error for targetColors above the maximum")
+	}
+
+	// The maximum itself is allowed (no transparency in this image).
+	palette, _, err := QuantizePalette(img, MaxPaletteColors, "median_cut", false)
+	if err != nil {
+		t.Fatalf("QuantizePalette() unexpected error at max size: %v", err)
+	}
+	if len(palette) > MaxPaletteColors {
+		t.Errorf("palette length = %d, exceeds maximum %d", len(palette), MaxPaletteColors)
+	}
+}
+
+// TestQuantizePaletteNeverExceedsMaxWithTransparency checks the hard limit when a
+// transparent entry is added to a maximum-size palette.
+func TestQuantizePaletteNeverExceedsMaxWithTransparency(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping large-palette test in short mode")
+	}
+
+	// Build an image with more than 256 distinct opaque colors plus transparency,
+	// so the quantizer wants to fill the palette and then prepend transparency.
+	img := image.NewRGBA(image.Rect(0, 0, 32, 32))
+	for y := 0; y < 32; y++ {
+		for x := 0; x < 32; x++ {
+			img.Set(x, y, color.RGBA{R: uint8(x * 8), G: uint8(y * 8), B: uint8((x * y) % 256), A: 255})
+		}
+	}
+	img.Set(0, 0, color.RGBA{A: 0})
+
+	for _, algo := range []string{"median_cut", "octree"} {
+		t.Run(algo, func(t *testing.T) {
+			palette, _, err := QuantizePalette(img, MaxPaletteColors, algo, true)
+			if err != nil {
+				// Failing before writing is an acceptable outcome; the palette simply
+				// must never be over the limit on success.
+				return
+			}
+			if len(palette) > MaxPaletteColors {
+				t.Errorf("palette length = %d, exceeds maximum %d", len(palette), MaxPaletteColors)
+			}
+		})
+	}
+}
+
 func TestQuantizePaletteWithDithering(t *testing.T) {
 	// Create gradient image
 	img := image.NewRGBA(image.Rect(0, 0, 8, 8))

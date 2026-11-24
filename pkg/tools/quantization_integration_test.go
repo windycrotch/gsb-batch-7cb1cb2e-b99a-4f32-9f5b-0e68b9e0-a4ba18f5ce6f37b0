@@ -290,20 +290,26 @@ func TestIntegration_QuantizePalette_WithDithering(t *testing.T) {
 	t.Logf("✓ Quantized from %d colors with dithering to %d colors", originalColors, len(palette))
 }
 
-func TestIntegration_QuantizePalette_WithDitheringAndReplacement(t *testing.T) {
+func TestIntegration_QuantizePalette_WithDitheringPreservesLayers(t *testing.T) {
 	cfg := testutil.LoadTestConfig(t)
 	client := aseprite.NewClient(cfg.AsepritePath, cfg.TempDir, 30*time.Second)
 	gen := aseprite.NewLuaGenerator()
 	ctx := context.Background()
 
 	// Create a canvas with gradient
-	spritePath := testutil.TempSpritePath(t, "test-quantize-dither-replace.aseprite")
+	spritePath := testutil.TempSpritePath(t, "test-quantize-dither-layers.aseprite")
 	createScript := gen.CreateCanvas(64, 64, aseprite.ColorModeRGB, spritePath)
 	_, err := client.ExecuteLua(ctx, createScript, "")
 	if err != nil {
 		t.Fatalf("Failed to create canvas: %v", err)
 	}
 	defer os.Remove(spritePath)
+
+	// Add a second layer so we can detect flattening.
+	addLayerScript := gen.AddLayer("Layer 2")
+	if _, err := client.ExecuteLua(ctx, addLayerScript, spritePath); err != nil {
+		t.Fatalf("Failed to add layer: %v", err)
+	}
 
 	// Draw gradient (should produce many colors) - batch pixels for efficiency
 	pixels := make([]aseprite.Pixel, 0, 64*64)
@@ -347,65 +353,76 @@ func TestIntegration_QuantizePalette_WithDitheringAndReplacement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Quantization failed: %v", err)
 	}
-
 	if len(palette) == 0 {
 		t.Fatal("Palette should not be empty")
 	}
 
-	t.Logf("✓ Quantized from %d to %d colors with dithering", originalColors, len(palette))
-
-	// Convert palette to color.Color slice (testing the color parsing)
-	paletteColors := make([]color.Color, len(palette))
-	for i, hexColor := range palette {
-		// Parse hex color
-		var r, g, b uint8
-		if _, err := parseHexColorValues(hexColor, &r, &g, &b); err != nil {
-			t.Fatalf("Failed to parse palette color %s: %v", hexColor, err)
-		}
-		paletteColors[i] = color.RGBA{R: r, G: g, B: b, A: 255}
-	}
-
-	// Apply dithering
-	ditheredImg := aseprite.RemapPixelsWithDithering(img, paletteColors, true)
-	if ditheredImg == nil {
-		t.Fatal("Dithered image should not be nil")
-	}
-
-	// Save dithered image
-	ditheredPNG := testutil.TempSpritePath(t, "dithered.png")
-	defer os.Remove(ditheredPNG)
-
-	ditheredFile, err := os.Create(ditheredPNG)
+	// Apply atomically with dithering and indexed conversion.
+	applyScript := gen.ApplyQuantizedPalette(palette, originalColors, "median_cut", true, true)
+	output, err := client.ExecuteLua(ctx, applyScript, spritePath)
 	if err != nil {
-		t.Fatalf("Failed to create dithered PNG: %v", err)
-	}
-	defer ditheredFile.Close()
-
-	if err := png.Encode(ditheredFile, ditheredImg); err != nil {
-		t.Fatalf("Failed to encode dithered PNG: %v", err)
+		t.Fatalf("Failed to apply quantized palette: %v", err)
 	}
 
-	// Replace sprite content with dithered image
-	replaceScript := gen.ReplaceWithImage(ditheredPNG)
-	_, err = client.ExecuteLua(ctx, replaceScript, spritePath)
-	if err != nil {
-		t.Fatalf("Failed to replace sprite with dithered image: %v", err)
+	var result QuantizePaletteOutput
+	if err := parseJSON(output, &result); err != nil {
+		t.Fatalf("failed to parse quantization output: %v", err)
+	}
+	if result.QuantizedColors != len(palette) {
+		t.Errorf("quantized_colors = %d, want %d", result.QuantizedColors, len(palette))
+	}
+	if result.ColorMode != "indexed" {
+		t.Errorf("color_mode = %s, want indexed", result.ColorMode)
 	}
 
-	t.Logf("✓ Successfully replaced sprite content with dithered image")
-
-	// Verify sprite was modified
+	// Layer structure must survive quantization (dithering must not flatten).
 	infoScript := gen.GetSpriteInfo()
-	output, err := client.ExecuteLua(ctx, infoScript, spritePath)
+	infoOut, err := client.ExecuteLua(ctx, infoScript, spritePath)
 	if err != nil {
 		t.Fatalf("Failed to get sprite info: %v", err)
 	}
+	if !strings.Contains(infoOut, "\"layer_count\": 2") {
+		t.Errorf("expected 2 layers after quantization, got: %s", infoOut)
+	}
+	if !strings.Contains(infoOut, "\"width\": 64") {
+		t.Error("Sprite dimensions should be preserved after quantization")
+	}
+}
 
-	if !strings.Contains(output, "\"width\": 64") {
-		t.Error("Sprite dimensions should be preserved after replacement")
+// TestIntegration_QuantizePalette_FailureRestoresSprite verifies that a failed
+// apply leaves the .aseprite file byte-for-byte unchanged.
+func TestIntegration_QuantizePalette_FailureRestoresSprite(t *testing.T) {
+	cfg := testutil.LoadTestConfig(t)
+	client := aseprite.NewClient(cfg.AsepritePath, cfg.TempDir, 30*time.Second)
+	gen := aseprite.NewLuaGenerator()
+	ctx := context.Background()
+
+	spritePath := testutil.TempSpritePath(t, "test-quantize-failure.aseprite")
+	createScript := gen.CreateCanvas(16, 16, aseprite.ColorModeRGB, spritePath)
+	if _, err := client.ExecuteLua(ctx, createScript, ""); err != nil {
+		t.Fatalf("Failed to create canvas: %v", err)
+	}
+	defer os.Remove(spritePath)
+
+	before, err := os.ReadFile(spritePath)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	t.Logf("✓ Verified sprite was successfully updated with dithered content")
+	// Force a failure inside the atomic script (palette size mismatch).
+	badScript := gen.ApplyQuantizedPalette([]string{"#FF0000", "#00FF00"}, 2, "median_cut", true, false)
+	badScript = strings.Replace(badScript, "local expectedColorCount = 2", "local expectedColorCount = 3", 1)
+	if _, err := client.ExecuteLua(ctx, badScript, spritePath); err == nil {
+		t.Fatal("expected the malformed script to fail")
+	}
+
+	after, err := os.ReadFile(spritePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Error("sprite file changed even though the quantization script failed")
+	}
 }
 
 // Helper function to parse hex color values

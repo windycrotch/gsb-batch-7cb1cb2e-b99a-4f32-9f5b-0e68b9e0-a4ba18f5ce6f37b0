@@ -10,11 +10,24 @@ import (
 	"github.com/lucasb-eyer/go-colorful"
 )
 
+// MaxPaletteColors is the maximum number of entries an Aseprite palette can hold.
+//
+// A quantized palette (including an optional transparent entry) must never exceed
+// this many colors, otherwise writing the palette to the sprite would have to
+// truncate colors silently.
+const MaxPaletteColors = 256
+
 // QuantizePalette reduces image colors using specified quantization algorithm.
 // Returns palette colors (hex strings), original color count, and error.
+//
+// When preserveTransparency is true and the image contains transparent pixels, a
+// fully transparent color is prepended to the palette. In that case the palette can
+// be one entry larger than targetColors. If the resulting palette would exceed
+// MaxPaletteColors the function fails instead of silently truncating colors, so the
+// caller can surface the error before touching the sprite file.
 func QuantizePalette(img image.Image, targetColors int, algorithm string, preserveTransparency bool) ([]string, int, error) {
-	if targetColors < 2 || targetColors > 256 {
-		return nil, 0, fmt.Errorf("targetColors must be between 2 and 256, got %d", targetColors)
+	if targetColors < 2 || targetColors > MaxPaletteColors {
+		return nil, 0, fmt.Errorf("targetColors must be between 2 and %d, got %d", MaxPaletteColors, targetColors)
 	}
 
 	// Count unique colors in original image
@@ -87,6 +100,19 @@ func QuantizePalette(img image.Image, targetColors int, algorithm string, preser
 		if hasTransparency {
 			paletteColors = append([]color.Color{color.RGBA{R: 0, G: 0, B: 0, A: 0}}, paletteColors...)
 		}
+	}
+
+	// The transparent entry can push the palette one past targetColors; honour that,
+	// but never exceed the hard palette limit. Failing here keeps the caller from
+	// writing a truncated palette and reporting success.
+	if len(paletteColors) > MaxPaletteColors {
+		return nil, originalColors, fmt.Errorf(
+			"quantized palette has %d colors (including transparency), which exceeds the maximum of %d; reduce target_colors",
+			len(paletteColors), MaxPaletteColors)
+	}
+
+	if len(paletteColors) == 0 {
+		return nil, originalColors, fmt.Errorf("quantization produced an empty palette")
 	}
 
 	// Convert to hex strings

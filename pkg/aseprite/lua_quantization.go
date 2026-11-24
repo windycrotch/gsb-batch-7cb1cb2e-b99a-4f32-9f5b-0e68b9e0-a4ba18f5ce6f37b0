@@ -2,54 +2,54 @@ package aseprite
 
 import (
 	"fmt"
-	"strings"
 )
 
-// ApplyQuantizedPalette generates a Lua script to apply a quantized palette to a sprite.
+// ApplyQuantizedPalette generates a Lua script that applies a quantized palette
+// to the active sprite in a single, atomic operation.
 //
-// This script:
-//  1. Sets the sprite's palette to the quantized colors
-//  2. Remaps all pixels to the nearest palette color (with optional dithering)
-//  3. Optionally converts the sprite to indexed color mode
-//  4. Returns JSON with original color count, quantized color count, color mode, palette, and algorithm used
+// All mutations happen inside one app.transaction and the sprite is saved only
+// after every step has succeeded. If any step fails, Aseprite rolls the sprite
+// back and the file on disk is never touched (the caller additionally restores a
+// backup as a safety net). Layer and frame structure is preserved: pixels are
+// remapped with Aseprite's per-cel pixel-format conversion instead of flattening
+// the sprite into a single layer.
 //
 // Parameters:
 //   - palette: slice of hex color strings (#RRGGBB or #RRGGBBAA format) from quantization
 //   - originalColors: number of unique colors in the original sprite
 //   - algorithm: name of the quantization algorithm used
 //   - convertToIndexed: whether to convert the sprite to indexed color mode
-//   - dither: whether dithering was applied (for reporting purposes)
+//   - dither: whether error-diffusion (Floyd-Steinberg) dithering is applied while
+//     remapping pixels to the palette
 //
-// The script uses Aseprite's built-in color quantization when converting to indexed mode.
+// Color mode behavior:
+//   - convertToIndexed=true: the sprite ends in indexed mode.
+//   - convertToIndexed=false: the sprite keeps a full-color mode. RGB sprites
+//     stay RGB; indexed sprites stay indexed (an indexed sprite cannot hold the
+//     remapped colors without a palette); grayscale sprites become RGB because a
+//     multi-color palette cannot be represented in grayscale. Pixels are always
+//     remapped to the quantized palette and, when dither is set, dithered.
+//
+// The script prints JSON with the palette, quantized color count and color mode
+// read back from the sprite after the operation, so the reported values always
+// match the file that was saved.
 func (g *LuaGenerator) ApplyQuantizedPalette(palette []string, originalColors int, algorithm string, convertToIndexed bool, dither bool) string {
 	if len(palette) == 0 {
 		return `error("No palette colors provided")`
 	}
+	if len(palette) > MaxPaletteColors {
+		return fmt.Sprintf(`error("Palette has %d colors, which exceeds the maximum of %d")`, len(palette), MaxPaletteColors)
+	}
 
-	// Build palette color list
+	// Build palette color list. Every entry must parse exactly, otherwise the
+	// written palette would silently differ from the requested one.
 	colorList := "{\n"
 	for i, hexColor := range palette {
-		// Parse hex color #RRGGBB or #RRGGBBAA
-		hexColor = strings.TrimPrefix(hexColor, "#")
-
-		var r, g, b, a int
-		if len(hexColor) == 8 {
-			// #RRGGBBAA format (with alpha)
-			_, _ = fmt.Sscanf(hexColor[:2], "%x", &r)
-			_, _ = fmt.Sscanf(hexColor[2:4], "%x", &g)
-			_, _ = fmt.Sscanf(hexColor[4:6], "%x", &b)
-			_, _ = fmt.Sscanf(hexColor[6:8], "%x", &a)
-		} else if len(hexColor) == 6 {
-			// #RRGGBB format (assume full opacity)
-			_, _ = fmt.Sscanf(hexColor[:2], "%x", &r)
-			_, _ = fmt.Sscanf(hexColor[2:4], "%x", &g)
-			_, _ = fmt.Sscanf(hexColor[4:6], "%x", &b)
-			a = 255
-		} else {
-			continue // Skip invalid colors
+		var c Color
+		if err := c.FromHex(hexColor); err != nil {
+			return fmt.Sprintf(`error("Invalid palette color: %s")`, EscapeString(hexColor))
 		}
-
-		colorList += fmt.Sprintf("\t\tColor{r=%d, g=%d, b=%d, a=%d}", r, g, b, a)
+		colorList += fmt.Sprintf("\t\tColor{r=%d, g=%d, b=%d, a=%d}", c.R, c.G, c.B, c.A)
 		if i < len(palette)-1 {
 			colorList += ","
 		}
@@ -57,18 +57,14 @@ func (g *LuaGenerator) ApplyQuantizedPalette(palette []string, originalColors in
 	}
 	colorList += "\t}"
 
-	conversionCode := ""
-	if convertToIndexed {
-		conversionCode = `
--- Convert to indexed color mode
-app.command.ChangePixelFormat{format="indexed"}
+	ditheringMode := "none"
+	if dither {
+		ditheringMode = "error-diffusion"
+	}
 
--- Get the new color mode after conversion
-colorMode = "indexed"`
-	} else {
-		conversionCode = `
--- Keep RGB mode, just apply palette
-colorMode = tostring(spr.colorMode):match("ColorMode%%.(%%w+)")`
+	convertFlag := "false"
+	if convertToIndexed {
+		convertFlag = "true"
 	}
 
 	return fmt.Sprintf(`local spr = app.activeSprite
@@ -76,29 +72,92 @@ if not spr then
 	error("No active sprite")
 end
 
--- Store original color mode for reporting
-local colorMode = tostring(spr.colorMode):match("ColorMode%%.(%%w+)")
-
--- Get or create palette
-local palette = spr.palettes[1]
-if not palette then
-	error("No palette found")
-end
-
--- Resize palette to match quantized color count
-palette:resize(%d)
-
--- Set palette colors
+local expectedColorCount = %d
 local colors = %s
-
-for i, color in ipairs(colors) do
-	palette:setColor(i - 1, color)  -- Palette is 0-indexed
+if #colors ~= expectedColorCount then
+	error("Palette color count mismatch: expected " .. expectedColorCount .. ", got " .. #colors)
 end
-%s
--- Prepare palette for JSON output
+
+local function modeName(mode)
+	if mode == ColorMode.INDEXED then
+		return "indexed"
+	elseif mode == ColorMode.GRAYSCALE then
+		return "grayscale"
+	else
+		return "rgb"
+	end
+end
+
+local convertToIndexed = %s
+local ditheringMode = "%s"
+local originalMode = modeName(spr.colorMode)
+-- An indexed sprite cannot hold RGB pixels without a palette, so it stays
+-- indexed even when convert_to_indexed is false. Everything else ends in one
+-- of the two honest targets below.
+local finalIndexed = convertToIndexed or (originalMode == "indexed")
+
+-- Aseprite reports a disabled/failed command by returning false rather than
+-- raising an error, so every conversion result is checked explicitly.
+local function changeFormat(format)
+	if not app.command.ChangePixelFormat{format=format, dithering=ditheringMode} then
+		error("ChangePixelFormat failed for format: " .. format)
+	end
+end
+
+local newPalette = Palette(#colors)
+for i, color in ipairs(colors) do
+	newPalette:setColor(i - 1, color)
+end
+
+-- Single transaction: either every mutation succeeds together or none of them
+-- are kept. The file is saved only after the transaction completes.
+--
+-- Layers and frames are never flattened: ChangePixelFormat remaps every cel
+-- independently, so the sprite structure is preserved.
+app.transaction(function()
+	-- Indexed sprites store palette indices and grayscale sprites store gray
+	-- values; neither carries enough information to remap against a full-color
+	-- palette. Convert both to RGB first so each pixel has an explicit color.
+	if spr.colorMode ~= ColorMode.RGB then
+		changeFormat("rgb")
+	end
+
+	-- Install the quantized palette before remapping pixels.
+	spr:setPalette(newPalette)
+
+	-- Remap every pixel to the nearest palette entry. Aseprite applies its
+	-- error-diffusion (Floyd-Steinberg) dithering here when requested.
+	changeFormat("indexed")
+
+	if not finalIndexed then
+		-- Returning to RGB keeps the remapped pixel colors exactly as mapped to
+		-- the quantized palette. A multi-color palette cannot be represented in
+		-- grayscale, so grayscale sources also end up in RGB here; the mode is
+		-- reported as "rgb" below, matching the saved file.
+		changeFormat("rgb")
+		spr:setPalette(newPalette)
+	end
+
+	-- Verify inside the transaction: any mismatch aborts and rolls back.
+	local checkPalette = spr.palettes[1]
+	if not checkPalette or #checkPalette ~= expectedColorCount then
+		error("Palette size mismatch after conversion")
+	end
+end)
+
+-- Save only after every mutation succeeded.
+if not spr:saveAs(spr.filename) then
+	error("Failed to save sprite")
+end
+
+local finalPalette = spr.palettes[1]
+if not finalPalette then
+	error("No palette found after quantization")
+end
+
 local paletteHex = {}
-for i = 0, #palette - 1 do
-	local c = palette:getColor(i)
+for i = 0, #finalPalette - 1 do
+	local c = finalPalette:getColor(i)
 	if c.alpha == 0 then
 		table.insert(paletteHex, string.format("#%%02X%%02X%%02X%%02X", c.red, c.green, c.blue, c.alpha))
 	else
@@ -106,27 +165,70 @@ for i = 0, #palette - 1 do
 	end
 end
 
--- Build JSON output
-local json = string.format([[{
-	"success": true,
-	"original_colors": %d,
-	"quantized_colors": %d,
-	"color_mode": "%%s",
-	"palette": [%%s],
-	"algorithm_used": "%s"
-}]], colorMode, '"' .. table.concat(paletteHex, '", "') .. '"')
+if #paletteHex ~= expectedColorCount then
+	error("Palette was modified unexpectedly: expected " .. expectedColorCount .. " colors, found " .. #paletteHex)
+end
 
--- Save sprite
-spr:saveAs(spr.filename)
+local json = '{"success": true,' ..
+	'"original_colors": %d,' ..
+	'"quantized_colors": %d,' ..
+	'"color_mode": "' .. modeName(spr.colorMode) .. '",' ..
+	'"palette": ["' .. table.concat(paletteHex, '","') .. '"],' ..
+	'"algorithm_used": "%s"}'
 
--- Print JSON result
 print(json)`,
-		len(palette),            // palette resize
+		len(palette),            // expectedColorCount
 		colorList,               // color list
-		conversionCode,          // conversion code
+		convertFlag,             // convertToIndexed
+		ditheringMode,           // dithering mode
 		originalColors,          // original_colors
 		len(palette),            // quantized_colors
 		EscapeString(algorithm)) // algorithm_used
+}
+
+// GetQuantizedState generates a Lua script that reports the sprite's current
+// color mode, palette and palette size as JSON.
+//
+// It is intended to be run on a freshly opened sprite (a separate Aseprite
+// process) so the reported values reflect the file on disk rather than the
+// in-memory state of the process that wrote it. This lets callers verify that
+// what they return to the user matches what was actually saved.
+//
+// JSON shape: {"color_mode":"indexed","quantized_colors":N,"palette":["#RRGGBB",...]}
+func (g *LuaGenerator) GetQuantizedState() string {
+	return `local spr = app.activeSprite
+if not spr then
+	error("No active sprite")
+end
+
+local function modeName(mode)
+	if mode == ColorMode.INDEXED then
+		return "indexed"
+	elseif mode == ColorMode.GRAYSCALE then
+		return "grayscale"
+	else
+		return "rgb"
+	end
+end
+
+local palette = spr.palettes[1]
+if not palette then
+	error("No palette found")
+end
+
+local paletteHex = {}
+for i = 0, #palette - 1 do
+	local c = palette:getColor(i)
+	if c.alpha == 0 then
+		table.insert(paletteHex, string.format("#%02X%02X%02X%02X", c.red, c.green, c.blue, c.alpha))
+	else
+		table.insert(paletteHex, string.format("#%02X%02X%02X", c.red, c.green, c.blue))
+	end
+end
+
+print('{"color_mode": "' .. modeName(spr.colorMode) .. '",' ..
+	'"quantized_colors": ' .. #paletteHex .. ',' ..
+	'"palette": ["' .. table.concat(paletteHex, '","') .. '"]}')`
 }
 
 // ReplaceWithImage generates a Lua script to replace sprite content with an external image.
