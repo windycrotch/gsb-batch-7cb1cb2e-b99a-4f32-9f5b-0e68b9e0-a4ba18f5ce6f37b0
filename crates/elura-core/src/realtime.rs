@@ -236,6 +236,12 @@ struct Runtime<C, S> {
     initialized: bool,
 }
 
+/// Late input accepted during a tick and the history tick it must be applied to.
+struct LateInput<C> {
+    target: u64,
+    command: Command<C>,
+}
+
 pub struct Room<S: AuthoritativeSimulation> {
     id: Arc<str>,
     config: RoomConfig,
@@ -424,10 +430,11 @@ impl<S: AuthoritativeSimulation> Room<S> {
         let mut runtime = self.runtime.lock().await;
         let mut simulation = self.simulation.lock().await;
         self.initialize(&mut runtime, &simulation).await?;
-        let late = self.drain(&mut runtime);
+        let (late_from, late_inputs) = self.drain(&mut runtime);
         let current = self.current_tick();
-        if let Some(from) = late {
-            self.resimulate(&mut runtime, &mut simulation, from, current)
+        let rollback = late_from.map(|from| (from, current));
+        if let Some((from, through)) = rollback {
+            self.resimulate(&mut runtime, &mut simulation, from, through, late_inputs)
                 .await?
         }
         let number = current + 1;
@@ -481,7 +488,11 @@ impl<S: AuthoritativeSimulation> Room<S> {
         );
         self.current.store(number, AtomicOrdering::Release);
         self.counters.ticks.fetch_add(1, AtomicOrdering::Relaxed);
-        if number.is_multiple_of(self.config.snapshot_interval) {
+        // A rollback rewrote already-published history: the next publication
+        // must be a single authoritative keyframe consistent with the final
+        // state hash, regardless of the periodic snapshot interval.
+        let force_keyframe = rollback.is_some();
+        if force_keyframe || number.is_multiple_of(self.config.snapshot_interval) {
             self.snapshots.send_replace(Some(snapshot.clone()));
             if let Some(o) = &self.observer
                 && let Err(error) = o.snapshot(tick, &snapshot, hash).await
@@ -549,9 +560,19 @@ impl<S: AuthoritativeSimulation> Room<S> {
         }
         Ok(())
     }
-    fn drain(&self, r: &mut Runtime<S::Command, S::Snapshot>) -> Option<u64> {
+    /// Drains submitted commands without touching history.
+    ///
+    /// Returns the earliest rollback target and the late inputs that must be
+    /// folded into history once resimulation has been verified. Future commands
+    /// enter the pending scheduler immediately, exactly as on the single-process
+    /// path without rollback.
+    fn drain(
+        &self,
+        r: &mut Runtime<S::Command, S::Snapshot>,
+    ) -> (Option<u64>, Vec<LateInput<S::Command>>) {
         let current = self.current_tick();
-        let mut late = None;
+        let mut late_from = None;
+        let mut late_inputs = Vec::new();
         while let Ok(input) = r.receiver.try_recv() {
             self.counters.received.fetch_add(1, AtomicOrdering::Relaxed);
             let last = r.sequences.get(&input.command.player).copied().unwrap_or(0);
@@ -563,13 +584,17 @@ impl<S: AuthoritativeSimulation> Room<S> {
             }
             if input.target <= current {
                 self.counters.late.fetch_add(1, AtomicOrdering::Relaxed);
-                if let Some(record) = r.history.get_mut(&input.target)
+                if let Some(record) = r.history.get(&input.target)
                     && record.commands.len() < self.config.max_commands_per_tick
                 {
                     r.sequences
                         .insert(input.command.player, input.command.sequence);
-                    record.commands.push(input.command);
-                    late = Some(late.map_or(input.target, |v: u64| v.min(input.target)))
+                    late_from =
+                        Some(late_from.map_or(input.target, |value: u64| value.min(input.target)));
+                    late_inputs.push(LateInput {
+                        target: input.target,
+                        command: input.command,
+                    });
                 } else {
                     self.counters.rejected.fetch_add(1, AtomicOrdering::Relaxed);
                 }
@@ -586,61 +611,68 @@ impl<S: AuthoritativeSimulation> Room<S> {
                 })
             }
         }
-        late
+        (late_from, late_inputs)
     }
+
+    /// Restores a verified checkpoint and recomputes every tick through the
+    /// current authoritative tick.
+    ///
+    /// The operation is transactional: checkpoint verification, restore,
+    /// replay and history replacement either all commit together, or — on any
+    /// failure — the simulation is rolled back to the exact state it had when
+    /// the tick started and history retains its previously published records.
+    /// No intermediate state is published; successful completion asks the next
+    /// publication to be a keyframe matching the final state hash.
     async fn resimulate(
         &self,
         r: &mut Runtime<S::Command, S::Snapshot>,
         s: &mut S,
         from: u64,
         through: u64,
+        late_inputs: Vec<LateInput<S::Command>>,
     ) -> Result<()> {
         let base = from
             .checked_sub(1)
             .ok_or_else(|| Error::InvalidConfig("rollback target".into()))?;
-        let checkpoint = r
+
+        // Capture the pre-rollback live state before mutating anything. It is
+        // the rollback anchor that keeps the failed advance invisible.
+        let anchor_tick = self.tick(through);
+        let (anchor_snapshot, anchor_hash) = self.capture(s, anchor_tick).await?;
+        let anchor_record = r
             .history
-            .get(&base)
+            .get(&through)
             .ok_or_else(|| Error::InvalidConfig("rollback window".into()))?;
-        if !checkpoint
-            .hash
-            .matches(&self.encode(s, &checkpoint.snapshot)?)
-        {
-            return Err(Error::InvalidFrame("checkpoint corrupted".into()));
+        if anchor_record.hash != anchor_hash {
+            return Err(Error::InvalidFrame(
+                "live state diverged from recorded history".into(),
+            ));
         }
-        if let Err(error) = s
-            .restore(self.tick(base), checkpoint.snapshot.clone())
+
+        match self
+            .resimulate_guarded(r, s, from, through, base, late_inputs)
             .await
         {
-            self.counters
-                .rollback_failures
-                .fetch_add(1, AtomicOrdering::Relaxed);
-            return Err(error);
-        }
-        let verified = s.snapshot(self.tick(base)).await?;
-        if !checkpoint.hash.matches(&self.encode(s, &verified)?) {
-            return Err(Error::InvalidFrame("restore mismatch".into()));
-        }
-        for number in from..=through {
-            let commands = r
-                .history
-                .get(&number)
-                .ok_or_else(|| Error::InvalidConfig("rollback history".into()))?
-                .commands
-                .clone();
-            for command in commands {
-                s.apply(command).await?
+            Ok(()) => {}
+            Err(error) => {
+                self.counters
+                    .rollback_failures
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                // Best-effort restore of the pre-advance state. If even this
+                // fails, the room must not expose the half-resimulated state:
+                // the error still aborts the advance without writing history.
+                if let Err(restore_error) = s.restore(anchor_tick, anchor_snapshot).await {
+                    tracing::error!(
+                        room_id = %self.id,
+                        %error,
+                        %restore_error,
+                        "Rollback failed and pre-rollback state could not be restored"
+                    );
+                }
+                return Err(error);
             }
-            let tick = self.tick(number);
-            s.step(tick).await?;
-            let (snapshot, hash) = self.capture(s, tick).await?;
-            let record = r
-                .history
-                .get_mut(&number)
-                .ok_or_else(|| Error::InvalidConfig("rollback history".into()))?;
-            record.snapshot = snapshot;
-            record.hash = hash;
         }
+
         self.counters
             .rollbacks
             .fetch_add(1, AtomicOrdering::Relaxed);
@@ -657,6 +689,76 @@ impl<S: AuthoritativeSimulation> Room<S> {
                 .observer_errors
                 .fetch_add(1, AtomicOrdering::Relaxed);
             tracing::warn!(room_id = %self.id, %error, "Realtime rollback observer failed");
+        }
+        Ok(())
+    }
+
+    /// Inner resimulation that only mutates history once every recomputed
+    /// record has been produced and verified.
+    async fn resimulate_guarded(
+        &self,
+        r: &mut Runtime<S::Command, S::Snapshot>,
+        s: &mut S,
+        from: u64,
+        through: u64,
+        base: u64,
+        late_inputs: Vec<LateInput<S::Command>>,
+    ) -> Result<()> {
+        let checkpoint = r
+            .history
+            .get(&base)
+            .ok_or_else(|| Error::InvalidConfig("rollback window".into()))?;
+        if !checkpoint
+            .hash
+            .matches(&self.encode(s, &checkpoint.snapshot)?)
+        {
+            return Err(Error::InvalidFrame("checkpoint corrupted".into()));
+        }
+        s.restore(self.tick(base), checkpoint.snapshot.clone())
+            .await?;
+        let verified = s.snapshot(self.tick(base)).await?;
+        if !checkpoint.hash.matches(&self.encode(s, &verified)?) {
+            return Err(Error::InvalidFrame("restore mismatch".into()));
+        }
+
+        // Merge late inputs into copies of the existing command lists. History
+        // itself stays untouched until the whole replay has succeeded.
+        let mut commands_by_tick: BTreeMap<u64, Vec<Command<S::Command>>> = r
+            .history
+            .range(from..=through)
+            .map(|(tick, record)| (*tick, record.commands.clone()))
+            .collect();
+        for late in late_inputs {
+            let commands = commands_by_tick
+                .get_mut(&late.target)
+                .ok_or_else(|| Error::InvalidConfig("rollback history".into()))?;
+            commands.push(late.command);
+        }
+
+        let mut recomputed: BTreeMap<u64, TickRecord<S::Command, S::Snapshot>> = BTreeMap::new();
+        for number in from..=through {
+            let commands = commands_by_tick
+                .remove(&number)
+                .ok_or_else(|| Error::InvalidConfig("rollback history".into()))?;
+            for command in &commands {
+                s.apply(command.clone()).await?
+            }
+            let tick = self.tick(number);
+            s.step(tick).await?;
+            let (snapshot, hash) = self.capture(s, tick).await?;
+            recomputed.insert(
+                number,
+                TickRecord {
+                    commands,
+                    snapshot,
+                    hash,
+                },
+            );
+        }
+
+        // Single commit point: only now does published history change.
+        for (number, record) in recomputed {
+            r.history.insert(number, record);
         }
         Ok(())
     }
@@ -697,6 +799,35 @@ impl<S: AuthoritativeSimulation> Room<S> {
                 .delta
                 .saturating_mul(u32::try_from(number).unwrap_or(u32::MAX)),
         }
+    }
+
+    /// Test-only fault injection: corrupts the stored checkpoint hash of a
+    /// history record so the next resimulation must reject it.
+    #[cfg(test)]
+    async fn corrupt_history_hash(&self, tick: u64) {
+        let mut runtime = self.runtime.lock().await;
+        if let Some(record) = runtime.history.get_mut(&tick) {
+            record.hash = StateHash::ZERO;
+        } else {
+            panic!("history tick {tick} not found");
+        }
+    }
+
+    /// Test-only accessor for a stored history snapshot.
+    #[cfg(test)]
+    async fn history_snapshot(&self, tick: u64) -> Option<S::Snapshot> {
+        let runtime = self.runtime.lock().await;
+        runtime
+            .history
+            .get(&tick)
+            .map(|record| record.snapshot.clone())
+    }
+
+    /// Test-only accessor for the number of retained history records.
+    #[cfg(test)]
+    async fn history_len(&self) -> usize {
+        let runtime = self.runtime.lock().await;
+        runtime.history.len()
     }
     pub fn stats(&self) -> RoomStats {
         RoomStats {
@@ -742,7 +873,7 @@ mod tests {
     use crate::replay::{ReplayHeader, ReplayReader, ReplayRecord, ReplayWriter};
     #[derive(Clone, serde::Serialize, serde::Deserialize)]
     struct Add(i64);
-    #[derive(Clone)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     struct State {
         i: i64,
     }
@@ -973,5 +1104,329 @@ mod tests {
         let stats = play_replay::<_, Add, _>(&mut reader, &room).await.unwrap();
         assert_eq!(stats.commands_submitted, 1);
         assert_eq!(stats.checkpoints_verified, 1);
+    }
+
+    /// Shared controls for the fault-injecting simulation.
+    #[derive(Default)]
+    struct Faults {
+        fail_restore: AtomicBool,
+        fail_step_at: std::sync::Mutex<Option<u64>>,
+    }
+
+    /// Simulation identical to [`Sim`] but able to fail restore and a chosen step.
+    struct ControlledSim {
+        state: State,
+        faults: Arc<Faults>,
+    }
+
+    impl ControlledSim {
+        fn new() -> (Self, Arc<Faults>) {
+            let faults = Arc::new(Faults::default());
+            (
+                Self {
+                    state: State { i: 0 },
+                    faults: Arc::clone(&faults),
+                },
+                faults,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl AuthoritativeSimulation for ControlledSim {
+        type Command = Add;
+        type Snapshot = State;
+        async fn apply(&mut self, c: Command<Add>) -> Result<()> {
+            self.state.i += c.value.0;
+            Ok(())
+        }
+        async fn step(&mut self, tick: Tick) -> Result<()> {
+            if self.faults.fail_step_at.lock().unwrap().as_ref() == Some(&tick.number) {
+                return Err(Error::Unavailable);
+            }
+            self.state.i += 1;
+            Ok(())
+        }
+        async fn snapshot(&self, _: Tick) -> Result<State> {
+            Ok(self.state.clone())
+        }
+        fn encode_snapshot(&self, snapshot: &State) -> Result<Vec<u8>> {
+            Ok(snapshot.i.to_le_bytes().to_vec())
+        }
+        async fn restore(&mut self, _: Tick, snapshot: State) -> Result<()> {
+            if self.faults.fail_restore.load(AtomicOrdering::Acquire) {
+                return Err(Error::Unavailable);
+            }
+            self.state = snapshot;
+            Ok(())
+        }
+    }
+
+    /// Publisher that records every published snapshot in tick order.
+    #[derive(Default)]
+    struct RecordingPublisher {
+        snapshots: std::sync::Mutex<Vec<(u64, State, StateHash)>>,
+        forced: AtomicBool,
+    }
+
+    #[async_trait]
+    impl SnapshotPublisher<State> for RecordingPublisher {
+        async fn publish(&self, snapshot: Snapshot<State>) -> Result<()> {
+            self.snapshots.lock().unwrap().push((
+                snapshot.tick,
+                snapshot.state,
+                snapshot.state_hash,
+            ));
+            Ok(())
+        }
+        fn force_keyframe(&self) {
+            self.forced.store(true, AtomicOrdering::Release);
+        }
+    }
+
+    fn rollback_config(snapshot_interval: u64) -> RoomConfig {
+        RoomConfig {
+            input_delay_ticks: 0,
+            rollback_window_ticks: 4,
+            snapshot_interval,
+            ..Default::default()
+        }
+    }
+
+    fn late_command(user_id: i64, value: i64) -> Command<Add> {
+        Command {
+            player: player(user_id),
+            sequence: 1,
+            value: Add(value),
+        }
+    }
+
+    #[tokio::test]
+    async fn rollback_recomputes_history_and_publishes_one_consistent_keyframe() {
+        let publisher = Arc::new(RecordingPublisher::default());
+        let room = Room::new("rollback", rollback_config(100), Sim(State { i: 0 }))
+            .unwrap()
+            .with_publisher(Arc::clone(&publisher) as Arc<dyn SnapshotPublisher<State>>);
+        room.try_submit_at(1, late_command(1, 2)).unwrap();
+        for _ in 0..3 {
+            room.advance().await.unwrap();
+        }
+        assert_eq!(room.current_tick(), 3);
+        // No periodic publication yet (interval is 100), so the watch and
+        // publisher only hold the states pushed by the rollback keyframe path.
+        assert!(publisher.snapshots.lock().unwrap().is_empty());
+
+        // Late input targets tick 1: history 1..=3 must be recomputed.
+        room.try_submit_at(1, late_command(2, 5)).unwrap();
+        room.advance().await.unwrap();
+
+        let stats = room.stats();
+        assert_eq!(stats.rollbacks_completed, 1);
+        assert_eq!(stats.rollback_failures, 0);
+        assert_eq!(stats.ticks_resimulated, 3);
+        assert_eq!(room.current_tick(), 4);
+        assert!(publisher.forced.load(AtomicOrdering::Acquire));
+
+        // Exactly one publication for the advance, at the final tick, and its
+        // hash matches the canonical encoding of the published state.
+        let published: Vec<_> = publisher.snapshots.lock().unwrap().clone();
+        assert_eq!(published.len(), 1);
+        let (tick, state, hash) = published[0].clone();
+        assert_eq!(tick, 4);
+        assert!(hash.matches(&state.i.to_le_bytes()));
+        // Replay from tick 0: tick1 applies +2 and +5 then steps to 8, and each
+        // later tick adds one; tick4 is 11.
+        assert_eq!(state.i, 11);
+
+        // Every retained history record reflects the recomputed timeline.
+        for tick in 1..=4 {
+            let snapshot = room.history_snapshot(tick).await.unwrap();
+            assert_eq!(snapshot.i, tick as i64 + 7);
+        }
+        // The watch channel exposes the same final state.
+        assert_eq!(room.snapshots.borrow().as_ref().unwrap().i, 11);
+    }
+
+    #[tokio::test]
+    async fn corrupted_checkpoint_aborts_the_advance_without_visible_changes() {
+        let publisher = Arc::new(RecordingPublisher::default());
+        let room = Room::new("corrupt", rollback_config(1), Sim(State { i: 0 }))
+            .unwrap()
+            .with_publisher(Arc::clone(&publisher) as Arc<dyn SnapshotPublisher<State>>);
+        for _ in 0..3 {
+            room.advance().await.unwrap();
+        }
+        let published_before = publisher.snapshots.lock().unwrap().clone();
+        let state_before = room.history_snapshot(3).await.unwrap();
+        assert_eq!(room.current_tick(), 3);
+
+        // Corrupt the checkpoint that resimulation would restore from
+        // (base of the earliest rollback target).
+        room.corrupt_history_hash(0).await;
+        room.try_submit_at(1, late_command(7, 5)).unwrap();
+
+        let error = room.advance().await;
+        assert!(
+            matches!(error, Err(Error::InvalidFrame(message)) if message.contains("checkpoint corrupted"))
+        );
+
+        let stats = room.stats();
+        assert_eq!(stats.rollbacks_completed, 0);
+        assert_eq!(stats.rollback_failures, 1);
+        assert_eq!(stats.ticks_resimulated, 0);
+        assert_eq!(stats.tick_failures, 1);
+        // The failed tick is not advanced, not finalized and not published.
+        assert_eq!(room.current_tick(), 3);
+        assert_eq!(room.finalized_tick(), 0);
+        assert_eq!(
+            publisher.snapshots.lock().unwrap().clone(),
+            published_before
+        );
+        // History keeps its previously published, un-recomputed records.
+        assert_eq!(room.history_snapshot(3).await.unwrap(), state_before);
+        assert!(!publisher.forced.load(AtomicOrdering::Acquire));
+
+        // The room remains usable: a later ordinary advance succeeds and the
+        // failed tick never becomes authoritative.
+        room.advance().await.unwrap();
+        assert_eq!(room.current_tick(), 4);
+        assert_eq!(room.stats().rollbacks_completed, 0);
+    }
+
+    #[tokio::test]
+    async fn restore_failure_aborts_and_keeps_the_published_state() {
+        let (sim, faults) = ControlledSim::new();
+        let publisher = Arc::new(RecordingPublisher::default());
+        let room = Room::new("restore-fail", rollback_config(1), sim)
+            .unwrap()
+            .with_publisher(Arc::clone(&publisher) as Arc<dyn SnapshotPublisher<State>>);
+        for _ in 0..3 {
+            room.advance().await.unwrap();
+        }
+        let state_before = room.history_snapshot(3).await.unwrap();
+        let published_before = publisher.snapshots.lock().unwrap().clone();
+
+        faults.fail_restore.store(true, AtomicOrdering::Release);
+        room.try_submit_at(2, late_command(7, 9)).unwrap();
+        let error = room.advance().await;
+        assert!(matches!(error, Err(Error::Unavailable)));
+
+        assert_eq!(room.stats().rollback_failures, 1);
+        assert_eq!(room.stats().rollbacks_completed, 0);
+        assert_eq!(room.current_tick(), 3);
+        assert_eq!(room.history_snapshot(3).await.unwrap(), state_before);
+        assert_eq!(
+            publisher.snapshots.lock().unwrap().clone(),
+            published_before
+        );
+
+        // Clear the fault and prove the next rollback converges normally.
+        faults.fail_restore.store(false, AtomicOrdering::Release);
+        room.try_submit_at(2, late_command(8, 9)).unwrap();
+        room.advance().await.unwrap();
+        assert_eq!(room.stats().rollbacks_completed, 1);
+        assert_eq!(room.current_tick(), 4);
+    }
+
+    #[tokio::test]
+    async fn step_failure_during_replay_restores_the_pre_advance_state() {
+        let (sim, faults) = ControlledSim::new();
+        let room = Room::new("step-fail", rollback_config(1), sim).unwrap();
+        for _ in 0..3 {
+            room.advance().await.unwrap();
+        }
+        let state_before = room.history_snapshot(3).await.unwrap();
+        // Fail the second recomputed tick: tick 1 replays first, then tick 2 fails.
+        *faults.fail_step_at.lock().unwrap() = Some(2);
+
+        room.try_submit_at(1, late_command(7, 4)).unwrap();
+        let error = room.advance().await;
+        assert!(matches!(error, Err(Error::Unavailable)));
+
+        assert_eq!(room.stats().rollback_failures, 1);
+        assert_eq!(room.stats().rollbacks_completed, 0);
+        assert_eq!(room.current_tick(), 3);
+        // No half-recomputed record is committed to history.
+        assert_eq!(room.history_snapshot(1).await.unwrap().i, 1);
+        assert_eq!(room.history_snapshot(3).await.unwrap(), state_before);
+
+        // The live simulation was restored to the pre-advance state, so a
+        // subsequent successful advance continues from the same timeline.
+        *faults.fail_step_at.lock().unwrap() = None;
+        room.advance().await.unwrap();
+        assert_eq!(room.current_tick(), 4);
+        assert_eq!(
+            room.history_snapshot(4).await.unwrap().i,
+            state_before.i + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_covering_several_late_inputs_converges_on_one_timeline() {
+        let room = Room::new("multi-late", rollback_config(1), Sim(State { i: 0 })).unwrap();
+        room.try_submit_at(1, late_command(1, 10)).unwrap();
+        for _ in 0..4 {
+            room.advance().await.unwrap();
+        }
+        assert_eq!(room.current_tick(), 4);
+        // Two late inputs land on different history ticks in the same advance.
+        room.try_submit_at(1, late_command(2, 100)).unwrap();
+        room.try_submit_at(3, late_command(3, 1000)).unwrap();
+        room.advance().await.unwrap();
+
+        assert_eq!(room.stats().rollbacks_completed, 1);
+        assert_eq!(room.stats().ticks_resimulated, 4);
+        // tick1: 10+100+1=111; tick2: 112; tick3: 1000+113=1113; tick4: 1114; tick5: 1115
+        assert_eq!(room.history_snapshot(1).await.unwrap().i, 111);
+        assert_eq!(room.history_snapshot(2).await.unwrap().i, 112);
+        assert_eq!(room.history_snapshot(3).await.unwrap().i, 1113);
+        assert_eq!(room.history_snapshot(4).await.unwrap().i, 1114);
+        assert_eq!(room.history_snapshot(5).await.unwrap().i, 1115);
+    }
+
+    #[tokio::test]
+    async fn concurrent_advances_serialize_and_never_corrupt_history() {
+        let room = Arc::new(
+            Room::new(
+                "concurrent",
+                RoomConfig {
+                    input_delay_ticks: 0,
+                    rollback_window_ticks: 64,
+                    snapshot_interval: 1,
+                    ..Default::default()
+                },
+                Sim(State { i: 0 }),
+            )
+            .unwrap(),
+        );
+        let mut handles = Vec::new();
+        for _ in 0..12 {
+            let room = Arc::clone(&room);
+            handles.push(tokio::spawn(async move { room.advance().await }));
+        }
+        for handle in handles {
+            handle.await.unwrap().unwrap();
+        }
+        assert_eq!(room.current_tick(), 12);
+        assert_eq!(room.stats().ticks_completed, 12);
+        assert_eq!(room.stats().tick_failures, 0);
+        assert_eq!(room.history_len().await, 13); // tick 0 plus ticks 1..=12
+        for tick in 1..=12 {
+            assert_eq!(room.history_snapshot(tick).await.unwrap().i, tick as i64);
+        }
+    }
+
+    #[tokio::test]
+    async fn rollback_failure_does_not_advance_finalization() {
+        let room = Room::new("finalized", rollback_config(1), Sim(State { i: 0 })).unwrap();
+        for _ in 0..4 {
+            room.advance().await.unwrap();
+        }
+        let finalized_before = room.finalized_tick();
+        room.corrupt_history_hash(0).await;
+        room.try_submit_at(1, late_command(7, 1)).unwrap();
+        assert!(room.advance().await.is_err());
+        assert_eq!(room.finalized_tick(), finalized_before);
+        assert_eq!(room.current_tick(), 4);
     }
 }

@@ -48,13 +48,14 @@ fn authoritative_state_replays_only_unconfirmed_inputs() {
 #[test]
 fn replay_limit_failure_is_transactional() {
     let mut config = PredictionConfig::default();
-    config.max_replay_steps = 2;
+    config.max_replay_steps = 1;
     let mut prediction = PredictionBuffer::new(config).unwrap();
     for tick in 1..=3 {
         prediction.record(tick, 1_i32, tick as i32).unwrap();
     }
+    // Ticks 2 and 3 would need replaying, which exceeds the one-step limit.
     assert_eq!(
-        prediction.reconcile(0, 0, |state, _, input| *state += input),
+        prediction.reconcile(1, 0, |state, _, input| *state += input),
         Err(NetcodeError::ReplayLimitExceeded)
     );
     assert_eq!(prediction.pending_len(), 3);
@@ -110,4 +111,131 @@ fn reconciliation_does_not_clone_inputs_or_the_entire_history() {
 
     assert_eq!(report.corrected_state.value, 7);
     assert_eq!(clones.load(Ordering::Relaxed), 3);
+}
+
+#[test]
+fn repeated_authoritative_tick_is_rejected_and_leaves_the_buffer_untouched() {
+    let mut prediction = PredictionBuffer::new(PredictionConfig::default()).unwrap();
+    prediction.record(1, 1_i32, 1_i32).unwrap();
+    prediction.record(2, 2, 3).unwrap();
+    prediction
+        .reconcile(1, 2, |state, _, input| *state += input)
+        .unwrap();
+    assert_eq!(prediction.confirmed_tick(), 1);
+
+    // A duplicated authoritative packet for the same tick must not discard
+    // frames again or move the confirmed tick.
+    let error = prediction.reconcile(1, 99, |state, _, input| *state += input);
+    assert!(matches!(error, Err(NetcodeError::InvalidInput(_))));
+    assert_eq!(prediction.confirmed_tick(), 1);
+    assert_eq!(prediction.pending_len(), 1);
+    assert_eq!(
+        prediction
+            .frames()
+            .map(|frame| (frame.tick, frame.predicted_state))
+            .collect::<Vec<_>>(),
+        vec![(2, 4)]
+    );
+}
+
+#[test]
+fn older_authoritative_tick_is_rejected_and_leaves_the_buffer_untouched() {
+    let mut prediction = PredictionBuffer::new(PredictionConfig::default()).unwrap();
+    prediction.record(1, 1_i32, 1_i32).unwrap();
+    prediction.record(2, 2, 3).unwrap();
+    prediction.record(3, 3, 6).unwrap();
+    prediction
+        .reconcile(2, 3, |state, _, input| *state += input)
+        .unwrap();
+    let frames_before: Vec<_> = prediction
+        .frames()
+        .map(|frame| (frame.tick, frame.predicted_state))
+        .collect();
+
+    let error = prediction.reconcile(1, 0, |state, _, input| *state += input);
+    assert!(matches!(error, Err(NetcodeError::InvalidInput(_))));
+
+    assert_eq!(prediction.confirmed_tick(), 2);
+    assert_eq!(
+        prediction
+            .frames()
+            .map(|frame| (frame.tick, frame.predicted_state))
+            .collect::<Vec<_>>(),
+        frames_before
+    );
+}
+
+#[test]
+fn confirmed_tick_is_monotonic_across_successive_corrections() {
+    let mut prediction = PredictionBuffer::new(PredictionConfig::default()).unwrap();
+    for tick in 1..=6 {
+        prediction.record(tick, tick as i32, tick as i32).unwrap();
+    }
+    let first = prediction
+        .reconcile(2, 100, |state, _, input| *state += input)
+        .unwrap();
+    assert_eq!(first.authoritative_tick, 2);
+    assert_eq!(first.current_tick, 6);
+    assert_eq!(prediction.confirmed_tick(), 2);
+    assert_eq!(prediction.pending_len(), 4);
+
+    let second = prediction
+        .reconcile(4, 200, |state, _, input| *state += input)
+        .unwrap();
+    assert_eq!(second.authoritative_tick, 4);
+    assert_eq!(second.replayed_inputs, 2);
+    assert_eq!(second.current_tick, 6);
+    assert_eq!(prediction.confirmed_tick(), 4);
+    assert_eq!(prediction.pending_len(), 2);
+}
+
+#[test]
+fn replay_overflow_keeps_the_buffer_and_a_later_correction_succeeds() {
+    let mut config = PredictionConfig::default();
+    config.max_replay_steps = 2;
+    let mut prediction = PredictionBuffer::new(config).unwrap();
+    for tick in 1..=4 {
+        prediction.record(tick, 1_i32, tick as i32).unwrap();
+    }
+    // Replaying ticks 2..=4 exceeds the limit: reject and keep every frame.
+    assert_eq!(
+        prediction.reconcile(1, 0, |state, _, input| *state += input),
+        Err(NetcodeError::ReplayLimitExceeded)
+    );
+    assert_eq!(prediction.pending_len(), 4);
+    assert_eq!(prediction.confirmed_tick(), 0);
+
+    // The next authoritative state is newer and only needs two replays.
+    let report = prediction
+        .reconcile(2, 10, |state, _, input| *state += input)
+        .unwrap();
+    assert_eq!(report.replayed_inputs, 2);
+    assert_eq!(report.corrected_state, 12);
+    assert_eq!(report.current_tick, 4);
+    assert_eq!(prediction.confirmed_tick(), 2);
+    assert_eq!(prediction.pending_len(), 2);
+}
+
+#[test]
+fn correction_discards_only_frames_not_newer_than_the_authoritative_tick() {
+    let mut prediction = PredictionBuffer::new(PredictionConfig::default()).unwrap();
+    prediction.record(1, 1_i32, 1).unwrap();
+    prediction.record(2, 2, 3).unwrap();
+    prediction.record(3, 3, 6).unwrap();
+    prediction.record(4, 4, 10).unwrap();
+
+    let report = prediction
+        .reconcile(3, 0, |state, _, input| *state += input)
+        .unwrap();
+    // Ticks 1..=3 are confirmed and discarded; only tick 4 is replayed.
+    assert_eq!(report.replayed_inputs, 1);
+    assert_eq!(report.current_tick, 4);
+    assert_eq!(
+        prediction
+            .frames()
+            .map(|frame| frame.tick)
+            .collect::<Vec<_>>(),
+        vec![4]
+    );
+    assert_eq!(prediction.confirmed_tick(), 3);
 }

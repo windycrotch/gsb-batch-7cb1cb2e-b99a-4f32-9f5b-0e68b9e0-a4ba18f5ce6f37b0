@@ -136,7 +136,9 @@ where
     /// Restores an authoritative state and deterministically replays later local inputs.
     ///
     /// `simulate` owns game rules and must advance `state` exactly once for the supplied Tick and
-    /// input. A replay-limit or ordering error leaves the buffer unchanged.
+    /// input. Authoritative Ticks must move strictly forward: a repeated or older authoritative
+    /// Tick is rejected without touching the buffer. A replay-limit or ordering error likewise
+    /// leaves the buffer unchanged, so the client can wait for a later authoritative state.
     pub fn reconcile<Simulate>(
         &mut self,
         authoritative_tick: u64,
@@ -146,11 +148,14 @@ where
     where
         Simulate: FnMut(&mut S, u64, &I),
     {
-        if authoritative_tick < self.confirmed_tick {
+        if authoritative_tick <= self.confirmed_tick {
             return Err(NetcodeError::InvalidInput(
-                "authoritative prediction Tick moved backwards",
+                "authoritative prediction Tick must be newer than the confirmed Tick",
             ));
         }
+        // Validate every precondition before mutating anything, so a rejected
+        // correction (for example an oversized replay) leaves the buffer exactly
+        // as it was and the confirmed Tick monotonic.
         let confirmed_frames = self
             .frames
             .iter()

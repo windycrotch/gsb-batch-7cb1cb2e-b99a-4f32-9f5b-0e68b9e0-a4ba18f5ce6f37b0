@@ -19,6 +19,11 @@ pub async fn shutdown_signal() -> io::Result<()> {
     }
 }
 
+/// Waits for the platform's normal process termination signal.
+///
+/// Non-Unix processes use the Tokio Ctrl-C facility. The caller remains
+/// responsible for notifying its watch-based server tasks so each runtime can
+/// drain within its configured deadline.
 #[cfg(not(unix))]
 pub async fn shutdown_signal() -> io::Result<()> {
     tokio::signal::ctrl_c().await
