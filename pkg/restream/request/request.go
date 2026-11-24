@@ -30,8 +30,14 @@ func (r Request) Do(ctx context.Context, requestURL string) (*http.Response, err
 		default:
 			response, err := r.attemptRequest(ctx, requestURL)
 			if err != nil || response == nil {
+				// Do not keep retrying (or sleep) once the caller gave up.
+				if ctx.Err() != nil {
+					return nil, fmt.Errorf("request to %s aborted as context cancelled: %w", requestURL, err)
+				}
 				log.Printf("request to %s failed with error %v. Will retry in 1 second", requestURL, err)
-				time.Sleep(time.Second)
+				if err := sleepWithContext(ctx, time.Second); err != nil {
+					return nil, fmt.Errorf("request to %s aborted as context cancelled", requestURL)
+				}
 				continue
 			}
 
@@ -40,13 +46,33 @@ func (r Request) Do(ctx context.Context, requestURL string) (*http.Response, err
 			}
 
 			if response.StatusCode != http.StatusNotFound {
+				if ctx.Err() != nil {
+					response.Body.Close()
+					return nil, fmt.Errorf("request to %s aborted as context cancelled", requestURL)
+				}
 				log.Printf("request to %s failed with status code %d. Will retry in 1 second", requestURL, response.StatusCode)
-				time.Sleep(time.Second)
+				response.Body.Close()
+				if err := sleepWithContext(ctx, time.Second); err != nil {
+					return nil, fmt.Errorf("request to %s aborted as context cancelled", requestURL)
+				}
 				continue
 			}
 
+			response.Body.Close()
 			return nil, fmt.Errorf("request to %s failed with status code %d", requestURL, response.StatusCode)
 		}
+	}
+}
+
+func sleepWithContext(ctx context.Context, duration time.Duration) error {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 

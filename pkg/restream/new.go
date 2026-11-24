@@ -3,6 +3,7 @@ package restream
 import (
 	"context"
 	"io"
+	"sync/atomic"
 
 	"github.com/shaunschembri/restreamer/pkg/restream/provider"
 )
@@ -15,16 +16,18 @@ const (
 )
 
 type Restream struct {
-	UserAgent        string
-	MaxBandwidth     uint32
-	Writer           io.Writer
-	SegmentProvider  provider.Provider
-	ReadBufferSize   int
-	streamedBytes    int64
-	currentBandwidth uint32
+	UserAgent       string
+	MaxBandwidth    uint32
+	Writer          io.Writer
+	SegmentProvider provider.Provider
+	ReadBufferSize  int
+	// streamedBytes and currentBandwidth are shared between Start's loop
+	// and the getSegments goroutine. They are only ever touched through the
+	// sync/atomic helpers (or their own atomic methods).
+	streamedBytes    atomic.Int64
+	currentBandwidth atomic.Uint32
 	segments         chan provider.Segment
 	errors           chan error
-	decrypter        decrypter
 }
 
 func (r *Restream) init(ctx context.Context, playlistURL string) error {
@@ -34,7 +37,7 @@ func (r *Restream) init(ctx context.Context, playlistURL string) error {
 	if r.MaxBandwidth == 0 {
 		r.MaxBandwidth = defaultBandwidth
 	}
-	r.currentBandwidth = r.MaxBandwidth
+	r.currentBandwidth.Store(r.MaxBandwidth)
 
 	if r.ReadBufferSize == 0 {
 		r.ReadBufferSize = defaultReadBufferSize

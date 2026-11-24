@@ -27,6 +27,13 @@ var downloadCmd = &cobra.Command{
 			log.Printf("Error: cannot open file %s", fileName)
 			return
 		}
+		// Guarantee the file is closed and flushed even if the stream ends
+		// early because the timeout fired or an error occurred.
+		defer func() {
+			if err := file.Close(); err != nil {
+				log.Printf("Error: cannot close file %s: %v", fileName, err)
+			}
+		}()
 
 		duration, _ := cmd.Flags().GetDuration("duration")
 		segmentsContext, cancel := context.WithTimeout(context.Background(), duration)
@@ -37,8 +44,6 @@ var downloadCmd = &cobra.Command{
 			log.Printf("Error: %v", err)
 		}
 		log.Printf("Download stream with id %s stopped", streamID)
-
-		file.Close()
 	},
 }
 

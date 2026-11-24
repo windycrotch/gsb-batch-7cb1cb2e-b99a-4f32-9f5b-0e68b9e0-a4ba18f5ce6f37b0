@@ -40,6 +40,11 @@ func (m Master) Info() string {
 	return infoStr
 }
 
+// Closed delegates to the selected media variant playlist.
+func (m Master) Closed() bool {
+	return m.media.Closed()
+}
+
 func (m *Master) Get(ctx context.Context, bandwidth uint32) ([]provider.Segment, time.Duration, error) {
 	if err := m.selectVariant(bandwidth); err != nil {
 		return nil, 0, err

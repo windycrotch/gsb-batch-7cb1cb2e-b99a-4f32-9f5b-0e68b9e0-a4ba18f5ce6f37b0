@@ -1,6 +1,7 @@
 package restreamer
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -38,10 +39,28 @@ func httpStream(writer http.ResponseWriter, request *http.Request) {
 	streamID := request.URL.Path[1:]
 
 	log.Printf("Starting to restream stream with id %s", streamID)
-	if err := start(request.Context(), writer, streamID); err != nil {
-		log.Println(err.Error())
+
+	recorder := &statusRecorder{ResponseWriter: writer, status: http.StatusOK}
+	err := start(request.Context(), recorder, streamID)
+	if err == nil {
+		log.Printf("Restream of stream with id %s stopped", streamID)
 		return
 	}
 
-	log.Printf("Restream of stream with id %s stopped", streamID)
+	// The client disconnected or the request context was cancelled: no
+	// response status can reach anyone, so just log and stop cleanly.
+	if request.Context().Err() != nil {
+		log.Printf("Restream of stream with id %s cancelled: %v", streamID, err)
+		return
+	}
+
+	log.Println(err.Error())
+
+	if errors.Is(err, ErrStreamNotFound) {
+		http.Error(recorder, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	// The stream id is valid but pulling/decrypting it failed.
+	http.Error(recorder, err.Error(), http.StatusBadGateway)
 }
