@@ -1,0 +1,178 @@
+basePath: /api/v1
+definitions:
+  api.AudioProfileData:
+    properties:
+      bitrate:
+        type: integer
+      codec:
+        type: string
+    type: object
+  api.Error:
+    properties:
+      details:
+        items:
+          $ref: '#/definitions/api.ErrorDetail'
+        type: array
+      message:
+        type: string
+    type: object
+  api.ErrorDetail:
+    properties:
+      message:
+        type: string
+      reason:
+        type: string
+    type: object
+  api.ErrorResponse:
+    properties:
+      error:
+        $ref: '#/definitions/api.Error'
+    type: object
+  api.InputData:
+    properties:
+      audio_profiles:
+        items:
+          $ref: '#/definitions/api.AudioProfileData'
+        type: array
+      format:
+        type: string
+      name:
+        type: string
+      video_profiles:
+        items:
+          $ref: '#/definitions/api.VideoProfileData'
+        type: array
+    required:
+    - format
+    - name
+    type: object
+  api.SuccessResponse:
+    properties:
+      data: {}
+      message:
+        type: string
+    type: object
+  api.VideoProfileData:
+    properties:
+      bitrate:
+        type: integer
+      codec:
+        type: string
+      framerate:
+        type: integer
+      height:
+        type: integer
+      max_key_interval:
+        type: integer
+      width:
+        type: integer
+    type: object
+info:
+  contact: {}
+  description: Manage your streaming workflow
+  title: Streaming Platform API
+  version: "1.0"
+paths:
+  /inputs:
+    post:
+      consumes:
+      - application/json
+      description: Create an input ready to be ingested
+      parameters:
+      - description: Input data
+        in: body
+        name: input
+        required: true
+        schema:
+          $ref: '#/definitions/api.InputData'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/api.SuccessResponse'
+        "400":
+          description: Invalid input data
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal server error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Create an input
+  /inputs/{id}:
+    delete:
+      description: Delete input by ID
+      parameters:
+      - description: Input ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.SuccessResponse'
+        "400":
+          description: Invalid UUID format
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal server error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Delete input
+    get:
+      description: Get input information by ID
+      parameters:
+      - description: Input ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.SuccessResponse'
+        "400":
+          description: Invalid UUID format
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal server error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Get input
+  /notifications/package:
+    post:
+      description: Enqueue packaging job using input URL, format and ID
+      parameters:
+      - description: Input ID
+        in: query
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/api.SuccessResponse'
+        "400":
+          description: Invalid UUID format
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+        "500":
+          description: Internal server error
+          schema:
+            $ref: '#/definitions/api.ErrorResponse'
+      summary: Enqueue packacing job
+swagger: "2.0"

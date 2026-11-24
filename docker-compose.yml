@@ -1,0 +1,71 @@
+services:
+  db:
+    container_name: db
+    image: postgres:16.1
+    restart: always
+    volumes:
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: dionysia
+      POSTGRES_PASSWORD: dionysia
+      POSTGRES_DB: dionysia
+  redis:
+    container_name: redis
+    image: redis:latest
+    ports:
+      - "6379:6379"
+  media-server:
+    container_name: media-server
+    build: media-server
+    restart: always
+    ports:
+      - "8554:8554"
+      - "1935:1935"
+      - "8888:8888"
+      - "8889:8889"
+      - "8890:8890/udp"
+      - "8189:8189/udp"
+    environment:
+      - MTX_PROTOCOLS=tcp
+      - MTX_WEBRTCADDITIONALHOSTS=192.168.x.x
+    volumes:
+      - ./media-server/mediamtx.yml:/mediamtx.yml
+  api:
+    container_name: api
+    build: .
+    restart: always
+    ports:
+      - "8080:8080"
+    depends_on:
+      - db
+      - redis
+    command: api
+    env_file:
+      - .env
+  worker:
+    container_name: worker
+    build: .
+    restart: always
+    depends_on:
+      - redis
+    command: worker
+    env_file:
+      - .env
+    volumes:
+      - content:/playout
+  playout:
+    container_name: playout
+    build: .
+    restart: always
+    ports:
+      - "8081:8081"
+    command: playout
+    env_file:
+      - .env
+    volumes:
+      - content:/playout
+
+volumes:
+  content:
