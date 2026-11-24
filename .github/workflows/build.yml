@@ -1,0 +1,18 @@
+name: CI
+
+on: [push, pull_request, pull_request_target]
+
+jobs:
+  build:
+    runs-on: "ubuntu-latest"
+    steps:
+    - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+    - name: Set up nix
+      uses: cachix/install-nix-action@v31
+    - name: Lint
+      run: nix develop -c make lint
+    - name: Test
+      run: nix develop -c make test
+    - name: Build
+      run: nix develop -c make srtrelay
