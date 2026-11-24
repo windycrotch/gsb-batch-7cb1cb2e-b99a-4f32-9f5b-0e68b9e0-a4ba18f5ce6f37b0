@@ -11,9 +11,9 @@ It's more or less an implementation of the shazam paper as described in [this aw
 
 You will need to have [go](https://golang.org/doc/install) on your computer (version > 1.11 to be able to use go modules).
 
-You will also need to have [portaudio](http://www.portaudio.com/) installed (`brew install portaudio` on macOS, `apt install portaudio19-dev` on Ubuntu / Debian, for other distributions you can search for the `portaudio` package), it is required for the `listen` command that listens on your microphone to match the recording against the database.
+The `load`, `read` and `spectrogram` commands are pure Go and need no extra dependency. The `listen` and `record` commands rely on [portaudio](http://www.portaudio.com/) to access the microphone and are built behind the `portaudio` build tag (enabled by default in the Makefile). On a machine without portaudio you can still build everything else with `make TAGS= build`, or `go build ./...` with `CGO_ENABLED=0`.
 
-To build the binary:
+To build the binary (requires portaudio for the microphone commands, e.g. `brew install portaudio` on macOS, `apt install portaudio19-dev` on Debian / Ubuntu):
 
 ```bash
 git clone git@github.com:sfluor/musig.git
@@ -32,6 +32,13 @@ You will then be able to run the binary with:
 To do some testing you can download `wav` songs by doing `make download`.
 
 Load them with `./bin/musig load "./assets/dataset/wav/*.wav"`
+
+Loading is idempotent and content aware:
+
+- loading the same file again does not add any fingerprint entry and the song name keeps its stable song ID,
+- when a same-named file contains new content, its previous fingerprint set is atomically retired inside a single database transaction and replaced by the new one, so queries only ever match the latest successfully loaded version while the song identity (name to ID mapping) is preserved,
+- a failed write rolls back entirely: no half-written fingerprint set and no song name pointing at an empty ID can ever be observed; reloading the file recovers a consistent state,
+- all of the above holds after closing and reopening the database, and under concurrent loads (a song name is mapped to a single ID, distinct songs can never overwrite each other's fingerprints).
 
 And try to find one of your song name with:
 

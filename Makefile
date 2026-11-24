@@ -10,24 +10,28 @@ LDFLAGS = -ldflags "-X main.VERSION=${BRANCH}:${COMMIT}"
 # Enable go modules
 GOCMD = GO111MODULE=on go
 
+# Build tags: the "portaudio" tag pulls in the cgo microphone recording code
+# and requires the portaudio native library. Override with `make TAGS=`.
+TAGS = -tags portaudio
+
 # Build the project
 all: build
 
 .PHONY: build
 build:
-	${GOCMD} build ${LDFLAGS} -o ./bin/${BINARY} ./cmd/musig/main.go
+	${GOCMD} build ${TAGS} ${LDFLAGS} -o ./bin/${BINARY} ./cmd/musig/main.go
 
 .PHONY: linux
 linux:
-	GOOS=linux GOARCH=${GOARCH} ${GOCMD} build ${LDFLAGS} -o ${BINARY}-linux-${GOARCH} .
+	GOOS=linux GOARCH=${GOARCH} ${GOCMD} build ${TAGS} ${LDFLAGS} -o ${BINARY}-linux-${GOARCH} .
 
 .PHONY: macos
 macos:
-	GOOS=darwin GOARCH=${GOARCH} ${GOCMD} build ${LDFLAGS} -o ${BINARY}-macos-${GOARCH} .
+	GOOS=darwin GOARCH=${GOARCH} ${GOCMD} build ${TAGS} ${LDFLAGS} -o ${BINARY}-macos-${GOARCH} .
 
 .PHONY: windows
 windows:
-	GOOS=windows GOARCH=${GOARCH} ${GOCMD} build ${LDFLAGS} -o ${BINARY}-windows-${GOARCH}.exe .
+	GOOS=windows GOARCH=${GOARCH} ${GOCMD} build ${TAGS} ${LDFLAGS} -o ${BINARY}-windows-${GOARCH}.exe .
 
 cross: linux macos windows
 
@@ -35,7 +39,7 @@ cross: linux macos windows
 test:
 	${GOCMD} get -v ./...; \
 	${GOCMD} vet $$(go list ./... | grep -v /vendor/); \
-	${GOCMD} test -v -race ./...; \
+	${GOCMD} test ${TAGS} -v -race ./...; \
 
 .PHONY: fmt
 fmt:

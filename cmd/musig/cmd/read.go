@@ -41,6 +41,7 @@ func cmdRead(file string) {
 	}
 
 	m, err := p.DB.Get(keys)
+	failIff(err, "error retrieving fingerprints from the database")
 	for key, values := range m {
 		for _, val := range values {
 
