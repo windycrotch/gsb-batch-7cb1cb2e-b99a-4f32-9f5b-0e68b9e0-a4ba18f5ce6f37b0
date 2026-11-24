@@ -1,0 +1,529 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.32.0] - 2026-11-08
+
+### Changed (breaking)
+
+- **IME contract (ADR-045)**, based on gpucontext#30 by @besmpl. One extended `IMEController` instead of versioned
+  interfaces; all text positions are UTF-8 byte offsets.
+  - `IMEController`: `SetIMEPosition(x, y int)` is replaced by `SetIMECursorArea(IMECursorArea)` (logical DIP).
+    New methods: `SetIMEContentType`, `SetIMESurroundingText`, `CancelIME`, `IMECapabilities`. Every method must
+    be safe from any goroutine.
+  - `IMEState`: `CursorPos`, `SelectionStart` and `SelectionEnd` are replaced by `Cursor` and `Selection`
+    (`IMETextRange`). A `{-1, -1}` cursor means the IME hides it (`HasCursor`).
+  - Migration: hosts implement the new methods. Methods for unsupported operations are no-ops, and
+    `IMECapabilities` reports what the platform does. Consumers read `state.Cursor.Start` where they read
+    `state.CursorPos`.
+
+### Added
+
+- `IMETextRange`, `IMESurroundingText`, `IMECursorArea`, `IMEDeleteSurroundingEvent`, with UTF-8 validation that
+  never clamps.
+- `ContentPurpose` (incl. `Chat`) and the `ContentHint` bitset, with names from tables keyed by the constants.
+- `IMECapabilities` in three groups, as in winit: cursor area, content type, surrounding text.
+- Optional `IMEEventSource` (`OnIMECanceled`, `OnIMEDisabled`, `OnIMEDeleteSurrounding`), found by type assertion.
+
+### Documentation
+
+- `WindowProvider.RequestRedraw` must be safe to call from any goroutine, and requests coalesce.
+- Package doc, AGENTS.md and ROADMAP list the IME interfaces.
+
+### Changed
+
+- deps: gputypes v0.8.0 → v0.8.2
+
+## [0.31.3] - 2026-08-31
+
+### Changed
+
+- **deps:** gputypes v0.7.0 → v0.8.0 (Viewport, ScissorRect, DrawArgs, DrawIndexedArgs — ADR-072)
+
+## [0.31.2] - 2026-08-30
+
+### Fixed
+
+- **docs:** update README and ROADMAP for struct-based `UpdateRegion` API (`image.Rectangle` + `ImageDataLayout`). v0.31.1 shipped with stale documentation showing old 6-parameter signature.
+
+## [0.31.1] - 2026-08-30
+
+### Changed
+
+- **`TextureRegionUpdater.UpdateRegion` — struct API** (#484) — replaced six positional int parameters with `image.Rectangle` + `ImageDataLayout` (WebGPU / Go stdlib idiom). Fixes silent parameter-swap bugs. Zero-value layout = offset 0, tight packed rows, region height.
+
+## [0.31.0] - 2026-08-30
+
+### Changed
+
+- **`TextureRegionUpdater.UpdateRegion` — strided upload** (#484) — added `bytesPerRow` parameter (pre-v1.0 signature change). `0` = tightly packed rows (`w * bytesPerPixel`), matching WebGPU `ImageDataLayout.bytesPerRow`. Enables zero-copy dirty-band uploads from full-frame buffers (geckty, ggcanvas) without `extractRegion` memcpy.
+
+## [0.30.0] - 2026-08-30
+
+### Added
+
+- **`DeviceProvider.DownlevelCapabilities()`** — returns `gputypes.DownlevelCapabilities` for backend capability queries. Enables consumers (gg, g3d, Born ML) to check compute support, indirect execution, and other capabilities that may be absent on non-conformant backends (GLES 3.0, CPU software). Returns zero-value if implementation does not track downlevel capabilities (backward compatible). Matches Rust wgpu `Adapter::get_downlevel_capabilities()` pattern. Architecture: DeviceProvider interface method, not type-assert — follows Flutter Impeller "check capabilities, not backend type" principle. See ADR-071.
+
+### Changed
+
+- **deps:** gputypes v0.6.0 → v0.7.0 (DownlevelCapabilities types)
+
+## [0.29.0] - 2026-08-27
+
+### Added
+
+- **`DeviceProvider.Features()`** — returns `gputypes.Features` bitfield of optional device capabilities. Enables consumers (g3d, gg) to query features like `FeatureRayQuery` without importing wgpu directly. Returns 0 if implementation does not track features (backward compatible). Matches Rust wgpu `device.features()` pattern.
+
+### Changed
+
+- **deps:** gputypes v0.5.2 → v0.6.0 (ray tracing types)
+
+## [0.28.0] - 2026-08-13
+
+### Added
+
+- **`MouseButton.String()`** — returns button name (Left, Right, Middle, X1, X2) for debugging and logging. Names match pointer `Button.String()`.
+- **`Modifiers.String()`** — returns deterministic modifier string (Ctrl+Alt+Shift+Super+CapsLock+NumLock). Order matches `gogpu/ui` event convention. Unknown bits are silently ignored.
+
+### Changed
+
+- **deps:** gputypes v0.5.1 → v0.5.2
+- Shared string constants (`stringLeft`, `stringRight`, `stringMiddle`) between `Key.String()`, `Button.String()`, and `MouseButton.String()` — eliminates duplication.
+
+## [0.27.0] - 2026-08-10
+
+### Added
+
+- **`SurfaceCompositor` interface** (ADR-067) — compositor-level bridge between gogpu and content renderers (gg, g3d). 4 methods: `ShouldPreserveContent()`, `DamageRects()`, `MarkContentRendered()`, `CompositeMSAAOverlay()`. Enables drawing library to delegate surface-level decisions (LoadOp, damage scissoring, MSAA overlay compositing) to the compositor without importing gogpu directly. Enterprise pattern validated by Chromium cc/Skia, GTK4 GSK, Flutter flow/ source code.
+
+## [0.26.0] - 2026-08-10
+
+### Changed
+
+- **Key enum redesign** — flat `iota` (94 keys) replaced with **grouped explicit bases** (138 keys). Each group has its own `const` block with reserved gaps, following the `net/http` status code pattern. Adding keys within a group never shifts values in other groups — binary-stable for v1.0+.
+  - **New groups:** Media (5 keys), Volume (3), Browser (5), System (4)
+  - **Extended:** Function keys F13-F24 (12 new), Punctuation +IntlBackslash/IntlYen, Numpad +NumpadEqual/NumpadComma
+  - **New keys:** `KeyContextMenu`, `KeyCancel`, `KeyLaunchApp1`, `KeyLaunchApp2`, `KeyMediaPlayPause`, `KeyMediaStop`, `KeyMediaTrackNext`, `KeyMediaTrackPrevious`, `KeyMediaRecord`, `KeyAudioVolumeUp`, `KeyAudioVolumeDown`, `KeyAudioVolumeMute`, `KeyBrowserBack`, `KeyBrowserForward`, `KeyBrowserRefresh`, `KeyBrowserHome`, `KeyBrowserSearch`
+  - **Naming:** W3C UIEvents KeyboardEvent.code convention adapted to Go PascalCase
+  - **BREAKING:** Key numeric values changed (pre-v1.0, no external consumers store numeric values)
+
+### Added
+
+- **`KeyFromString`** function — thread-safe reverse lookup from string name to Key value. Enables W3C KeyboardEvent.code compatibility for browser/WASM platforms. Uses `sync.Once` initialization. Round-trips with `Key.String()`.
+- **`Key.String()`** method — covers all 138 keys with human-readable names
+
+## [0.25.0] - 2026-08-09
+
+### Added
+
+- **Damage tracking interfaces** (ADR-065) — multi-renderer damage aggregation for shared surfaces. When multiple renderers (gg, g3d, video, compose) share a single GPU surface, each registers as a damage source and reports per-frame damage rectangles. The compositor unions all sources at present time.
+  - `DamageReporter` interface — 2-method frozen contract (`ReportDamage`, `ReportDamageWithReason`)
+  - `DamageCategory` enum — 6 categories (`Content`, `Layout`, `Animation`, `Resize`, `Full`, `External`)
+  - `DamageReason` struct — typed category + human-readable detail string
+  - `DamageSourceSnapshot` struct — per-source frame snapshot (name, color, rects, reason)
+  - `DamageOverlayRenderer` interface — custom overlay rendering for libraries with text capability
+  - `DamageOverlayInfo` struct — structured per-source data passed to overlay renderer
+  - Design follows Chromium `cc/DamageTracker` pattern — adapted for explicit registration model
+
+- **Pluggable debug overlay system** (ADR-066) — GTK4 Inspector-inspired overlay architecture. Multiple debug overlays register with the compositor and draw in registration order after content, before present.
+  - `DebugOverlay` interface — 2-method frozen contract (`Name`, `Draw`)
+  - `DebugOverlayContext` struct — GPU resources and frame metadata for overlay rendering
+  - Self-sustaining render loop: `Draw()` returns true → compositor calls `RequestRedraw()`
+  - Env var activation: `GOGPU_DEBUG_DAMAGE=overlay`, `GOGPU_DEBUG_FPS=overlay`, `GOGPU_DEBUG_DIRTY=overlay`
+
+## [0.24.0] - 2026-08-01
+
+### Added
+
+- **`ScaleChangedEvent`** (ADR-059, gogpu#409) — runtime DPI/scale factor change event. Emitted when window moves between monitors with different DPI or OS DPI settings change. Carries `ScaleFactor`, `Width`, `Height`. Event ordering: `ScaleChangedEvent` before `ResizeEvent` (cause before effect, winit pattern). Enterprise research: winit, Qt6, SDL3, Flutter — all emit separate DPI event.
+
+## [0.23.0] - 2026-07-30
+
+### Added
+
+- **`InputEvent` sealed interface** (ADR-058) — unified event type for SDL-style event queue. Sealed via unexported `inputEventTag()` marker — only gpucontext types implement it. Enables exhaustive type switch handling.
+- **`KeyEvent`** struct — keyboard key state change (Key, Modifiers, Pressed)
+- **`CharEvent`** struct — committed text input (Char rune)
+- **`FocusEvent`** struct — window focus state change (Focused bool)
+- **`ResizeEvent`** struct — window content area size change (Width, Height in logical DIP)
+- `PointerEvent` and `ScrollEvent` now implement `InputEvent` interface
+- 8 test cases covering interface satisfaction, type switch, field access
+
+## [0.22.0] - 2026-07-29
+
+### Added
+
+- **`FontSmoothing` type** (gogpu#396, ADR-057) — three-state enum (`None`, `Grayscale`, `Subpixel`) for OS text anti-aliasing mode. Separate from `SubpixelLayout` — answers "how is text AA'd?" vs "what is the display's pixel arrangement?". `PlatformProvider.FontSmoothing()` method added. `NullPlatformProvider` defaults to `FontSmoothingGrayscale`. `String()` method for debugging.
+- **Coordinate space documentation** (gogpu#398) — explicit "logical DIP, do NOT divide by ScaleFactor" godoc on `PointerEvent.X/Y`, `ScrollEvent.X/Y`, and all `OnMouse*` callbacks.
+
+## [0.21.1] - 2026-07-12
+
+### Changed
+
+- **deps:** gputypes v0.5.0 → v0.5.1
+
+## [0.21.0] - 2026-06-15
+
+### Changed
+
+- **GPU handles: interface → struct tokens (BREAKING)** — `Device`, `Queue`,
+  `Adapter`, `Surface`, `Instance` changed from interfaces to opaque struct
+  tokens wrapping `unsafe.Pointer`. Same pattern as `TextureView` and
+  `CommandEncoder` (ADR-018).
+
+  **Why:** v0.20.0 used unexported sentinel methods on interfaces, but Go spec
+  prohibits cross-package satisfaction of interfaces with unexported methods.
+  `*wgpu.Device` could never implement `gpucontext.Device` — build broke in
+  gogpu/gg/ui. Struct tokens solve this: 8 bytes, zero alloc, GC-safe
+  (`unsafe.Pointer` in struct fields is traced — `reflect.Value` precedent),
+  compile-time type distinct (Device ≠ Queue).
+
+  **Migration:**
+  ```go
+  // Before (v0.19.0):
+  dev := provider.Device()           // gpucontext.Device (interface)
+  wgpuDev := dev.(*wgpu.Device)      // type assertion
+
+  // After (v0.21.0):
+  dev := provider.Device()           // gpucontext.Device (struct)
+  wgpuDev := (*wgpu.Device)(dev.Pointer())  // unsafe.Pointer extraction
+  // Or via helper:
+  wgpuDev := wgpu.DeviceFromHandle(dev)
+
+  // Nil check:
+  // Before: dev != nil
+  // After:  !dev.IsNil()
+  ```
+
+  Constructors: `NewDevice(ptr)`, `NewQueue(ptr)`, `NewAdapter(ptr)`,
+  `NewSurface(ptr)`, `NewInstance(ptr)`. Extraction: `.Pointer()`, `.IsNil()`.
+
+## [0.20.0] - 2026-06-15 [YANKED]
+
+**DO NOT USE** — unexported sentinel methods on interfaces do not work
+cross-package per Go spec. `*wgpu.Device` cannot implement `gpucontext.Device`.
+Fixed in v0.21.0 with struct tokens.
+
+## [0.19.0] - 2026-05-16
+
+### Added
+
+- **ScrollPhase + IsMomentum on ScrollEvent** (FEAT-INPUT-021) — `ScrollPhase` enum (`None`, `Began`, `Changed`, `Ended`, `Canceled`) and `IsMomentum bool` field on `ScrollEvent`. Enables apps to distinguish active trackpad gestures from momentum/inertial scroll. On macOS: maps NSEvent.phase and NSEvent.momentumPhase. On Wayland: maps axis_stop. Zero value preserves backward compatibility (Phase=None, IsMomentum=false).
+
+## [0.18.0] - 2026-05-09
+
+### Added
+
+- **SubpixelLayout on PlatformProvider** (ADR-024) — `SubpixelLayout()` method returns display subpixel arrangement (`SubpixelNone`, `SubpixelRGB`, `SubpixelBGR`, `SubpixelVRGB`, `SubpixelVBGR`). Enables LCD/ClearType font rendering in gg. Follows Qt6 `QPlatformScreen::SubpixelAntialiasingType` pattern — subpixel is a display/OS property, not GPU. `NullPlatformProvider` returns `SubpixelNone` (grayscale AA). Researched Qt6, GTK4/Wayland, FreeType, DRM/KMS — all treat subpixel as platform property.
+
+### Fixed
+
+- **Lint:** extracted `stringNone` reuse for SubpixelLayout.String().
+
+## [0.17.0] - 2026-05-06
+
+### Added
+
+- **AdapterInfo on DeviceProvider** (ADR-020) — `AdapterInfo()` method returns `AdapterInfo{Name, Type}` with `AdapterType` enum (Discrete, Integrated, Software, Unknown). Enables gg render mode auto-selection: CPU rasterizer on software adapters (60 FPS) vs GPU accelerator on real hardware. Triggered by software backend 92x regression after SPIR-V interpreter (FEAT-SW-004).
+
+## [0.16.0] - 2026-04-30
+
+### Added
+
+- **WindowChrome.SetFullscreen / IsFullscreen** — runtime fullscreen toggle interface (ADR-018). Enables `App.SetFullscreen(bool)` in gogpu for borderless fullscreen (Windows), native `toggleFullScreen:` (macOS), `_NET_WM_STATE_FULLSCREEN` (X11), `xdg_toplevel.set_fullscreen` (Wayland). NullWindowChrome provides no-op defaults. Triggered by ui#88 (@AgentNemo00).
+
+## [0.15.0] - 2026-04-25
+
+### Changed
+
+- **TextureView** — replaced `interface{}` token with `struct{ ptr unsafe.Pointer }` opaque handle
+  (ADR-018, Vulkan/Ebitengine/Go Protobuf Opaque pattern). Compile-time type safety: TextureView
+  cannot be confused with CommandEncoder or other resource types. 8 bytes, value type, zero allocations.
+  GC-safe (unsafe.Pointer keeps object alive per Go spec). Breaking: callers must use
+  `NewTextureView(unsafe.Pointer(ptr))` and `tv.Pointer()` / `tv.IsNil()` instead of direct assignment.
+
+### Added
+
+- **CommandEncoder** opaque handle — same pattern as TextureView. Used for the shared encoder
+  pipeline (ADR-017). `NewCommandEncoder()`, `Pointer()`, `IsNil()`.
+
+## [0.14.0] - 2026-04-22
+
+### Added
+
+- **TextureView** type token interface — enables type-safe render target passing between packages without importing wgpu. Follows existing Device/Queue/Surface/Instance pattern. Used by gg `GPURenderTarget.View` for per-pass render target selection (WebGPU spec alignment).
+
+## [0.13.0] - 2026-04-21
+
+### Added
+
+- **TextureRegionUpdater** interface — `UpdateRegion(x, y, w, h int, data []byte) error` for partial texture upload. Enables incremental rendering where only dirty regions are uploaded to GPU instead of full texture.
+
+### Changed
+
+- **Dependencies:** gputypes v0.2.0 → v0.5.0 (PrimitiveState zero value = WebGPU spec default)
+
+## [0.12.0] - 2026-04-09
+
+### Added
+
+- **CursorMode** — `CursorNormal`, `CursorLocked`, `CursorConfined` constants for mouse grab / pointer lock.
+  Matches SDL `SDL_SetRelativeMouseMode` and `SDL_SetWindowMouseGrab` semantics. (gogpu#173)
+- **PointerEvent.DeltaX/DeltaY** — relative mouse movement fields for locked cursor mode.
+  Non-zero only when cursor is locked (FPS mouselook). Follows W3C Pointer Events pattern.
+
+## [0.11.0] - 2026-03-20
+
+### Added
+
+- **WindowChrome interface** for custom window chrome (frameless windows)
+  - `SetFrameless(bool)` / `IsFrameless() bool` — enable/disable frameless mode
+  - `SetHitTestCallback(HitTestCallback)` — custom hit testing for drag, resize, buttons
+  - `Minimize()` / `Maximize()` / `IsMaximized() bool` / `Close()` — window controls
+  - Optional interface — use type assertion:
+    `if wc, ok := provider.(gpucontext.WindowChrome); ok { ... }`
+
+- **HitTestResult enum** (13 values) for custom window regions
+  - `HitTestClient` — normal content area
+  - `HitTestCaption` — title bar drag area
+  - `HitTestClose` / `HitTestMaximize` / `HitTestMinimize` — window buttons
+  - `HitTestResizeN/S/W/E/NW/NE/SW/SE` — 8 resize edges/corners
+  - `String()` method for debugging
+
+- **HitTestCallback type** — `func(x, y float64) HitTestResult`
+
+- **NullWindowChrome** — no-op implementation for testing
+
+## [0.10.0] - 2026-03-15
+
+### Removed
+
+- **HalProvider interface DELETED** — `HalDevice() any` and `HalQueue() any` removed entirely.
+  Replaced by typed pattern: `provider.Device()` returns `gpucontext.Device`, consumers
+  type-assert to `*wgpu.Device` for full API access. Zero `any` in the device provider chain.
+  Go "accept interfaces, return structs" pattern.
+
+### Changed
+
+- **Device, Queue, Adapter, Surface, Instance** interfaces in webgpu_types.go converted to
+  minimal type-token interfaces. Enables implicit Go interface satisfaction — `*wgpu.Device`
+  implements `gpucontext.Device` without gpucontext importing wgpu.
+
+- **WindowProvider.Size()** now documented as returning logical points (DIP) instead of physical pixels
+  - Aligns with gogpu RETINA refactor: `App.Size()` returns logical coordinates
+  - Physical pixel dimensions = `Size() * ScaleFactor()`
+  - `NullWindowProvider` fields W/H updated to logical points
+  - README examples updated for HiDPI-aware rendering pattern
+
+## [0.9.0] - 2026-02-10
+
+### Added
+
+- **HalProvider interface** for direct HAL device/queue access ([gg#95](https://github.com/gogpu/gg/issues/95))
+  - `HalDevice() any` — returns underlying HAL device for direct GPU access
+  - `HalQueue() any` — returns underlying HAL queue for direct GPU access
+  - Optional interface — use type assertion on DeviceProvider:
+    `if hp, ok := provider.(gpucontext.HalProvider); ok { ... }`
+  - Enables GPU accelerators (e.g., gg SDF pipeline) to share devices with host applications
+    without creating their own wgpu instance
+
+## [0.8.0] - 2026-02-06
+
+### Added
+
+- **WindowProvider interface** for window geometry and DPI integration
+  - `Size() (width, height int)` — window client area in logical points (DIP)
+  - `ScaleFactor() float64` — DPI scale factor (1.0 = standard, 2.0 = Retina/HiDPI)
+  - `RequestRedraw()` — request a new frame in on-demand rendering mode
+  - `NullWindowProvider` — configurable defaults for testing and headless operation
+
+- **PlatformProvider interface** for OS integration features (optional)
+  - `ClipboardRead() (string, error)` — read text from system clipboard
+  - `ClipboardWrite(text string) error` — write text to system clipboard
+  - `SetCursor(cursor CursorShape)` — change mouse cursor shape
+  - `DarkMode() bool` — system dark mode detection
+  - `ReduceMotion() bool` — accessibility: reduced animation preference
+  - `HighContrast() bool` — accessibility: high contrast mode
+  - `FontScale() float32` — user's font size preference multiplier
+  - `NullPlatformProvider` — no-op defaults for testing
+
+- **CursorShape enum** with 12 standard cursor shapes
+  - Default, Pointer, Text, Crosshair, Move
+  - ResizeNS, ResizeEW, ResizeNWSE, ResizeNESW
+  - NotAllowed, Wait, None (hidden)
+  - `String()` method for debugging
+
+### Removed
+
+- **TouchEventSource interface** — replaced by PointerEventSource (W3C Pointer Events Level 3)
+  - `TouchID`, `TouchPhase`, `TouchPoint`, `TouchEvent` types removed
+  - `TouchEventSource` interface removed
+  - `NullTouchEventSource` removed
+  - Touch input is fully covered by `PointerEventSource` with `PointerType: Touch`
+  - W3C recommends Pointer Events over Touch Events (Touch Events is legacy)
+
+### Notes
+
+- PlatformProvider is **optional** — use type assertion on WindowProvider:
+  `if pp, ok := provider.(gpucontext.PlatformProvider); ok { ... }`
+- These interfaces enable UI frameworks to access host window and platform
+  capabilities without direct dependency on gogpu
+
+## [0.7.0] - 2026-02-05
+
+### Added
+
+- **TextureUpdater interface** for updating existing texture pixel data ([gg#79](https://github.com/gogpu/gg/issues/79))
+  - `UpdateData(data []byte) error` — upload new pixel data to existing texture
+  - Enables proper error handling for dynamic content (canvas rendering, video frames)
+  - Implemented by `gogpu.Texture`
+
+## [0.6.0] - 2026-01-31
+
+### Added
+
+- **Gesture Events** for multi-touch gesture recognition ([#6](https://github.com/gogpu/gpucontext/pull/6))
+  - `GestureEvent` — Vello-style per-frame gesture deltas (zoom, rotation, translation)
+  - `GestureEventSource` — interface for registering gesture callbacks
+  - `NullGestureEventSource` — no-op implementation
+
+## [0.5.0] - 2026-01-31
+
+### Added
+
+- **W3C Pointer Events Level 3** for unified pointer input
+  - `PointerEvent` — unified mouse, touch, pen input with full W3C compliance
+  - `PointerEventType` — Down, Up, Move, Enter, Leave, Cancel
+  - `PointerType` — Mouse, Touch, Pen
+  - `Button` — Left, Middle, Right, X1, X2, Eraser
+  - `Buttons` — bitmask for tracking multiple pressed buttons
+  - `PointerEventSource` — interface for registering pointer callbacks
+  - `NullPointerEventSource` — no-op implementation
+
+- **Scroll Events** for mouse wheel and trackpad
+  - `ScrollEvent` — horizontal/vertical scroll with delta modes
+  - `ScrollDeltaMode` — Pixel, Line, Page modes
+  - `ScrollEventSource` — interface for registering scroll callbacks
+  - `NullScrollEventSource` — no-op implementation
+
+- **CI/CD Infrastructure**
+  - GitHub Actions workflow (build, test, lint on Linux/macOS/Windows)
+  - golangci-lint v2 configuration
+
+### Changed
+
+- **TouchCancelled → TouchCanceled** — US English spelling (misspell linter)
+- Removed unused `DeviceHandle` alias
+
+[0.11.0]: https://github.com/gogpu/gpucontext/releases/tag/v0.11.0
+[0.10.0]: https://github.com/gogpu/gpucontext/releases/tag/v0.10.0
+[0.9.0]: https://github.com/gogpu/gpucontext/releases/tag/v0.9.0
+[0.8.0]: https://github.com/gogpu/gpucontext/releases/tag/v0.8.0
+[0.7.0]: https://github.com/gogpu/gpucontext/releases/tag/v0.7.0
+[0.6.0]: https://github.com/gogpu/gpucontext/releases/tag/v0.6.0
+[0.5.0]: https://github.com/gogpu/gpucontext/releases/tag/v0.5.0
+
+## [0.4.0] - 2026-01-30
+
+### Added
+
+- **Texture interfaces** for GPU texture sharing across packages
+  - `Texture` — minimal interface with Width/Height
+  - `TextureDrawer` — interface for drawing textures (DrawTexture, DrawTextureEx)
+  - `TextureCreator` — interface for creating textures from pixel data
+  - `TextureDrawOptions` — options for advanced texture rendering (position, scale, alpha, flip)
+
+- **Touch input support** for mobile and tablet applications
+  - `TouchID` — unique identifier for touch points
+  - `TouchPhase` — lifecycle stages (Began, Moved, Ended, Cancelled)
+  - `TouchPoint` — single touch contact with position, optional pressure/radius
+  - `TouchEvent` — complete touch event with Changed/All points, modifiers, timestamp
+  - `TouchEventSource` — interface for registering touch callbacks
+  - `NullTouchEventSource` — no-op implementation for non-touch platforms
+
+### Notes
+
+- Touch interfaces follow platform conventions (iOS, Android, W3C Touch Events)
+- Texture interfaces enable gg↔gogpu integration without circular dependencies
+- Both are **contracts only** — implementations in host applications
+
+[0.4.0]: https://github.com/gogpu/gpucontext/releases/tag/v0.4.0
+
+## [0.3.1] - 2026-01-29
+
+### Changed
+
+- **Update gputypes to v0.2.0** for webgpu.h spec-compliant enum values
+
+[0.3.1]: https://github.com/gogpu/gpucontext/releases/tag/v0.3.1
+
+## [0.3.0] - 2026-01-29
+
+### Changed
+
+- **Import gputypes for unified WebGPU types**
+  - DeviceProvider.SurfaceFormat() now returns `gputypes.TextureFormat`
+  - Removed local type re-exports in favor of gputypes
+  - Single source of truth for WebGPU types across ecosystem
+
+### Added
+
+- CODE_OF_CONDUCT.md
+- SECURITY.md
+
+[0.3.0]: https://github.com/gogpu/gpucontext/releases/tag/v0.3.0
+
+## [0.2.0] - 2026-01-27
+
+### Added
+
+- **IME Support** for CJK input (Chinese, Japanese, Korean)
+  - `IMEState` struct with composition state tracking
+  - `IMEController` interface for positioning IME window
+  - Extended `EventSource` with `OnIMECompositionStart`, `OnIMECompositionUpdate`, `OnIMECompositionEnd`
+  - Updated `NullEventSource` with no-op IME implementations
+
+### Notes
+
+- IME interfaces are **contracts only** — platform integration happens in host applications (gogpu)
+- Required for enterprise UI frameworks supporting international users
+
+[0.2.0]: https://github.com/gogpu/gpucontext/releases/tag/v0.2.0
+
+## [0.1.1] - 2026-01-27
+
+### Added
+
+- **DeviceProvider** interface for GPU device/queue injection
+  - `Device()` returns WebGPU device
+  - `Queue()` returns command queue
+  - `Adapter()` returns GPU adapter
+  - `SurfaceFormat()` returns preferred texture format
+
+- **EventSource** interface for input events
+  - Keyboard: `OnKeyPress`, `OnKeyRelease`, `OnTextInput`
+  - Mouse: `OnMouseMove`, `OnMousePress`, `OnMouseRelease`, `OnScroll`
+  - Window: `OnResize`, `OnFocus`
+  - `Key`, `Modifiers`, `MouseButton` types
+  - `NullEventSource` no-op implementation
+
+- **Registry[T]** generic backend registry
+  - Thread-safe registration with `sync.RWMutex`
+  - Priority-based selection via `Best()`
+  - `Register`, `Unregister`, `Get`, `Has`, `Available`, `Count`
+
+- **WebGPU Types** (zero dependencies)
+  - `Device`, `Queue`, `Adapter`, `Surface`, `Instance` interfaces
+  - `TextureFormat` enum with common formats
+  - `OpenDevice` convenience struct
+
+### Notes
+
+- This package has **zero external dependencies** by design
+- All interfaces are minimal to allow diverse implementations
+- Part of the [gogpu](https://github.com/gogpu) ecosystem
+
+[0.1.1]: https://github.com/gogpu/gpucontext/releases/tag/v0.1.1
