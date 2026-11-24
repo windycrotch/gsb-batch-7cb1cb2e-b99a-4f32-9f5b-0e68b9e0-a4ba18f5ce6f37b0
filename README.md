@@ -85,6 +85,10 @@ See [docs/API.md](docs/API.md) for more information about the API.
 ## Contributing
 See [docs/Contributing.md](docs/Contributing.md)
 
+## Testing
+See [docs/Testing.md](docs/Testing.md) for running the tests and for verifying
+the relay with locally constructed MPEG-TS data.
+
 ## Credits
 Thanks go to
   - Haivision for [srt](https://github.com/Haivision/srt) and [srtgo](https://github.com/Haivision/srtgo)

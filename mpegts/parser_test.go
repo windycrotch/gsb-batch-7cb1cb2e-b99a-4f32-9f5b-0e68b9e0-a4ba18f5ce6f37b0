@@ -21,6 +21,14 @@ type ffprobeOutput struct {
 	Frames []ffprobeFrame `json:"frames"`
 }
 
+// ffprobeAvailable reports whether ffprobe can be found in PATH. The ffprobe
+// based checks are an optional cross-check against an external decoder; the
+// parser assertions themselves always run.
+func ffprobeAvailable() bool {
+	_, err := exec.LookPath("ffprobe")
+	return err == nil
+}
+
 func ffprobe(filename string) (ffprobeOutput, error) {
 	cmd := exec.Command("ffprobe", "-v", "debug", "-hide_banner", "-of", "json", "-show_frames", filename)
 	stdout, err := cmd.StdoutPipe()
@@ -96,6 +104,11 @@ func checkParser(t *testing.T, p *Parser, data []byte, name string, numFrames in
 	}
 	if err := file.Sync(); err != nil {
 		t.Fatal(err)
+	}
+
+	if !ffprobeAvailable() {
+		t.Log("ffprobe not found in PATH, skipping decoder cross-check")
+		return
 	}
 
 	// compare ffprobe results with original

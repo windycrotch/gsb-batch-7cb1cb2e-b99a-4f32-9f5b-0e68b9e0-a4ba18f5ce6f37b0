@@ -9,13 +9,25 @@ import (
 type BufferPool struct {
 	size int
 	pool sync.Pool
+
+	// inUse counts buffers that are currently handed out. It never influences
+	// pooling behaviour, it only makes buffer accounting observable for tests
+	// and diagnostics.
+	inUse atomic.Int64
 }
 
 func NewBufferPool(size uint) *BufferPool {
 	return &BufferPool{size: int(size)}
 }
 
+// InUse returns the number of buffers that have been acquired but not yet
+// released. A quiescent relay with no active streams must report zero.
+func (p *BufferPool) InUse() int64 {
+	return p.inUse.Load()
+}
+
 func (p *BufferPool) Get() *Buffer {
+	p.inUse.Add(1)
 	if value := p.pool.Get(); value != nil {
 		buf := value.(*Buffer)
 		buf.refs.Store(1)
@@ -33,6 +45,7 @@ func (p *BufferPool) Get() *Buffer {
 
 func (p *BufferPool) put(buf *Buffer) {
 	buf.data = buf.data[:p.size]
+	p.inUse.Add(-1)
 	p.pool.Put(buf)
 }
 

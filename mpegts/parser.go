@@ -67,16 +67,34 @@ func (p *Parser) hasInit() bool {
 	return true
 }
 
-// InitData returns data needed for decoder init or nil if the parser is not ready yet
+// InitData returns data needed for decoder init or nil if the parser is not ready yet.
+//
+// The returned slices are owned by the parser and must be treated as read-only.
+// They are only valid until the next call to Parse, because Parse copies the
+// packets it keeps into its own storage; the data passed to Parse is never
+// retained.
 func (p *Parser) InitData() ([][]byte, error) {
 	if !p.hasInit() {
 		return nil, nil
 	}
 
-	init := [][]byte{p.PAT, p.PMT}
+	init := make([][]byte, 0, 2+len(p.init))
+	if p.PAT != nil {
+		init = append(init, p.PAT)
+	}
+	if p.PMT != nil {
+		init = append(init, p.PMT)
+	}
 	init = append(init, p.init...)
 
 	return init, nil
+}
+
+// clonePacket returns a copy of a complete MPEG-TS packet. The parser keeps
+// these copies so it never references caller-owned memory (relay buffers are
+// recycled into a pool as soon as the subscriber is done with them).
+func clonePacket(pkt []byte) []byte {
+	return append([]byte(nil), pkt...)
 }
 
 // Parse processes all MPEGTS packets from a buffer
@@ -104,7 +122,7 @@ func (p *Parser) Parse(data []byte) error {
 				return err
 			}
 			if store {
-				p.PAT = data[:pkt.Size()]
+				p.PAT = clonePacket(data[:pkt.Size()])
 			}
 
 		} else if _, ok := p.pmtMap[pkt.PID()]; ok {
@@ -114,7 +132,7 @@ func (p *Parser) Parse(data []byte) error {
 				return err
 			}
 			if store {
-				p.PMT = data[:pkt.Size()]
+				p.PMT = clonePacket(data[:pkt.Size()])
 			}
 
 		} else if stream, ok := p.tspMap[pkt.PID()]; ok {
@@ -129,9 +147,11 @@ func (p *Parser) Parse(data []byte) error {
 			}
 		}
 
-		// store init packets and all remaining packets from the buffer after init
+		// store init packets and all remaining packets from the buffer after init.
+		// Packets are copied: the caller may reuse or release the buffer that
+		// data points into as soon as Parse returns.
 		if storePacket || p.hasInit() {
-			p.init = append(p.init, data[:pkt.Size()])
+			p.init = append(p.init, clonePacket(data[:pkt.Size()]))
 		}
 
 		data = data[pkt.Size():]

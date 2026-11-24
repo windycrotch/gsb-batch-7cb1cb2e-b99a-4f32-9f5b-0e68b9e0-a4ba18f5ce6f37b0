@@ -10,6 +10,10 @@ install: srtrelay
 test:
 	go test ./...
 
+.PHONY: test-race
+test-race:
+	go test -race -count=1 ./relay/ ./srt/ ./mpegts/
+
 .PHONY: lint
 lint:
 	golangci-lint run --timeout 5m

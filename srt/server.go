@@ -258,21 +258,24 @@ func (s *Server) play(conn *srtConn) error {
 
 // publish a stream to the server
 func (s *Server) publish(conn *srtConn) error {
-	pub, err := s.relay.Publish(conn.streamid.Name())
+	publisher, err := s.relay.NewPublisher(conn.streamid.Name())
 	if err != nil {
 		return err
 	}
-	defer close(pub)
+	// Releasing the name is synchronous: as soon as the publisher is gone the
+	// stream can be claimed by a new publisher, even before the connection is
+	// torn down by the caller.
+	defer publisher.Close()
 	conn.log.Info("publish")
 
 	for {
 		buf := s.relay.AcquireBuffer()
 		n, err := conn.socket.Read(buf.Bytes())
 
-		// Push read buffers to all clients via the publish channel
+		// Push read buffers to all subscribers
 		if n > 0 {
 			buf.Resize(n)
-			pub <- buf
+			publisher.Write(buf)
 		} else {
 			buf.Release()
 		}
