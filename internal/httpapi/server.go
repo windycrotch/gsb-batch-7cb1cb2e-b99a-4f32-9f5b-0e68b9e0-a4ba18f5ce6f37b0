@@ -658,13 +658,13 @@ func (s *Server) dispatch(conn Conn, sess *session.Session, viewerID uint64, pay
 	case session.MsgFrameAck:
 		// The client presented the frame with this pts. A viewer that is gone,
 		// or a body of the wrong length, is dropped quietly: acks arrive once
-		// per frame.
+		// per frame. ViewerAckFrame matches the ack to an in-flight frame and
+		// only then feeds its send-to-ack time to the viewer's pacer, so
+		// duplicate/unknown/pre-rebuild acks cannot move the send fraction.
 		if len(body) < 8 {
 			return nil
 		}
-		if flow, _ := sess.ViewerFlow(viewerID); flow != nil {
-			flow.Ack(binary.BigEndian.Uint64(body), time.Now())
-		}
+		sess.ViewerAckFrame(viewerID, binary.BigEndian.Uint64(body), time.Now())
 		return nil
 	case session.MsgHello:
 		// Its only job was to exist. See MsgHello.

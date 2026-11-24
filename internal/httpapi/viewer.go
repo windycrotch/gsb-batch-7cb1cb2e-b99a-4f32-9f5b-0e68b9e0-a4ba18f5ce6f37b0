@@ -539,7 +539,14 @@ func (s *Server) serveViewerWith(targetID string, sess *session.Session, conn Co
 		// needKey gates decode-unusable frames after a shed: an inter-frame
 		// whose predecessors were dropped decodes into visible garbage.
 		needKey := false
-		pacer := session.NewPacer()
+		// The pacer is created with the viewer by AddViewerWith so the read
+		// loop's MsgFrameAck dispatch can feed matched acks to the same
+		// throttle this loop admits from. Fall back to a private one only if
+		// the session has lost the viewer (which cannot happen here).
+		pacer := sess.ViewerPacer(viewerID)
+		if pacer == nil {
+			pacer = session.NewPacer()
+		}
 		// flow measures this viewer's queueing from its frame acks. It decides
 		// staleness for a viewer that acks (frameStale).
 		flow, local := sess.ViewerFlow(viewerID)
@@ -629,9 +636,11 @@ func (s *Server) serveViewerWith(targetID string, sess *session.Session, conn Co
 
 				// A config frame starts a new stream: the encoder was rebuilt and
 				// its pts restart, so acks still in flight for the old one must
-				// not match new entries.
-				if msg.Config && flow != nil {
-					flow.Reset()
+				// not match new entries. The coordinated reset also arms the
+				// pacer's recovery so the new stream cannot stay pinned with no
+				// fresh acks.
+				if msg.Config {
+					sess.ViewerResetThrottle(viewerID)
 				}
 
 				// Parameter sets and keyframes are never shed: dropping them

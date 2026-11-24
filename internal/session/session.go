@@ -158,6 +158,13 @@ type viewer struct {
 	// flow turns this viewer's frame acks into queueing delay and delivery
 	// rate. It has its own lock: the write loop and the read loop both use it.
 	flow FlowEst
+	// pacer is this viewer's send throttle, shared with the read loop so a
+	// matched frame ack is a real input to what later frames are shed. Created
+	// with the viewer; pacer.mu serializes its two goroutines. ackMu below
+	// serializes the compound ack->flow+pacer and config->reset+StreamReset
+	// operations so an old stream's measurement cannot cross a rebuild.
+	pacer *Pacer
+	ackMu sync.Mutex
 	// replayedThrough is the last passthrough frame this viewer got in its
 	// join replay, which broadcast must not send it again.
 	replayedThrough uint64
@@ -814,6 +821,65 @@ func (s *Session) ViewerFlow(id uint64) (flow *FlowEst, local bool) {
 	return &v.flow, v.local
 }
 
+// ViewerPacer returns the viewer's send throttle, nil for a viewer that is
+// gone. The write loop uses the one created with the viewer so the read loop
+// can feed it frame acks.
+func (s *Session) ViewerPacer(id uint64) *Pacer {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if v, ok := s.viewers[id]; ok {
+		return v.pacer
+	}
+	return nil
+}
+
+// viewerForAck resolves a viewer pointer without holding s.mu afterwards.
+func (s *Session) viewerForAck(id uint64) *viewer {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.viewers[id]
+}
+
+// ViewerAckFrame applies a client MsgFrameAck to the viewer's flow estimator
+// and, exactly when the ack names an in-flight frame of the current stream,
+// feeds that measurement to the viewer's pacer.
+//
+// The compound operation runs under v.ackMu against ViewerResetThrottle, so an
+// ack matched just before a config-frame reset cannot apply its old-stream
+// sample to the reset pacer afterwards. Duplicate, out-of-order-tail, shed and
+// pre-rebuild acks return Matched=false and never touch the pacer, which is
+// what keeps backlog, baseline and send fraction free of jumps. A gone viewer
+// is ignored quietly, as acks arrive once per frame.
+func (s *Session) ViewerAckFrame(id, pts uint64, at time.Time) {
+	v := s.viewerForAck(id)
+	if v == nil {
+		return
+	}
+	v.ackMu.Lock()
+	defer v.ackMu.Unlock()
+	out := v.flow.Ack(pts, at)
+	if !out.Matched || v.pacer == nil {
+		return
+	}
+	v.pacer.ObserveAck(out.RTT, out.Base)
+}
+
+// ViewerResetThrottle handles an encoder rebuild boundary (a config frame): it
+// clears the flow's in-flight/pts epoch and arms the pacer's recovery. The two
+// happen under v.ackMu so no ack can be applied across the boundary.
+func (s *Session) ViewerResetThrottle(id uint64) {
+	v := s.viewerForAck(id)
+	if v == nil {
+		return
+	}
+	v.ackMu.Lock()
+	defer v.ackMu.Unlock()
+	v.flow.Reset()
+	if v.pacer != nil {
+		v.pacer.StreamReset()
+	}
+}
+
 // Stats reports counters useful for a health endpoint.
 func (s *Session) Stats() map[string]any {
 	s.mu.RLock()
@@ -871,6 +937,7 @@ func (s *Session) AddViewerWith(o ViewerOptions) (uint64, <-chan OutMsg) {
 		passthrough: passthrough,
 		local:       o.Local,
 		joined:      time.Now(),
+		pacer:       NewPacer(),
 	}
 	s.viewers[v.id] = v
 

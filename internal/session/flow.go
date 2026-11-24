@@ -20,13 +20,21 @@ import (
 //   - the delivered rate is measured over windows of at least 0.5 s and
 //     smoothed 0.6 old + 0.4 new, the first window setting it outright.
 //
-// This slice only measures. Nothing reads a FlowEst to decide what to send.
+// Ack returns an AckOutcome carrying the one fresh measurement; the viewer
+// wires matched outcomes into its Pacer (Session.ViewerAckFrame), so frame
+// acks are a real input to what gets shed.
 //
 // Safe across the viewer's write loop (Sent) and its read loop (Ack).
 type FlowEst struct {
 	mu sync.Mutex
 
 	inflight []flowEntry
+
+	// epoch is the stream generation. It starts at 0 and advances on every
+	// Reset (an encoder rebuild: rotate, resize, relaunch). It lets a caller
+	// that coordinates Ack with a throttle tell measurements of the old stream
+	// from those of the new one.
+	epoch uint64
 
 	acking     bool
 	lastAck    time.Time
@@ -104,24 +112,60 @@ func (f *FlowEst) Sent(pts uint64, bytes int, at time.Time) {
 	f.inflight = append(f.inflight, flowEntry{pts: pts, bytes: bytes, at: at})
 }
 
+// AckOutcome is what one Ack did. The throttle consumes it only when Matched
+// is true, which is what makes a duplicate, out-of-order tail, shed-frame ack
+// or pre-Reset ack incapable of moving the send fraction.
+type AckOutcome struct {
+	// Matched says pts named an in-flight frame. Everything else is zero-ish
+	// (apart from PTS and Epoch) when false.
+	Matched bool
+	PTS     uint64
+	// Epoch is the stream generation the ack was evaluated in.
+	Epoch uint64
+	// Backlog is the in-flight count after the ack.
+	Backlog int
+	// RTT is the matched frame's own send-to-ack time.
+	RTT time.Duration
+	// Base is the ack-path baseline in force after the sample was folded in.
+	Base time.Duration
+	// Excess is RTT-Base clamped at zero, the instantaneous queueing signal.
+	Excess time.Duration
+	// QueueMs is the smoothed queueing estimate after this sample.
+	QueueMs float64
+}
+
 // Ack handles the client's ack of pts: it pops every entry up to and including
 // it. A pts that was never recorded (a shed frame, a trimmed entry, an ack
 // from before a Reset) is ignored, not read as acking everything.
-func (f *FlowEst) Ack(pts uint64, at time.Time) {
+//
+// The returned outcome is the single measurement the throttle may apply. It is
+// returned rather than pushed into the Pacer because the read loop (Ack) and
+// the write loop (Admit) are different goroutines; the caller coordinates the
+// hand-off (see Session.ViewerAckFrame).
+func (f *FlowEst) Ack(pts uint64, at time.Time) AckOutcome {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.lastAckPTS = pts
-	idx := -1
+	if idx := f.findLocked(pts); idx < 0 {
+		f.ignoredAcks++
+		return AckOutcome{Matched: false, PTS: pts, Epoch: f.epoch}
+	} else {
+		return f.applyAckLocked(pts, at, idx)
+	}
+}
+
+// findLocked locates pts in flight. Called with f.mu held.
+func (f *FlowEst) findLocked(pts uint64) int {
 	for i, e := range f.inflight {
 		if e.pts == pts {
-			idx = i
-			break
+			return i
 		}
 	}
-	if idx < 0 {
-		f.ignoredAcks++
-		return
-	}
+	return -1
+}
+
+// applyAckLocked pops through idx and folds the sample in. Called with f.mu.
+func (f *FlowEst) applyAckLocked(pts uint64, at time.Time, idx int) AckOutcome {
 	acked := f.inflight[idx]
 	bytes := 0
 	for _, e := range f.inflight[:idx+1] {
@@ -135,13 +179,30 @@ func (f *FlowEst) Ack(pts uint64, at time.Time) {
 	f.noteBase(sample, at)
 	f.queueMs = flowQueueKeep*f.queueMs + (1-flowQueueKeep)*(sample-f.baseMs)
 
+	rtt := at.Sub(acked.at)
+	base := msDuration(f.baseMs)
+	excess := rtt - base
+	if excess < 0 {
+		excess = 0
+	}
+	out := AckOutcome{
+		Matched: true,
+		PTS:     pts,
+		Epoch:   f.epoch,
+		Backlog: len(f.inflight),
+		RTT:     rtt,
+		Base:    base,
+		Excess:  excess,
+		QueueMs: f.queueMs,
+	}
+
 	// The window opens on an ack and counts the bytes acked after it, so idle
 	// time before the first ack of a burst is not read as a slow link.
 	if !f.winStarted {
 		f.winStart = at
 		f.winBytes = 0
 		f.winStarted = true
-		return
+		return out
 	}
 	f.winBytes += bytes
 	if dt := at.Sub(f.winStart); dt >= flowRateWindow {
@@ -154,6 +215,13 @@ func (f *FlowEst) Ack(pts uint64, at time.Time) {
 		f.winStart = at
 		f.winBytes = 0
 	}
+	return out
+}
+
+// msDuration converts a millisecond float to a Duration without going through
+// time.Parse.
+func msDuration(ms float64) time.Duration {
+	return time.Duration(ms * float64(time.Millisecond))
 }
 
 // noteBase folds sample into the per-second minima and recomputes baseMs as
@@ -193,17 +261,27 @@ func (f *FlowEst) windowMin(now time.Time) float64 {
 	return m
 }
 
-// Reset forgets what is in flight. The encoder restarts its pts when it is
-// rebuilt (resize, rotate, relaunch), so an ack for the old stream must not
-// match a new entry; the writer calls this whenever it sends a config frame.
-// The path measurements (base, queue, rate) describe the link, not the stream,
-// and are kept, as is Acking.
+// Reset forgets what is in flight and starts a new stream epoch. The encoder
+// restarts its pts when it is rebuilt (resize, rotate, relaunch), so an ack for
+// the old stream must not match a new entry; the writer calls this whenever it
+// sends a config frame. The path measurements (base, queue, rate) describe the
+// link, not the stream, and are kept, as is Acking.
 func (f *FlowEst) Reset() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.inflight = nil
+	f.epoch++
 	f.winStarted = false
 	f.winBytes = 0
+}
+
+// Epoch reports the stream generation, advanced by every Reset. An AckOutcome
+// carries the epoch it was evaluated in, so a coordinator can discard a
+// measurement that crossed a rebuild.
+func (f *FlowEst) Epoch() uint64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.epoch
 }
 
 // Snapshot reads the estimator at now.
