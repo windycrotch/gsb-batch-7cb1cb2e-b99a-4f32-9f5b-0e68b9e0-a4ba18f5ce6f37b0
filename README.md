@@ -12,11 +12,50 @@ FFMPEG wrapper written in GO
 - [x] Transcoding
 - [x] Streaming
 - [x] Progress
+- [x] Stopping a running transcode
 - [x] Filters
 - [x] Thumbnails
 - [x] Watermark
 - [ ] Concatenation
 - [ ] Subtitles
+
+## Stopping and progress
+
+`Run` starts ffmpeg and returns a channel that reports the final error. The
+progress channel returned by `Output` is closed exactly once, either when the
+transcode finishes on its own or when `Stop` is called:
+
+```go
+trans := new(transcoder.Transcoder)
+if err := trans.Initialize("input.mp4", "output.mp4"); err != nil {
+    log.Fatal(err)
+}
+
+done := trans.Run(true)
+progress := trans.Output()
+
+go func() {
+    for p := range progress {
+        fmt.Printf("%s (%0.1f%%)\n", p.CurrentTime, p.Progress)
+    }
+}()
+
+// Later, from another goroutine:
+if err := trans.Stop(); err != nil {
+    log.Printf("stop failed: %v", err)
+}
+// Ranging over `progress` now completes promptly instead of blocking.
+```
+
+`Stop` never blocks indefinitely: it asks ffmpeg to quit, waits a short grace
+period and kills the process if needed. Calling it when the transcode has
+already finished returns `nil` immediately. Input and output pipes created with
+`CreateInputPipe`/`CreateOutputPipe` are closed when the run ends, whether it
+was stopped or completed.
+
+For live streams (a total duration of `0`) the reported `Progress` percentage
+stays at `0`; `CurrentTime`, `CurrentBitrate` and `FramesProcessed` are still
+reported.
 
 ## Dependencies
 - [FFmpeg](https://www.ffmpeg.org/)
