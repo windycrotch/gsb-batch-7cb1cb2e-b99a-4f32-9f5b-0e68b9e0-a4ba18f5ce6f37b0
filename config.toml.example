@@ -1,0 +1,30 @@
+[input]
+
+[[input.sources]]
+type = "rtmp"
+address = ":1935"
+
+[[input.sources]]
+type = "ftl"
+address = ":8084"
+
+
+[output]
+
+[[output.sources]]
+type = "whep"
+address = ":8091"
+
+
+[service]
+type = "dummy"
+
+[orchestrator]
+type = "dummy"
+
+[control]
+service = "dummy"
+orchestrator = "dummy"
+http_server_type = "http"
+http_address = "localhost:8091"
+save_video = false
