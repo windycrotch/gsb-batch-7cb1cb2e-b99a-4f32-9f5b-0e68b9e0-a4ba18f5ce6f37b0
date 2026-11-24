@@ -164,6 +164,25 @@ The initial status is `200 OK` before FFmpeg completes. A later FFmpeg failure t
 
 The endpoint must not include a URL scheme or bucket name. `useSSL` defaults to `true`. AWS S3 and path-style S3-compatible services such as MinIO, DigitalOcean Spaces, and Cloudflare R2 are supported.
 
+## Request lifecycle
+
+Every request owns one temporary directory and one request-scoped context.
+
+- Inputs download concurrently. If any download fails, its sibling downloads are canceled and FFmpeg never starts.
+- A client disconnect cancels all in-flight downloads, S3 transfers, and the running FFmpeg process. Once canceled, the request performs no new S3 upload or Base64 encoding, so partially written files are never returned as results.
+- Each request is isolated: canceling one request never cancels another request's downloads or FFmpeg processes and never removes another request's directory.
+- The job directory is removed on every outcome — success, validation/processing failure, and cancellation — before the handler returns (and therefore before the HTTP response finishes). JSON responses are written only after removal; inline and streamed responses finish their file/pipe work first and remove the directory immediately afterwards.
+
+## Tests
+
+```bash
+go test ./...
+```
+
+The lifecycle tests are hermetic and need no FFmpeg install: they re-execute the test binary as a controllable fake FFmpeg process, so cancellation still goes through the real `os/exec` process path, and use local `httptest` servers for downloads, S3 endpoints, and real TCP client disconnects. They cover successful collection (temporary inputs excluded), download failure with sibling cancellation, client disconnect during FFmpeg, the partial-output collection race, directory cleanup, and two concurrent requests with one canceled.
+
+To additionally run the real-FFmpeg smoke test, put `ffmpeg` on `PATH` or set `LIFECYCLE_FFMPEG_BIN` to its executable path.
+
 ## Docker
 
 The published image contains the API and FFmpeg:

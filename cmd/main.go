@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -27,6 +28,15 @@ import (
 const (
 	statusTrailer = "X-Ffmpeg-Status"
 	bytesTrailer  = "X-Ffmpeg-Bytes"
+
+	// statusClientClosedRequest is the nginx-style 499 used when the request
+	// was canceled locally before a terminal response could be produced. net/http
+	// permits arbitrary three digit statuses; real clients have usually gone away.
+	statusClientClosedRequest = 499
+
+	// cleanupAttempts makes temporary directory removal resilient against
+	// short-lived Windows file locks held by a just-killed process or scanner.
+	cleanupAttempts = 8
 )
 
 func main() {
@@ -45,7 +55,52 @@ func main() {
 	}
 }
 
+// defaultProcessor backs the package-level handleProcess used by main. Tests
+// construct their own Processor instead of mutating this value.
+var defaultProcessor = &Processor{}
+
+// Processor carries the injectable seams of one process endpoint. The zero
+// value uses the real operating system temporary directory and ffmpeg binary.
+// Different requests never share cancellation state or job directories: the
+// fields here are configuration only.
+type Processor struct {
+	// TempRoot is the directory beneath which per-request job directories are
+	// created. Empty means os.TempDir.
+	TempRoot string
+
+	// FFmpegPath is the ffmpeg executable used by the default command factory.
+	// Empty means "ffmpeg" looked up on PATH.
+	FFmpegPath string
+
+	// NewFFmpegCommand, when set, overrides command creation. It receives the
+	// request-scoped context and the sanitized argument list (including the
+	// leading -hide_banner). Tests use it to substitute a fake ffmpeg process
+	// while still exercising real process cancellation.
+	NewFFmpegCommand func(ctx context.Context, args []string) *exec.Cmd
+
+	// AfterFFmpeg, when set, runs after the last non-streaming FFmpeg command
+	// finished successfully and before output collection. It is a test seam
+	// for cancellation races at the collection boundary.
+	AfterFFmpeg func()
+
+	// OnCommandStart and OnCommandFinish, when set, observe each FFmpeg
+	// process. They are intended for tests that need deterministic
+	// synchronization with process lifetime.
+	OnCommandStart  func(cmd *exec.Cmd)
+	OnCommandFinish func(cmd *exec.Cmd, runErr error)
+}
+
 func handleProcess(w http.ResponseWriter, r *http.Request) {
+	defaultProcessor.ServeHTTP(w, r)
+}
+
+// ServeHTTP implements http.Handler so tests and custom muxes can mount a
+// configured Processor.
+func (p *Processor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	p.handleProcess(w, r)
+}
+
+func (p *Processor) handleProcess(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
@@ -66,58 +121,129 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	jobPath, cleanup, err := createJobPath()
+	jobPath, cleanup, err := p.createJobPath()
 	if err != nil {
 		log.Println("job directory creation failed:", err)
 		internal.WriteError(w, http.StatusInternalServerError, "failed to create job directory")
 		return
 	}
-	defer cleanup()
 	log.Println("job started:", jobPath)
+
+	// One request-scoped context for every download, FFmpeg process and S3
+	// transfer. It is derived from r.Context, so a client disconnect cancels
+	// the whole job, but cancelling one request can never reach another.
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	// cleanup is idempotent. The deferred call is the panic/early-return
+	// backstop; JSON terminal paths remove the directory explicitly *before*
+	// they write the response, giving the endpoint one strict lifecycle:
+	//
+	//   fetch -> ffmpeg -> collect -> cleanup -> JSON response write
+	//
+	// Inline and streaming responses write (and, for inline, finish serving
+	// the file) before their explicit cleanup call, but cleanup always runs
+	// before the handler returns and therefore before net/http finishes the
+	// response on the wire.
+	defer cleanup()
+
+	removeJobAndWriteJSON := func(status int, payload any) {
+		cleanup()
+		internal.WriteJSON(w, status, payload)
+	}
+	removeJobAndWriteError := func(status int, msg string) {
+		removeJobAndWriteJSON(status, map[string]string{"error": msg})
+	}
 
 	var s3Client *s3.Client
 	if requestUsesS3(req) {
 		s3Client = internal.GetS3Client(&req.S3Config)
 	}
 
-	if err := fetchInputs(r.Context(), s3Client, req.Inputs, jobPath); err != nil {
+	if err := fetchInputs(ctx, s3Client, req.Inputs, jobPath); err != nil {
+		cancel()
 		log.Println("input fetch failed:", err)
-		internal.WriteError(w, http.StatusBadRequest, err.Error())
+		removeJobAndWriteError(http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := ctx.Err(); err != nil {
+		// The client went away while inputs were being fetched. Downloads have
+		// already been canceled by fetchInputs; there is no response to write.
+		cancel()
+		cleanup()
 		return
 	}
 
 	if req.Output.Stream {
-		if err := runFFmpegStreaming(r.Context(), w, req, jobPath); err != nil {
+		if err := p.runFFmpegStreaming(ctx, w, req, jobPath); err != nil {
+			cancel()
 			log.Println("streaming ffmpeg execution failed:", err)
+			// runFFmpegStreaming has already emitted the error JSON (head
+			// failure) or the error trailer (final pipe failure). Only cleanup
+			// remains; the deferred call is a safe no-op afterwards.
+			cleanup()
 			return
 		}
 		log.Printf("job finished in %s (streamed)", time.Since(start))
+		cleanup()
 		return
 	}
 
-	if stderr, err := runFFmpeg(r.Context(), req.Commands, jobPath); err != nil {
+	if stderr, err := p.runFFmpeg(ctx, req.Commands, jobPath); err != nil {
+		cancel()
 		logFFmpegError(stderr)
+		cleanup()
 		internal.WriteConsoleError(w, http.StatusInternalServerError, err.Error(), stderr)
 		return
 	}
 
+	if p.AfterFFmpeg != nil {
+		p.AfterFFmpeg()
+	}
+
+	// Cancellation can race with FFmpeg completion. From this point on a
+	// canceled request must not upload, Base64-encode or otherwise collect
+	// anything, so partially written files can never become a success result.
+	if err := ctx.Err(); err != nil {
+		cancel()
+		log.Println("request canceled before results were collected:", err)
+		removeJobAndWriteError(statusClientClosedRequest, "request canceled before results were collected")
+		return
+	}
+
 	if req.Output.InlineContentType != "" {
-		if err := serveFirstResult(w, r, jobPath, req); err != nil {
+		// ServeFile completes and closes the file before returning, so the job
+		// directory can be removed immediately afterwards while still strictly
+		// before the handler returns and net/http finishes the response.
+		err := serveFirstResult(w, r, jobPath, req)
+		cleanup()
+		if err != nil {
 			log.Println("inline result failed:", err)
 			internal.WriteError(w, http.StatusInternalServerError, err.Error())
 		}
 		return
 	}
 
-	results, err := collectResults(r.Context(), s3Client, req, jobPath)
+	results, err := collectResults(ctx, s3Client, req, jobPath)
 	if err != nil {
+		cancel()
 		log.Println("result collection failed:", err)
-		internal.WriteError(w, http.StatusInternalServerError, err.Error())
+		if errors.Is(err, context.Canceled) {
+			removeJobAndWriteError(statusClientClosedRequest, "request canceled during result collection")
+		} else {
+			removeJobAndWriteError(http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	if err := ctx.Err(); err != nil {
+		cancel()
+		log.Println("request canceled before success response was written:", err)
+		removeJobAndWriteError(statusClientClosedRequest, "request canceled before response was sent")
 		return
 	}
 
 	log.Printf("job finished in %s (%d outputs)", time.Since(start), len(results))
-	internal.WriteJSON(w, http.StatusOK, api.ProcessResponse{Results: results})
+	removeJobAndWriteJSON(http.StatusOK, api.ProcessResponse{Results: results})
 }
 
 func decodeRequest(body io.Reader) (api.ProcessRequest, error) {
@@ -201,21 +327,53 @@ func requestUsesS3(req api.ProcessRequest) bool {
 }
 
 func createJobPath() (string, func(), error) {
-	tempRoot := os.TempDir()
-	if err := os.MkdirAll(tempRoot, 0700); err != nil {
+	return createJobPathIn("")
+}
+
+func (p *Processor) createJobPath() (string, func(), error) {
+	root := ""
+	if p != nil {
+		root = p.TempRoot
+	}
+	return createJobPathIn(root)
+}
+
+func createJobPathIn(root string) (string, func(), error) {
+	if root == "" {
+		root = os.TempDir()
+	}
+	if err := os.MkdirAll(root, 0700); err != nil {
 		return "", nil, err
 	}
-	path, err := os.MkdirTemp(tempRoot, "ffmpeg-api-")
+	path, err := os.MkdirTemp(root, "ffmpeg-api-")
 	if err != nil {
 		return "", nil, err
 	}
+	var once sync.Once
 	cleanup := func() {
-		log.Println("cleaning job dir:", path)
-		if err := os.RemoveAll(path); err != nil {
-			log.Println("job directory cleanup failed:", err)
-		}
+		once.Do(func() {
+			log.Println("cleaning job dir:", path)
+			removeJobDir(path)
+		})
 	}
 	return path, cleanup, nil
+}
+
+// removeJobDir removes a job directory, retrying briefly when the operating
+// system temporarily refuses deletion (notably Windows shortly after a
+// terminated process exits).
+func removeJobDir(path string) {
+	var err error
+	for attempt := 0; attempt < cleanupAttempts; attempt++ {
+		err = os.RemoveAll(path)
+		if err == nil {
+			return
+		}
+		time.Sleep(time.Duration(25*(attempt+1)) * time.Millisecond)
+	}
+	if err != nil {
+		log.Println("job directory cleanup failed:", err)
+	}
 }
 
 func fetchInputs(ctx context.Context, s3Client *s3.Client, inputs map[string]api.Input, jobPath string) error {
@@ -260,10 +418,14 @@ func fetchInput(ctx context.Context, s3Client *s3.Client, input api.Input, dst s
 }
 
 func runFFmpeg(ctx context.Context, commands [][]string, dir string) ([]string, error) {
+	return defaultProcessor.runFFmpeg(ctx, commands, dir)
+}
+
+func (p *Processor) runFFmpeg(ctx context.Context, commands [][]string, dir string) ([]string, error) {
 	for i, args := range commands {
 		start := time.Now()
 		log.Printf("ffmpeg step %d: %s", i+1, strings.Join(sanitizeArgs(args), " "))
-		stderr, err := executeFFmpeg(ctx, args, dir, nil)
+		stderr, err := p.executeFFmpeg(ctx, args, dir, nil)
 		if err != nil {
 			return stderr, err
 		}
@@ -273,19 +435,48 @@ func runFFmpeg(ctx context.Context, commands [][]string, dir string) ([]string, 
 }
 
 func executeFFmpeg(ctx context.Context, args []string, dir string, stdout io.Writer) ([]string, error) {
-	cmd := exec.CommandContext(ctx, "ffmpeg", sanitizeArgs(args)...)
+	return defaultProcessor.executeFFmpeg(ctx, args, dir, stdout)
+}
+
+func (p *Processor) executeFFmpeg(ctx context.Context, args []string, dir string, stdout io.Writer) ([]string, error) {
+	cmd := p.newFFmpegCommand(ctx, sanitizeArgs(args))
 	cmd.Dir = dir
 	cmd.Stdout = stdout
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
+	// Do not hang forever if a killed child leaves output pipes open.
+	if cmd.WaitDelay == 0 {
+		cmd.WaitDelay = 10 * time.Second
+	}
+	if p.OnCommandStart != nil {
+		p.OnCommandStart(cmd)
+	}
 	err := cmd.Run()
+	if p.OnCommandFinish != nil {
+		p.OnCommandFinish(cmd, err)
+	}
 	return consoleLines(stderr.String()), err
 }
 
+func (p *Processor) newFFmpegCommand(ctx context.Context, args []string) *exec.Cmd {
+	if p != nil && p.NewFFmpegCommand != nil {
+		return p.NewFFmpegCommand(ctx, args)
+	}
+	bin := "ffmpeg"
+	if p != nil && p.FFmpegPath != "" {
+		bin = p.FFmpegPath
+	}
+	return exec.CommandContext(ctx, bin, args...)
+}
+
 func runFFmpegStreaming(ctx context.Context, w http.ResponseWriter, req api.ProcessRequest, dir string) error {
+	return defaultProcessor.runFFmpegStreaming(ctx, w, req, dir)
+}
+
+func (p *Processor) runFFmpegStreaming(ctx context.Context, w http.ResponseWriter, req api.ProcessRequest, dir string) error {
 	head := req.Commands[:len(req.Commands)-1]
 	last := req.Commands[len(req.Commands)-1]
-	if stderr, err := runFFmpeg(ctx, head, dir); err != nil {
+	if stderr, err := p.runFFmpeg(ctx, head, dir); err != nil {
 		logFFmpegError(stderr)
 		internal.WriteConsoleError(w, http.StatusInternalServerError, err.Error(), stderr)
 		return err
@@ -301,7 +492,7 @@ func runFFmpegStreaming(ctx context.Context, w http.ResponseWriter, req api.Proc
 	step := len(req.Commands)
 	start := time.Now()
 	log.Printf("ffmpeg step %d: %s", step, strings.Join(sanitizeArgs(last), " "))
-	stderr, err := executeFFmpeg(ctx, last, dir, stream)
+	stderr, err := p.executeFFmpeg(ctx, last, dir, stream)
 	w.Header().Set(bytesTrailer, strconv.FormatInt(stream.written, 10))
 	if err != nil {
 		w.Header().Set(statusTrailer, "error")
@@ -361,6 +552,10 @@ func collectResults(ctx context.Context, s3Client *s3.Client, req api.ProcessReq
 	}
 	results := make(map[string]api.Result, len(files))
 	for _, file := range files {
+		// Never start a new output after cancellation.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		log.Println("collecting output:", file.Name())
 		path := filepath.Join(jobPath, file.Name())
 		result := api.Result{}
@@ -372,13 +567,22 @@ func collectResults(ctx context.Context, s3Client *s3.Client, req api.ProcessReq
 			result.URL = url
 		}
 		if req.Output.Base64 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			data, err := os.ReadFile(path)
 			if err != nil {
+				return nil, err
+			}
+			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
 			result.Base64 = base64.StdEncoding.EncodeToString(data)
 		}
 		results[file.Name()] = result
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return results, nil
 }
