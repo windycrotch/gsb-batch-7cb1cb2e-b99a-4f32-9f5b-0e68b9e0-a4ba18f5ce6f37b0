@@ -1,0 +1,9 @@
+.env
+/cadence
+/cadence.exe
+*.test
+*.out
+CLAUDE.md
+.claude/
+.playwright-mcp/
+.env
