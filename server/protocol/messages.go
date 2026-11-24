@@ -99,17 +99,44 @@ type NodeDrainingData struct {
 	DeadlineMs int64  `json:"deadline_ms"`
 }
 
+// PlayerMigrateData starts a handshake. Target and MigrationID are optional:
+// a client may retry with the same MigrationID and will get the identical
+// frozen snapshot back instead of a re-advanced position.
 type PlayerMigrateData struct {
-	GuildID snowflake.ID `json:"guild_id"`
+	GuildID     snowflake.ID `json:"guild_id"`
+	MigrationID string       `json:"migration_id,omitempty"`
+	Target      string       `json:"target,omitempty"`
 }
 
 type MigrateReadyData struct {
 	GuildID     snowflake.ID    `json:"guild_id"`
+	MigrationID string          `json:"migration_id"`
+	Target      string          `json:"target,omitempty"`
 	URL         string          `json:"url"`
 	Position    int64           `json:"position"`
 	State       string          `json:"state"`
 	RequesterID string          `json:"requester_id,omitempty"`
 	Filters     *filter.Filters `json:"filters,omitempty"`
+}
+
+// MigrateSettleData is sent by the client once the handshake has actually
+// succeeded on the target node, or with Success=false when it could not reach
+// the target. A failed settle restores the player on the old node so a drain
+// keeps waiting instead of exiting early.
+type MigrateSettleData struct {
+	GuildID     snowflake.ID `json:"guild_id"`
+	MigrationID string       `json:"migration_id,omitempty"`
+	Success     bool         `json:"success"`
+	Reason      string       `json:"reason,omitempty"`
+}
+
+// MigrationResultData reports the outcome of a settle attempt or a rejected
+// handshake back to the client.
+type MigrationResultData struct {
+	GuildID     snowflake.ID `json:"guild_id"`
+	MigrationID string       `json:"migration_id,omitempty"`
+	Outcome     string       `json:"outcome"`
+	Reason      string       `json:"reason,omitempty"`
 }
 
 type StatsResponse struct {

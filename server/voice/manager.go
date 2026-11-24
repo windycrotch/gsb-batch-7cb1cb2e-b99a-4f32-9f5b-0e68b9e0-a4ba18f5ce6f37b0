@@ -22,17 +22,67 @@ type EventHandler interface {
 	OnVoiceDisconnected(sessionID string, guildID snowflake.ID)
 }
 
+// Conn is the subset of voice connection behaviour the manager relies on.
+// Keeping it an interface lets tests drive migration and drain flows without a
+// real Discord voice gateway.
+type Conn interface {
+	HandleVoiceUpdate(ctx context.Context, channelID snowflake.ID, sessionID string, event protocol.VoiceServerEvent) error
+	Play(ctx context.Context, src source.Source) error
+	Pause()
+	Resume()
+	Stop()
+	SeekTo(positionMs int64) error
+	Position() int64
+	Close()
+}
+
+type ConnFactory func(
+	ctx context.Context,
+	logger *slog.Logger,
+	userID, guildID, channelID snowflake.ID,
+	sessionID string,
+	event protocol.VoiceServerEvent,
+	onTrackEnd func(src source.Source, reason string, err error),
+	onDisconnect func(),
+) (Conn, error)
+
+type SourceFactory func(ctx context.Context, url string, startTimeMs int64, filters *filter.Filters) (source.Source, error)
+
+func defaultConnFactory(
+	ctx context.Context,
+	logger *slog.Logger,
+	userID, guildID, channelID snowflake.ID,
+	sessionID string,
+	event protocol.VoiceServerEvent,
+	onTrackEnd func(src source.Source, reason string, err error),
+	onDisconnect func(),
+) (Conn, error) {
+	conn, err := NewConnection(ctx, logger, userID, guildID, channelID, sessionID, event, onTrackEnd, onDisconnect)
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
+}
+
+func defaultSourceFactory(ctx context.Context, url string, startTimeMs int64, filters *filter.Filters) (source.Source, error) {
+	return source.NewDefaultFactory().CreateFromURL(ctx, url, startTimeMs, filters)
+}
+
 type Manager struct {
-	logger       *slog.Logger
-	connections  map[string]*Connection
-	mutex        sync.RWMutex
-	eventHandler EventHandler
+	logger        *slog.Logger
+	connections   map[string]Conn
+	mutex         sync.RWMutex
+	eventHandler  EventHandler
+	connFactory   ConnFactory
+	sourceFactory SourceFactory
 }
 
 func NewManager(logger *slog.Logger) *Manager {
 	return &Manager{
-		logger:      logger,
-		connections: make(map[string]*Connection),
+		logger:        logger,
+		connections:   make(map[string]Conn),
+		connFactory:   defaultConnFactory,
+		sourceFactory: defaultSourceFactory,
 	}
 }
 
@@ -40,6 +90,26 @@ func (m *Manager) SetEventHandler(handler EventHandler) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 	m.eventHandler = handler
+}
+
+// SetConnFactory overrides how voice connections are created. Intended for tests.
+func (m *Manager) SetConnFactory(factory ConnFactory) {
+	if factory == nil {
+		return
+	}
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.connFactory = factory
+}
+
+// SetSourceFactory overrides how audio sources are created. Intended for tests.
+func (m *Manager) SetSourceFactory(factory SourceFactory) {
+	if factory == nil {
+		return
+	}
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.sourceFactory = factory
 }
 
 func (m *Manager) onTrackEnd(sessionID string, guildID snowflake.ID, src source.Source, reason string, err error) {
@@ -58,7 +128,7 @@ func (m *Manager) onTrackEnd(sessionID string, guildID snowflake.ID, src source.
 	handler.OnTrackEnd(sessionID, guildID, src, reason)
 }
 
-func (m *Manager) onDisconnect(sessionID string, guildID snowflake.ID, conn *Connection, key string) {
+func (m *Manager) onDisconnect(sessionID string, guildID snowflake.ID, conn Conn, key string) {
 	m.mutex.Lock()
 	if m.connections[key] != conn {
 		m.mutex.Unlock()
@@ -74,17 +144,18 @@ func (m *Manager) onDisconnect(sessionID string, guildID snowflake.ID, conn *Con
 }
 
 func (m *Manager) Connect(ctx context.Context, sessionID string, userID, guildID, channelID snowflake.ID, discordSessionID string, event protocol.VoiceServerEvent) error {
-	m.mutex.Lock()
-	key := connectionKey(sessionID, guildID)
-	existing, ok := m.connections[key]
-	m.mutex.Unlock()
+	m.mutex.RLock()
+	existing, ok := m.connections[connectionKey(sessionID, guildID)]
+	factory := m.connFactory
+	m.mutex.RUnlock()
 
 	if ok {
 		return existing.HandleVoiceUpdate(ctx, channelID, discordSessionID, event)
 	}
 
-	var conn *Connection
-	conn, err := NewConnection(ctx, m.logger, userID, guildID, channelID, discordSessionID, event,
+	key := connectionKey(sessionID, guildID)
+	var conn Conn
+	conn, err := factory(ctx, m.logger, userID, guildID, channelID, discordSessionID, event,
 		func(src source.Source, reason string, err error) {
 			m.onTrackEnd(sessionID, guildID, src, reason, err)
 		},
@@ -92,7 +163,6 @@ func (m *Manager) Connect(ctx context.Context, sessionID string, userID, guildID
 			m.onDisconnect(sessionID, guildID, conn, key)
 		},
 	)
-
 	if err != nil {
 		return fmt.Errorf("failed to create voice connection: %w", err)
 	}
@@ -109,7 +179,7 @@ func (m *Manager) Connect(ctx context.Context, sessionID string, userID, guildID
 	return nil
 }
 
-func (m *Manager) getConnection(sessionID string, guildID snowflake.ID) *Connection {
+func (m *Manager) getConnection(sessionID string, guildID snowflake.ID) Conn {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 	return m.connections[connectionKey(sessionID, guildID)]
@@ -121,8 +191,11 @@ func (m *Manager) Play(ctx context.Context, sessionID string, guildID snowflake.
 		return nil, fmt.Errorf("no voice connection for guild %s", guildID)
 	}
 
-	factory := source.NewDefaultFactory()
-	src, err := factory.CreateFromURL(ctx, url, startTime, filters)
+	m.mutex.RLock()
+	factory := m.sourceFactory
+	m.mutex.RUnlock()
+
+	src, err := factory(ctx, url, startTime, filters)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audio source: %w", err)
 	}
@@ -184,37 +257,49 @@ func (m *Manager) Position(sessionID string, guildID snowflake.ID) int64 {
 }
 
 func (m *Manager) Disconnect(sessionID string, guildID snowflake.ID) error {
+	m.detach(sessionID, guildID)
+	return nil
+}
+
+// Release closes and forgets a connection without emitting an event. It is used
+// after a successful migration so the old node does not report a misleading
+// voiceDisconnect for a player that has already moved elsewhere.
+func (m *Manager) Release(sessionID string, guildID snowflake.ID) {
+	m.detach(sessionID, guildID)
+}
+
+func (m *Manager) detach(sessionID string, guildID snowflake.ID) {
 	key := connectionKey(sessionID, guildID)
 
 	m.mutex.Lock()
-
 	conn, ok := m.connections[key]
-	if !ok {
-		m.mutex.Unlock()
-		return nil
+	if ok {
+		delete(m.connections, key)
 	}
-
-	delete(m.connections, key)
 	m.mutex.Unlock()
 
-	go func() {
-		conn.Close()
+	if !ok {
+		return
+	}
 
-		m.logger.Info("voice connection closed",
-			slog.String("session", sessionID),
-			slog.String("guild_id", guildID.String()),
-		)
-	}()
+	conn.Close()
 
-	return nil
+	m.logger.Info("voice connection closed",
+		slog.String("session", sessionID),
+		slog.String("guild_id", guildID.String()),
+	)
 }
 
 func (m *Manager) Close() {
 	m.mutex.Lock()
-	defer m.mutex.Unlock()
-
+	conns := make([]Conn, 0, len(m.connections))
 	for key, conn := range m.connections {
-		conn.Close()
+		conns = append(conns, conn)
 		delete(m.connections, key)
+	}
+	m.mutex.Unlock()
+
+	for _, conn := range conns {
+		conn.Close()
 	}
 }

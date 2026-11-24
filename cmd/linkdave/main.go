@@ -93,6 +93,10 @@ DrainLoop:
 		}
 	}
 
+	// Whatever is left after the deadline must be stopped and cleaned in a
+	// deterministic order before the process exits.
+	server.ForceStopAllPlayers()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 

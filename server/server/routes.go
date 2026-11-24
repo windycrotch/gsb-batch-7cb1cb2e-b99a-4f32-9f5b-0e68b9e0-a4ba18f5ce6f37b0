@@ -112,6 +112,7 @@ func (s *Server) routePlay(client *Client, guildID snowflake.ID, w http.Response
 	}
 
 	player.SetPlayingState(play.URL, play.StartTime, play.RequesterID, play.Filters)
+	client.resetMigration(guildID)
 
 	client.send(protocol.Message{
 		Op: protocol.OpTrackStart,
@@ -150,6 +151,7 @@ func (s *Server) routePause(client *Client, guildID snowflake.ID, w http.Respons
 			State:   player.GetState(),
 		},
 	})
+	client.syncMigrationAfterControl(guildID, player.GetState(), player.GetPosition())
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -178,6 +180,7 @@ func (s *Server) routeResume(client *Client, guildID snowflake.ID, w http.Respon
 			State:   player.GetState(),
 		},
 	})
+	client.syncMigrationAfterControl(guildID, player.GetState(), player.GetPosition())
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -204,6 +207,7 @@ func (s *Server) routeStop(client *Client, guildID snowflake.ID, w http.Response
 			State:   player.GetState(),
 		},
 	})
+	client.syncMigrationAfterControl(guildID, player.GetState(), player.GetPosition())
 
 	w.WriteHeader(http.StatusNoContent)
 }
