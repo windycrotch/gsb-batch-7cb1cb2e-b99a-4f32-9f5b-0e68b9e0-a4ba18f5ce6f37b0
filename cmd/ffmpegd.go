@@ -4,14 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/alfg/ffmpegd/ffmpeg"
@@ -20,12 +18,12 @@ import (
 
 const (
 	logo = `
-███████╗███████╗███╗   ███╗██████╗ ███████╗ ██████╗ ██████╗ 
+███████╗███████╗███╗   ███╗██████╗ ███████╗ ██████╗ ██████╗
 ██╔════╝██╔════╝████╗ ████║██╔══██╗██╔════╝██╔════╝ ██╔══██╗
 █████╗  █████╗  ██╔████╔██║██████╔╝█████╗  ██║  ███╗██║  ██║
 ██╔══╝  ██╔══╝  ██║╚██╔╝██║██╔═══╝ ██╔══╝  ██║   ██║██║  ██║
 ██║     ██║     ██║ ╚═╝ ██║██║     ███████╗╚██████╔╝██████╔╝
-╚═╝     ╚═╝     ╚═╝     ╚═╝╚═╝     ╚══════╝ ╚═════╝ ╚═════╝ 
+╚═╝     ╚═╝     ╚═╝     ╚═╝╚═╝     ╚══════╝ ╚═════╝ ╚═════╝
                                                       v2.1.0
 	`
 	version     = "ffmpegd version 2.1.0"
@@ -43,6 +41,7 @@ Options:
 	progressInterval = time.Second * 1
 	writeTimeout     = time.Second * 10
 	maxQueuedJobs    = 100
+	maxRetainedTasks = 1000
 )
 
 var (
@@ -58,28 +57,33 @@ var (
 	}
 	allowedOrigins []string
 
-	clients  = &hub{conns: make(map[*websocket.Conn]bool)}
-	jobs     = make(chan Message, maxQueuedJobs)
+	mgr *manager
+
 	upgrader = websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			return isAllowedOrigin(r.Header.Get("Origin"))
 		},
 	}
-
-	// The running encode, so a cancel message can stop it.
-	currentMu sync.Mutex
-	current   *ffmpeg.FFmpeg
 )
 
 // Message payload from client.
+//
+// ID is the stable task identifier introduced with task tracking: clients that
+// send it receive the same ID on every event for the encode. Clients that omit
+// it keep the original, ID-less broadcast behaviour.
+//
+// ClientID identifies the browser across reconnects, either via the
+// ?client_id= query parameter or a hello message.
 type Message struct {
-	Type    string `json:"type"`
-	Input   string `json:"input"`
-	Output  string `json:"output"`
-	Payload string `json:"payload"`
+	Type     string `json:"type"`
+	ID       string `json:"id,omitempty"`
+	ClientID string `json:"client_id,omitempty"`
+	Input    string `json:"input"`
+	Output   string `json:"output"`
+	Payload  string `json:"payload"`
 }
 
-// Status response to client.
+// Status is the legacy response shape, still sent to ID-less clients.
 type Status struct {
 	Percent   float64 `json:"percent"`
 	Speed     string  `json:"speed"`
@@ -98,50 +102,6 @@ type FilesResponse struct {
 type file struct {
 	Name string `json:"name"`
 	Size int64  `json:"size"`
-}
-
-// hub is the set of connected clients. gorilla/websocket allows one writer at
-// a time per connection, so writes go through the hub's lock too.
-type hub struct {
-	mu    sync.Mutex
-	conns map[*websocket.Conn]bool
-}
-
-func (h *hub) add(c *websocket.Conn) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.conns[c] = true
-}
-
-func (h *hub) remove(c *websocket.Conn) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	delete(h.conns, c)
-	c.Close()
-}
-
-// send writes a message to one client, dropping it if the write fails.
-func (h *hub) send(c *websocket.Conn, v any) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.write(c, v)
-}
-
-// broadcast writes a message to every client.
-func (h *hub) broadcast(v any) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	for c := range h.conns {
-		h.write(c, v)
-	}
-}
-
-func (h *hub) write(c *websocket.Conn, v any) {
-	c.SetWriteDeadline(time.Now().Add(writeTimeout))
-	if err := c.WriteJSON(v); err != nil {
-		delete(h.conns, c)
-		c.Close()
-	}
 }
 
 func Run() {
@@ -243,6 +203,9 @@ func startServer() {
 	http.HandleFunc("/files", handleFiles)
 	http.Handle("/", http.FileServer(http.Dir("./")))
 
+	mgr = newManager(newHub(), newRegistry(maxRetainedTasks))
+	mgr.start()
+
 	listeners, err := listen()
 	if err != nil {
 		fmt.Println("\u001b[31mCould not start server: " + err.Error() + "\u001b[0m")
@@ -251,9 +214,6 @@ func startServer() {
 		}
 		os.Exit(1)
 	}
-
-	// Handles queued encodes, one at a time.
-	go handleMessages()
 
 	fmt.Println("  Server started on \u001b[33mhttp://" + net.JoinHostPort(host, port) + "\u001b[0m.")
 	if !isLoopback(host) {
@@ -281,6 +241,9 @@ func isAllowedOrigin(origin string) bool {
 	return false
 }
 
+// handleConnections owns the read loop of one websocket. Identity comes from
+// the ?client_id= query parameter when the browser has one; otherwise a
+// server-side ID is assigned and can later be claimed with a hello message.
 func handleConnections(w http.ResponseWriter, r *http.Request) {
 	if origin := r.Header.Get("Origin"); !isAllowedOrigin(origin) {
 		fmt.Printf("\rRejected connection from %q: not an allowed origin.%s\n", origin, clearLine)
@@ -292,8 +255,28 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 		fmt.Printf("\rWaiting for connection...\u001b[31m websocket connection failed!\u001b[0m")
 		return
 	}
-	clients.add(ws)
-	defer clients.remove(ws)
+
+	clientID := r.URL.Query().Get("client_id")
+	identified := validClientID(clientID)
+	if !identified {
+		clientID = newClientID()
+	}
+	c := newClient(ws, clientID, identified)
+	if identified {
+		// A browser presenting a stored identity speaks the typed event
+		// protocol, so enable it before sending welcome/tasks.
+		c.enableTaskMode()
+	}
+	mgr.hub.add(c)
+	defer mgr.disconnect(c)
+
+	if identified {
+		// A browser returning with a stored identity: confirm it and replay
+		// the latest state of everything it owns, including terminal results
+		// it may have missed while disconnected.
+		c.send(Event{Type: "welcome", ClientID: clientID})
+		mgr.tasks(c)
+	}
 
 	fmt.Printf("\rWaiting for connection......\u001b[32mconnected!\u001b[0m")
 	for {
@@ -305,23 +288,47 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 
 		var msg Message
 		if err := json.Unmarshal(data, &msg); err != nil {
-			clients.send(ws, Status{Err: "invalid message: " + err.Error()})
+			replyError(c, "", "invalid message: "+err.Error())
 			continue
+		}
+
+		// Any ID-carrying or task-aware message switches the connection to
+		// the typed event protocol for its replies.
+		if msg.ID != "" || msg.Type == "hello" || msg.Type == "tasks" || msg.Type == "status" {
+			c.enableTaskMode()
 		}
 
 		switch msg.Type {
 		case "encode":
-			select {
-			case jobs <- msg:
-			default:
-				clients.send(ws, Status{Err: "too many encodes queued, try again later"})
+			if err := mgr.enqueue(c, msg); err != nil {
+				replyError(c, msg.ID, err.Error())
 			}
 		case "cancel":
-			cancelEncode()
+			if err := mgr.cancel(c, msg.ID); err != nil {
+				replyError(c, msg.ID, err.Error())
+			}
+		case "hello":
+			if err := mgr.hello(c, msg.ClientID); err != nil {
+				replyError(c, "", err.Error())
+			}
+		case "status":
+			mgr.status(c, msg.ID)
+		case "tasks":
+			mgr.tasks(c)
 		default:
-			clients.send(ws, Status{Err: fmt.Sprintf("unknown message type %q", msg.Type)})
+			replyError(c, "", fmt.Sprintf("unknown message type %q", msg.Type))
 		}
 	}
+}
+
+// replyError answers in whichever protocol the connection is speaking: a typed
+// error event for task-aware clients, a legacy Status for old ones.
+func replyError(c *client, id, msg string) {
+	if c.isTaskMode() {
+		c.send(Event{Type: "error", ID: id, Err: msg})
+		return
+	}
+	c.send(Status{Err: msg})
 }
 
 func handleFiles(w http.ResponseWriter, r *http.Request) {
@@ -384,12 +391,6 @@ func cors(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func handleMessages() {
-	for msg := range jobs {
-		runEncode(msg)
-	}
-}
-
 func verifyFFmpeg() error {
 	f := &ffmpeg.FFmpeg{}
 	version, err := f.Version()
@@ -407,75 +408,6 @@ func verifyFFmpeg() error {
 	return nil
 }
 
-func cancelEncode() {
-	currentMu.Lock()
-	defer currentMu.Unlock()
-	if current != nil {
-		current.Cancel()
-	}
-}
-
-func runEncode(msg Message) {
-	// Registered before anything slow, so a cancel that arrives while the
-	// input is still being probed is not lost.
-	f := &ffmpeg.FFmpeg{}
-	currentMu.Lock()
-	current = f
-	currentMu.Unlock()
-	defer func() {
-		currentMu.Lock()
-		current = nil
-		currentMu.Unlock()
-	}()
-
-	fmt.Printf("\rEncoding %s -> %s%s\n", msg.Input, msg.Output, clearLine)
-
-	e, err := ffmpeg.NewEncode(msg.Input, msg.Output, msg.Payload)
-	if err != nil {
-		sendError(err)
-		return
-	}
-	defer e.Close()
-
-	probe, err := ffmpeg.FFProbe{}.Run(msg.Input)
-	if err != nil {
-		sendError(err)
-		return
-	}
-
-	done := make(chan struct{})
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		trackEncodeProgress(f, e.OutputDuration(probe.Duration()), totalFrames(probe), done)
-	}()
-	err = f.RunEncode(e)
-	// Stop progress updates before the final status so none can follow it.
-	close(done)
-	wg.Wait()
-
-	switch {
-	case errors.Is(err, ffmpeg.ErrCancelled):
-		fmt.Printf("\rEncode cancelled.%s\n", clearLine)
-		clients.broadcast(Status{Cancelled: true})
-	case err != nil:
-		sendError(err)
-	default:
-		fmt.Printf("\rEncode finished: %s%s\n", msg.Output, clearLine)
-		clients.broadcast(Status{Percent: 100})
-	}
-	fmt.Printf("Waiting for next job...")
-}
-
-// clearLine erases what's left of a progress line after \r.
-const clearLine = "\u001b[K"
-
-func sendError(err error) {
-	fmt.Printf("\r\u001b[31mEncode failed:\u001b[0m %s%s\n", err, clearLine)
-	clients.broadcast(Status{Err: err.Error()})
-}
-
 // totalFrames returns the frame count of the first video stream, or 0.
 func totalFrames(p *ffmpeg.FFProbeResponse) int {
 	for _, s := range p.Streams {
@@ -487,50 +419,5 @@ func totalFrames(p *ffmpeg.FFProbeResponse) int {
 	return 0
 }
 
-// trackEncodeProgress reports progress to clients until done is closed.
-// Progress is measured against the output duration when it is known, and the
-// frame count otherwise. Each pass of a two-pass encode is half the total.
-func trackEncodeProgress(f *ffmpeg.FFmpeg, duration float64, frames int, done <-chan struct{}) {
-	ticker := time.NewTicker(progressInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-done:
-			return
-		case <-ticker.C:
-			p := f.Progress()
-			if p.Passes == 0 {
-				continue
-			}
-
-			frac := -1.0
-			switch {
-			case duration > 0:
-				frac = float64(p.OutTimeUS) / 1e6 / duration
-			case frames > 0:
-				frac = float64(p.Frame) / float64(frames)
-			}
-
-			var pct float64
-			if frac >= 0 {
-				pct = (float64(p.Pass-1) + math.Min(frac, 1)) / float64(p.Passes) * 100
-				// 100 tells the client the job is done, so hold just short of
-				// it until ffmpeg exits.
-				pct = math.Min(math.Round(pct*100)/100, 99.99)
-			}
-
-			pass := ""
-			if p.Passes > 1 {
-				pass = fmt.Sprintf(" pass %d/%d", p.Pass, p.Passes)
-			}
-			if frac >= 0 {
-				fmt.Printf("\rEncoding...%s %0.2f%% %s @ %0.2f fps%s", pass, pct, p.Speed, p.FPS, clearLine)
-			} else {
-				fmt.Printf("\rEncoding...%s %0.1fs done %s @ %0.2f fps%s", pass, float64(p.OutTimeUS)/1e6, p.Speed, p.FPS, clearLine)
-			}
-
-			clients.broadcast(Status{Percent: pct, Speed: p.Speed, FPS: p.FPS})
-		}
-	}
-}
+// clearLine erases what's left of a progress line after \r.
+const clearLine = "\u001b[K"

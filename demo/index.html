@@ -1,6 +1,6 @@
 <!DOCTYPE html>
   <meta charset="utf-8" />
-  <title>WebSocket Test Client</title>
+  <title>ffmpegd WebSocket Test Client</title>
   <style>
       .controls input,
       .controls textarea {
@@ -8,9 +8,20 @@
           margin: 5px 0;
           width: 400px;
       }
+      table { border-collapse: collapse; margin-top: 10px; }
+      th, td { border: 1px solid #888; padding: 4px 8px; font-family: monospace; font-size: 12px; }
+      .state-queued    { color: #888; }
+      .state-running   { color: #06c; }
+      .state-complete  { color: #080; }
+      .state-failed    { color: #c00; }
+      .state-cancelled { color: #b26a00; }
   </style>
   <body>
-    <h1>WebSocket Test Client</h1>
+    <h1>ffmpegd WebSocket Test Client</h1>
+    <p>
+      Client ID: <code id="clientId"></code><br />
+      Connection: <span id="connState">connecting…</span>
+    </p>
 
     <div class="controls">
         <label for="input">Input</label>
@@ -21,59 +32,49 @@
 
         <label for="payload">Payload</label>
         <textarea id="payload" rows="6"></textarea>
-        <button id="submit">Submit</button>
+        <button id="submit">Submit encode</button>
     </div>
 
-    <h4>Log</h4>
+    <h4>Tasks</h4>
+    <table>
+      <thead><tr><th>ID</th><th>State</th><th>Percent</th><th>Speed / FPS</th><th>Error</th><th></th></tr></thead>
+      <tbody id="tasks"></tbody>
+    </table>
+
+    <h4>Event log</h4>
     <div id="log"></div>
 
     <script language="javascript" type="text/javascript">
         var wsUri = "ws://localhost:8080/ws";
         var log;
+        // A stable identity survives reloads and reconnects, so the server can
+        // replay this browser's task results after a dropped connection.
+        var clientId = localStorage.getItem("ffmpegd-client-id");
+        if (!clientId) {
+            clientId = "browser-" + (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()));
+            localStorage.setItem("ffmpegd-client-id", clientId);
+        }
+        document.getElementById("clientId").textContent = clientId;
+
+        // Latest known state of each task id, keyed by the id the client chose
+        // when submitting. Every event for an encode carries this same id.
+        var taskRows = {};
+
         var payload = {
-            "format": {
-                "container": "mp4",
-                "clip": false
-            },
+            "format": { "container": "mp4", "clip": false },
             "video": {
-                "codec": "libx264",
-                "preset": "veryslow",
-                "pass": "1",
-                "crf": 23,
-                "pixel_format": "auto",
-                "frame_rate": "auto",
-                "speed": "auto",
-                "tune": "none",
-                "profile": "none",
-                "level": "none",
-                "faststart": false,
-                "size": "source",
-                "width": "1080",
-                "height": "1920",
-                "format": "widescreen",
-                "aspect": "auto",
-                "scaling": "auto",
-                "codec_options": ""
+                "codec": "libx264", "preset": "veryslow", "pass": "1", "crf": 23,
+                "pixel_format": "auto", "frame_rate": "auto", "speed": "auto",
+                "tune": "none", "profile": "none", "level": "none", "faststart": false,
+                "size": "source", "width": "1080", "height": "1920", "format": "widescreen",
+                "aspect": "auto", "scaling": "auto", "codec_options": ""
             },
-            "audio": {
-                "codec": "copy",
-                "channel": "source",
-                "quality": "auto",
-                "sampleRate": "auto",
-                "volume": "100"
-            },
+            "audio": { "codec": "copy", "channel": "source", "quality": "auto",
+                       "sampleRate": "auto", "volume": "100" },
             "filter": {
-                "deband": false,
-                "deshake": false,
-                "deflicker": false,
-                "dejudder": false,
-                "denoise": "none",
-                "deinterlace": "none",
-                "brightness": "0",
-                "contrast": "1",
-                "saturation": "0",
-                "gamma": "0",
-                "acontrast": "33"
+                "deband": false, "deshake": false, "deflicker": false, "dejudder": false,
+                "denoise": "none", "deinterlace": "none", "brightness": "0",
+                "contrast": "1", "saturation": "0", "gamma": "0", "acontrast": "33"
             }
         };
 
@@ -85,44 +86,101 @@
         }
 
         function startWebSocket() {
-            websocket = new WebSocket(wsUri);
-            websocket.onopen = function(evt) { onOpen(evt) };
-            websocket.onclose = function(evt) { onClose(evt) };
-            websocket.onmessage = function(evt) { onMessage(evt) };
-            websocket.onerror = function(evt) { onError(evt) };
+            // Passing client_id identifies this browser and switches the
+            // connection to the typed event protocol; the server replies with
+            // a welcome event and a snapshot of this client's tasks.
+            var ws = new WebSocket(wsUri + "?client_id=" + encodeURIComponent(clientId));
+            websocket = ws;
+            ws.onopen = function() {
+                document.getElementById("connState").textContent = "connected";
+                writeToScreen("CONNECTED as " + clientId);
+            };
+            ws.onclose = function() {
+                document.getElementById("connState").textContent = "disconnected — retrying in 1s";
+                writeToScreen("DISCONNECTED; will reconnect and query task state");
+                setTimeout(startWebSocket, 1000);
+            };
+            ws.onmessage = function(evt) { onMessage(evt) };
+            ws.onerror = function(evt) { writeToScreen('<span style="color: red;">ERROR</span>'); };
         }
 
-        function onOpen(evt) {
-            writeToScreen("CONNECTED");
+        function newTaskId() {
+            return "task-" + (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()));
         }
 
-        function onClose(evt) {
-            writeToScreen("DISCONNECTED");
+        function onSubmit() {
+            var input = document.getElementById("input").value;
+            var output = document.getElementById("output").value;
+            var body = document.getElementById("payload").value;
+            var id = newTaskId();
+            writeToScreen("SENT encode " + id);
+            upsertRow(id, "queued", 0, "", "");
+            websocket.send(JSON.stringify({
+                type: 'encode', id: id, client_id: clientId,
+                input: input, output: output, payload: body
+            }));
+        }
+
+        function cancel(id) {
+            writeToScreen("SENT cancel " + id);
+            websocket.send(JSON.stringify({ type: 'cancel', id: id, client_id: clientId }));
         }
 
         function onMessage(evt) {
-            writeToScreen('<span style="color: blue;">RESPONSE: ' + evt.data + '</span>');
+            writeToScreen('<span style="color: blue;">RECV: ' + evt.data + '</span>');
+            var m = JSON.parse(evt.data);
+            switch (m.type) {
+                case "welcome":
+                    break;
+                case "tasks":
+                    // Reconnect snapshot: rebuild the table from server state,
+                    // including complete/failed/cancelled results missed offline.
+                    (m.tasks || []).forEach(function(t) {
+                        upsertRow(t.id, t.state, t.percent || 0,
+                                  (t.speed || "") + " / " + (t.fps || ""), t.err || "");
+                    });
+                    break;
+                case "queued":
+                case "started":
+                case "progress":
+                case "complete":
+                case "cancelled":
+                    upsertRow(m.id, m.state, m.percent || 0,
+                             (m.speed || "") + (m.fps ? " / " + m.fps : ""), m.err || "");
+                    break;
+                case "error":
+                    // A task-level failure has an id; connection errors may not.
+                    if (m.id) { upsertRow(m.id, "failed", 0, "", m.err || "error"); }
+                    break;
+                case "status":
+                    upsertRow(m.id, m.state, m.percent || 0, "", m.err || "");
+                    break;
+            }
         }
 
-        function onError(evt) {
-            writeToScreen('<span style="color: red;">ERROR:</span> ' + evt.data);
-        }
-
-        function onSubmit(evt) {
-            var input = document.getElementById("input").value;
-            var output = document.getElementById("output").value;
-            var payload = document.getElementById("payload").value;
-            sendPayload(input, output, payload);
-        }
-
-        function sendPayload(input, output, payload) {
-            writeToScreen("SENT: " + JSON.stringify({ type: 'encode', input: input, output: output, payload: payload }));
-            websocket.send(JSON.stringify({
-                type: 'encode',
-                input: input,
-                output: output,
-                payload: payload
-            }));
+        function upsertRow(id, state, percent, speed, err) {
+            var row = taskRows[id];
+            if (!row) {
+                row = document.createElement("tr");
+                var cells = [];
+                for (var i = 0; i < 6; i++) { cells.push(document.createElement("td")); }
+                var btn = document.createElement("button");
+                btn.textContent = "Cancel";
+                btn.onclick = function() { cancel(id); };
+                cells[5].appendChild(btn);
+                cells.forEach(function(c) { row.appendChild(c); });
+                document.getElementById("tasks").appendChild(row);
+                taskRows[id] = { cells: cells, btn: btn };
+            }
+            var c = taskRows[id].cells;
+            c[0].textContent = id;
+            c[1].innerHTML = '<span class="state-' + state + '">' + state + '</span>';
+            c[2].textContent = percent ? percent + "%" : "";
+            c[3].textContent = speed;
+            c[4].textContent = err;
+            if (state === "complete" || state === "failed" || state === "cancelled") {
+                taskRows[id].btn.disabled = true;
+            }
         }
 
         function writeToScreen(message) {

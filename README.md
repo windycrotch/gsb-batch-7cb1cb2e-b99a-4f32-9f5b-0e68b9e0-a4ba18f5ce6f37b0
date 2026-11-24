@@ -110,6 +110,62 @@ Encoding... 34.68% 3.37x @ 80.77 fps
 ## WebSocket Demo
 See [demo](demo/) for a websocket client example.
 
+## Task tracking
+Each encode can carry a stable `id` chosen by the client, and each connection
+can present a stable `client_id`. The server tracks every task through a fixed
+lifecycle and echoes the same `id` on all of its events, so multiple browsers
+can share the server without their jobs becoming confused.
+
+### Lifecycle
+```
+queued ──► running ──► complete
+                 ├──► failed
+                 └──► cancelled   (a queued task can also be cancelled before it runs)
+```
+
+A task reaches exactly one terminal state — `complete`, `failed` or
+`cancelled`. It is never executed twice, and it can never report both
+completion and cancellation.
+
+### Messages
+Connect with an identity, optionally in the URL: `ws://host/ws?client_id=<id>`,
+or send `{"type":"hello","client_id":"<id>"}` after connecting. The server
+replies with a `welcome` event and a `tasks` snapshot of that client's jobs.
+
+| Client message | Purpose |
+|----------------|---------|
+| `encode` (`id` optional) | Queue an encode; with an `id`, events use the typed protocol. |
+| `cancel` (`id` optional) | Cancel a specific owned task, or the caller's running encode when no `id`. |
+| `status` (`id`) | Query the latest state of one owned task. |
+| `tasks` | List all tasks owned by this client, including terminal results. |
+| `hello` (`client_id`) | Claim a stable identity on an anonymous connection. |
+
+Server events (`queued`, `started`, `progress`, `complete`, `error`,
+`cancelled`, `status`, `tasks`, `welcome`) are JSON objects with a `type` and,
+for task events, the matching `id` and a `state`. For example:
+
+```json
+{"type":"progress","id":"task-1","state":"running","percent":42.5,"speed":"3.1x","fps":80.2}
+{"type":"complete","id":"task-1","state":"complete","percent":100}
+```
+
+### Cancellation and disconnect rules
+* A client can only cancel tasks it owns; cancelling another client's task or
+  an unknown ID returns an `error`.
+* Cancelling a **queued** task removes it: it never runs and produces no output.
+* Cancelling a **running** task kills ffmpeg, deletes the partial output and
+  lets the worker continue with the next queued job.
+* On disconnect, the client's queued tasks are removed and its running task is
+  terminated and cleaned up. Other clients' jobs are unaffected.
+* Reconnecting with the same `client_id` replays the retained results
+  (completed, failed and cancelled) via the `tasks` snapshot.
+* Task history is held in memory; a server restart does not restore old tasks.
+
+### Backward compatibility
+Clients that send no `id` keep the original protocol: they receive the bare
+`Status` objects (`percent`/`speed`/`fps`/`err`/`cancelled`, no `type` field)
+and an ID-less `cancel` stops the caller's own running encode.
+
 ## Develop
 Requires Go 1.26 or newer and `ffmpeg`/`ffprobe` on your `$PATH`.
 ```
