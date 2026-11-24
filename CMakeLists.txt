@@ -152,6 +152,7 @@ endif()
 file(GLOB BPVP_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/source/bpvp.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/source/bpvp.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/source/bpvp_model.h
   ${CMAKE_CURRENT_SOURCE_DIR}/source/bpvp_convert.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/source/bpvp_convert.h
 )
@@ -165,6 +166,19 @@ target_link_libraries(bpvp PRIVATE tensorflow-lite)
 
 if(BPVP_TESTER_ENABLE)
   enable_testing()
+
+  # The voice/note conversion is independent of TensorFlow Lite and of the Vamp
+  # plugin SDK, so its regression test is built and run everywhere. It checks
+  # that the number of voices (the limit on the outputs) never changes the notes
+  # of the retained voices, nor discards or duplicates notes in them.
+  add_executable(bpvp_convert_test
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/bpvp_convert_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/source/bpvp_convert.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/source/bpvp_convert.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/source/bpvp_model.h
+  )
+  target_include_directories(bpvp_convert_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/source)
+  add_test(NAME bpvp_convert_test COMMAND bpvp_convert_test)
 endif()
 
 vpp_add_plugin(bpvp

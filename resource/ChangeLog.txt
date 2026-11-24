@@ -1,0 +1,15 @@
+1.1.0
+- The number of voices (the number of outputs) can be changed at any time during the analysis
+  (before, during the processing or in the finishing stage): the notes are assigned to the voices
+  independently of the limit, which only selects the voices to return, so the notes of the retained
+  voices (start, end, pitch and amplitude) never change, the notes cut by the limit appear in no
+  output, and re-analysing an audio with another limit gives the same result as analysing it directly
+  with that limit.
+- getRemainingFeatures() flushes the model output only once and does not alter the accumulated
+  analysis, so reading the results again (e.g. after changing the number of voices or a parameter)
+  recomputes them without duplicating the zero-padded windows.
+- reset() clears the accumulated analysis before (re)loading the model, so a failed reload cannot
+  carry the notes of the previous analysis into the next one.
+- The model output conversion (voices and notes) is now independent of TensorFlow Lite and of the
+  Vamp plugin SDK (see source/bpvp_model.h) and has a regression test (test/bpvp_convert_test.cpp,
+  registered with CTest).

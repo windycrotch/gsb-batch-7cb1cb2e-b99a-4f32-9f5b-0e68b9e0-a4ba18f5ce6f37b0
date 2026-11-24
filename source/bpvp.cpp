@@ -333,6 +333,18 @@ Bpvp::Plugin::OutputList Bpvp::Plugin::getOutputDescriptors() const
 
 void Bpvp::Plugin::reset()
 {
+    // The state of the analysis is cleared first: whatever happens to the model, a reset must not keep the notes of
+    // the previous analysis (the number of voices is a setting of the analysis and is intentionally preserved).
+    std::fill(mInputBuffer.begin(), mInputBuffer.end(), 0.0f);
+    // basic_pitch.inference.get_audio_input: the audio is prepended with half of the overlap
+    mInputBufferPosition = static_cast<size_t>(modelBlockPadding / 2);
+    mNumSamples = 0;
+    mStartTime = Vamp::RealTime::zeroTime;
+    mResampler.reset();
+    mAccumulatedFrames.clear();
+    mAccumulatedOnsets.clear();
+    mFinalised = false;
+
     mInterpreter.reset();
     mModel.reset();
 
@@ -393,14 +405,6 @@ void Bpvp::Plugin::reset()
             }
         }
     }
-    // basic_pitch.inference.get_audio_input: the audio is prepended with half of the overlap
-    std::fill(mInputBuffer.begin(), mInputBuffer.end(), 0.0f);
-    mInputBufferPosition = static_cast<size_t>(modelBlockPadding / 2);
-    mNumSamples = 0;
-    mStartTime = Vamp::RealTime::zeroTime;
-    mResampler.reset();
-    mAccumulatedFrames.clear();
-    mAccumulatedOnsets.clear();
 }
 
 Bpvp::Plugin::ParameterList Bpvp::Plugin::getParameterDescriptors() const
@@ -565,14 +569,14 @@ void Bpvp::Plugin::processModel(bool flush)
         TfLiteTensorCopyFromBuffer(TfLiteInterpreterGetInputTensor(mInterpreter.get(), 0), mAudioBuffer.data(), mAudioBuffer.size() * sizeof(float));
         TfLiteInterpreterInvoke(mInterpreter.get());
 
-        auto const addFrames = [&](std::vector<std::array<float, modelNumNotes>>& buffer)
+        auto const addFrames = [&](Matrix& accumulated)
         {
-            buffer.reserve(buffer.size() + modelNumValidFrames);
+            accumulated.reserve(accumulated.size() + modelNumValidFrames);
             for(size_t frame = firstValidFrame; frame < firstValidFrame + modelNumValidFrames; ++frame)
             {
                 auto const it = std::next(mOuputBuffer.cbegin(), static_cast<long>(frame * modelNumNotes));
-                buffer.push_back({});
-                std::copy(it, std::next(it, modelNumNotes), buffer.back().begin());
+                accumulated.push_back({});
+                std::copy(it, std::next(it, modelNumNotes), accumulated.back().begin());
             }
         };
 
@@ -590,6 +594,8 @@ Bpvp::Plugin::FeatureSet Bpvp::Plugin::process(float const* const* inputBuffers,
     {
         mStartTime = timestamp;
     }
+    // The analysis is only finalised by getRemainingFeatures: a new block reopens it (see getRemainingFeatures)
+    mFinalised = false;
     auto const* inputBuffer = inputBuffers[0];
     size_t inputPosition = 0;
     auto remainingSamples = mBlockSize;
@@ -615,26 +621,47 @@ Bpvp::Plugin::FeatureSet Bpvp::Plugin::getRemainingFeatures()
     {
         return {};
     }
-    processModel(true);
-
+    // The last windows of the model are padded with zeros, but the analysis is only flushed once: the accumulated
+    // frames are the state of the analysis, so a second call (e.g. after the number of voices was changed during the
+    // finishing stage) reuses them instead of appending the padded windows again. The notes are computed from a copy
+    // of the accumulated frames trimmed to the audio length, so finalising never alters the analysis and calling it
+    // again (with any number of voices or any parameter values) yields the result of a direct analysis.
+    if(!mFinalised)
+    {
+        processModel(true);
+        mFinalised = true;
+    }
     // basic_pitch.inference.unwrap_output: trim to the original audio length
     auto const duration = static_cast<double>(mNumSamples) / static_cast<double>(modelSampleRate);
-    while(!mAccumulatedFrames.empty() && frameToSeconds(mAccumulatedFrames.size() - 1) >= duration)
+    auto numFrames = mAccumulatedFrames.size();
+    while(numFrames > 0 && frameToSeconds(numFrames - 1) >= duration)
     {
-        mAccumulatedFrames.pop_back();
+        --numFrames;
     }
-    mAccumulatedOnsets.resize(std::min(mAccumulatedOnsets.size(), mAccumulatedFrames.size()));
-    if(mAccumulatedFrames.empty() || mAccumulatedOnsets.empty())
+    numFrames = std::min(numFrames, mAccumulatedOnsets.size());
+    if(numFrames == 0)
     {
         return {};
     }
-    // The notes of each voice are returned in the feature list of the corresponding output
-    auto const voices = getNotes(mAccumulatedFrames, mAccumulatedOnsets, true, mNumVoices, mFrameThreshold, mOnsetThreshold, static_cast<double>(mMinNoteDuration) / 1000.0, 11, 80.0f, 8000.0f);
+    auto const frames = Matrix(mAccumulatedFrames.cbegin(), std::next(mAccumulatedFrames.cbegin(), static_cast<long>(numFrames)));
+    auto const onsets = Matrix(mAccumulatedOnsets.cbegin(), std::next(mAccumulatedOnsets.cbegin(), static_cast<long>(numFrames)));
+    // The notes are assigned to the voices independently of the voice limit, which only selects the voices to return:
+    // the notes of the retained voices are exactly the same whatever the limit, the notes of the voices above the limit
+    // are not returned by any output, and they cannot influence the retained notes because the voice of a note only
+    // depends on the notes of lower pitches.
+    auto const voices = getNotes(frames, onsets, true, mNumVoices, mFrameThreshold, mOnsetThreshold, static_cast<double>(mMinNoteDuration) / 1000.0, 11, 80.0f, 8000.0f);
+    // The notes of each voice are returned in the feature list of the corresponding output. A feature list is created
+    // for every voice up to the limit (even when the voice has no note), so the feature set always matches the output
+    // descriptors and no output can keep the notes of a previous conversion.
     FeatureSet fs;
-    for(size_t voice = 0; voice < voices.size(); ++voice)
+    for(size_t voice = 0; voice < mNumVoices; ++voice)
     {
-        auto const& notes = voices.at(voice);
         auto& fl = fs[static_cast<int>(voice)];
+        if(voice >= voices.size())
+        {
+            continue;
+        }
+        auto const& notes = voices.at(voice);
         fl.reserve(notes.size() * 2);
         for(auto const& note : notes)
         {

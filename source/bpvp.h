@@ -7,22 +7,10 @@
 #include <tensorflow/lite/c/c_api.h>
 #include <vector>
 
+#include "bpvp_model.h"
+
 namespace Bpvp
 {
-    // Model
-    static auto constexpr modelSampleRate = 22050;
-    static auto constexpr modelFFTHope = 256;
-    static auto constexpr modelBlockSize = 43844;
-    static auto constexpr modelBlockPadding = 7680;
-    static auto constexpr modelBlockDuration = static_cast<double>(modelBlockSize - modelBlockPadding) / static_cast<double>(modelSampleRate);
-    static auto constexpr modelNumFrames = 172;
-    static auto constexpr modelNumNotes = 88;
-    static auto constexpr modelNoteOffset = 21;
-    static auto constexpr modelTensorSize = modelNumFrames * modelNumNotes;
-    static auto constexpr modelBlockHop = modelBlockSize - modelBlockPadding;
-    static auto constexpr modelNumOverlappingFrames = modelBlockPadding / modelFFTHope;
-    static auto constexpr modelNumValidFrames = modelNumFrames - modelNumOverlappingFrames;
-
     class Plugin
     : public Vamp::Plugin
     , public Ive::PluginExtension
@@ -62,6 +50,11 @@ namespace Bpvp
         void setOutputVoiceCount(std::string const& identifier, size_t count) override;
 
     private:
+        using Matrix = std::vector<std::array<float, modelNumNotes>>;
+
+        // Runs the model on the windows of the streaming buffer (the remaining samples are padded with zeros when
+        // flushing) and appends the valid frames of the model to the accumulated matrices. The audio buffer and its
+        // position are consumed, so the analysis is only flushed once (see getRemainingFeatures).
         void processModel(bool flush);
 
         class Resampler
@@ -94,14 +87,21 @@ namespace Bpvp
         std::array<float, modelBlockSize * 2> mInputBuffer;
         std::array<float, modelBlockSize> mAudioBuffer;
         std::array<float, modelTensorSize> mOuputBuffer;
-        std::vector<std::array<float, modelNumNotes>> mAccumulatedFrames;
-        std::vector<std::array<float, modelNumNotes>> mAccumulatedOnsets;
+        Matrix mAccumulatedFrames;
+        Matrix mAccumulatedOnsets;
+        // Whether the accumulated frames already contain the final (zero-padded) windows of the model. It prevents the
+        // finalisation from running twice, so getRemainingFeatures can be called again (e.g. after the number of voices
+        // was changed) without appending the padded windows to the analysis again.
+        bool mFinalised{false};
         size_t mInputBufferPosition{0};
         size_t mNumSamples{0};
         Vamp::RealTime mStartTime;
         size_t mBlockSize{0};
         static size_t constexpr maxNumVoices = 24;
         static size_t constexpr defaultNumVoices = 4;
+        // The maximum number of voices is a setting of the analysis, not a state of the accumulated analysis: it is
+        // kept by reset() and the notes are assigned to the voices independently of it (see getVoices), so the limit
+        // can be changed at any time and the retained notes never change.
         size_t mNumVoices{defaultNumVoices};
         float mFrameThreshold{0.3f};
         float mOnsetThreshold{0.5f};

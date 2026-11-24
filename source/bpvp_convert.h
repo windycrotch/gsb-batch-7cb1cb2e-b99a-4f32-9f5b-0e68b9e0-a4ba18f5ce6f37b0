@@ -21,7 +21,8 @@
 
 #pragma once
 
-#include "bpvp.h"
+#include "bpvp_model.h"
+
 #include <array>
 #include <cmath>
 #include <functional>
@@ -44,7 +45,18 @@ namespace Bpvp
 
     // Port of basic_pitch.note_creation.output_to_notes_polyphonic, the overlapping notes with the same pitch are merged
     // and the notes are split into monophonic voices preserving the pitch order (when two notes overlap, the lower note is
-    // in a lower voice, 0 being the lowest) to return the notes of the first maxVoices voices (the notes of the higher
-    // voices are ignored)
+    // in a lower voice, 0 being the lowest). The function returns the notes of the maxNumVoices voices (the voices of the
+    // model, the highest ones are usually empty). The voice of a note only depends on the notes of lower pitches, so the
+    // assignment does not depend on any voice limit and the notes of a voice are sorted by start time.
+    std::vector<std::vector<Note>> getVoices(std::vector<std::array<float, modelNumNotes>> const& frames, std::vector<std::array<float, modelNumNotes>> const& onsets, bool inferOnsets, float frameEnergyThreshold, float onsetEnergyThreshold, double minNoteDuration, long maxFramesBelowThreshold, std::optional<float> const minFreq = {}, std::optional<float> const maxFreq = {}, bool melodiaTrick = true);
+
+    // Returns the first maxVoices voices of a voice assignment (the missing voices are empty). The projection only
+    // selects the voices, it does not modify the notes, so the output of a limit is always the prefix of the output of
+    // a higher limit.
+    std::vector<std::vector<Note>> projectVoices(std::vector<std::vector<Note>> const& voices, size_t maxVoices);
+
+    // Port of basic_pitch.note_creation.output_to_notes_polyphonic limited to the first maxVoices voices. The notes
+    // (start, end, pitch and amplitude) do not depend on maxVoices: the result is exactly the projection of getVoices(),
+    // so changing the number of voices never changes, removes or adds a note in the retained voices.
     std::vector<std::vector<Note>> getNotes(std::vector<std::array<float, modelNumNotes>> const& frames, std::vector<std::array<float, modelNumNotes>> const& onsets, bool inferOnsets, size_t maxVoices, float frameEnergyThreshold, float onsetEnergyThreshold, double minNoteDuration, long maxFramesBelowThreshold, std::optional<float> const minFreq = {}, std::optional<float> const maxFreq = {}, bool melodiaTrick = true);
 } // namespace Bpvp

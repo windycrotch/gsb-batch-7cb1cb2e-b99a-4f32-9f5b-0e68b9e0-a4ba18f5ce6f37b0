@@ -20,7 +20,6 @@
 // to the Basic Pitch Vamp Plugin.
 
 #include "bpvp_convert.h"
-#include "bpvp.h"
 #include <algorithm>
 #include <cassert>
 #include <limits>
@@ -99,7 +98,7 @@ namespace Bpvp
         return static_cast<double>(sample) / static_cast<double>(modelSampleRate);
     }
 
-    std::vector<std::vector<Note>> getNotes(Matrix const& inputFrames, Matrix const& inputOnsets, bool inferOnsets, size_t maxVoices, float frameEnergyThreshold, float onsetEnergyThreshold, double minNoteDuration, long maxFramesBelowThreshold, std::optional<float> const minFreq, std::optional<float> const maxFreq, bool melodiaTrick)
+    std::vector<std::vector<Note>> getVoices(Matrix const& inputFrames, Matrix const& inputOnsets, bool inferOnsets, float frameEnergyThreshold, float onsetEnergyThreshold, double minNoteDuration, long maxFramesBelowThreshold, std::optional<float> const minFreq, std::optional<float> const maxFreq, bool melodiaTrick)
     {
         auto const numFrames = std::min(inputFrames.size(), inputOnsets.size());
         if(numFrames == 0)
@@ -303,7 +302,12 @@ namespace Bpvp
         // highest voice of the lower notes that overlap it (or 0 if there is none), so when two notes overlap, the
         // lower note is always in a lower voice. The notes are processed from the lowest to the highest pitch, and
         // since the overlapping notes with the same pitch have been merged, the notes of a pitch are disjoint and
-        // sorted by start (so are their ends). Only the notes of the first maxVoices voices are returned.
+        // sorted by start (so are their ends).
+        //
+        // The voice of a note only depends on the notes of strictly lower pitches, which are all processed before it,
+        // so the voice assignment is independent of any limit on the number of voices. The notes are never discarded
+        // here: dropping the notes of the highest voices is done afterwards by projectVoices(), which cannot change the
+        // notes of the retained voices.
         std::sort(notes.begin(), notes.end(), [](auto const& lhs, auto const& rhs)
                   {
                       return std::tie(lhs.pitch, lhs.start) < std::tie(rhs.pitch, rhs.start);
@@ -315,7 +319,7 @@ namespace Bpvp
             size_t voice;
         };
         std::map<float, std::vector<VoiceNote>> pitchNotes;
-        std::vector<std::vector<Note>> voiceNotes(maxVoices);
+        std::map<size_t, std::vector<Note>> notesByVoice;
         for(auto const& note : notes)
         {
             size_t voice = 0;
@@ -331,18 +335,35 @@ namespace Bpvp
                 }
             }
             pitchNotes[note.pitch].push_back({note.start, note.end, voice});
-            if(voice < maxVoices)
-            {
-                voiceNotes[voice].push_back(note);
-            }
+            notesByVoice[voice].push_back(note);
         }
-        for(auto& notesOfVoice : voiceNotes)
+        // Map the voice indices to consecutive indices starting at 0 (the notes of the first voices are always present,
+        // but a denser texture can leave an empty voice in between)
+        std::vector<std::vector<Note>> voices;
+        for(auto& [voice, notesOfVoice] : notesByVoice)
         {
+            voices.resize(std::max(voices.size(), voice + 1));
             std::sort(notesOfVoice.begin(), notesOfVoice.end(), [](auto const& lhs, auto const& rhs)
                       {
                           return lhs.start < rhs.start;
                       });
+            voices[voice] = std::move(notesOfVoice);
         }
-        return voiceNotes;
+        return voices;
+    }
+
+    std::vector<std::vector<Note>> projectVoices(std::vector<std::vector<Note>> const& voices, size_t maxVoices)
+    {
+        std::vector<std::vector<Note>> projected(maxVoices);
+        for(size_t voice = 0; voice < std::min(maxVoices, voices.size()); ++voice)
+        {
+            projected[voice] = voices[voice];
+        }
+        return projected;
+    }
+
+    std::vector<std::vector<Note>> getNotes(Matrix const& frames, Matrix const& onsets, bool inferOnsets, size_t maxVoices, float frameEnergyThreshold, float onsetEnergyThreshold, double minNoteDuration, long maxFramesBelowThreshold, std::optional<float> const minFreq, std::optional<float> const maxFreq, bool melodiaTrick)
+    {
+        return projectVoices(getVoices(frames, onsets, inferOnsets, frameEnergyThreshold, onsetEnergyThreshold, minNoteDuration, maxFramesBelowThreshold, minFreq, maxFreq, melodiaTrick), maxVoices);
     }
 } // namespace Bpvp
