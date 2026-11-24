@@ -227,18 +227,6 @@ func (s *s3SegmentSender) ForwardSegment(
 	dbClient := s.dbConns.NewPersistanceManager()
 	defer dbClient.Close()
 
-	// Mark that the segment is uploaded
-	if err := dbClient.MarkLiveStreamSegmentsUploaded(ctxt, []string{segment.ID}); err != nil {
-		log.
-			WithError(err).
-			WithFields(logTags).
-			WithField("source-id", segment.SourceID).
-			WithField("segment-name", segment.Name).
-			Error("Unable to mark segment is uploaded")
-		dbClient.MarkExternalError(err)
-		return err
-	}
-
 	log.
 		WithFields(logTags).
 		WithField("source-id", segment.SourceID).
@@ -295,6 +283,19 @@ func (s *s3SegmentSender) ForwardSegment(
 		WithField("target-bucket", targetBucket).
 		WithField("target-object-key", targetObjectKey).
 		Debug("Video segment uploaded")
+
+	// Mark that the segment is uploaded only after the object store write succeeded,
+	// so persistence never claims the segment is stored when it is not
+	if err := dbClient.MarkLiveStreamSegmentsUploaded(ctxt, []string{segment.ID}); err != nil {
+		log.
+			WithError(err).
+			WithFields(logTags).
+			WithField("source-id", segment.SourceID).
+			WithField("segment-name", segment.Name).
+			Error("Unable to mark segment is uploaded")
+		dbClient.MarkExternalError(err)
+		return err
+	}
 
 	// Update metrics
 	if s.segmentIOMetrics != nil {

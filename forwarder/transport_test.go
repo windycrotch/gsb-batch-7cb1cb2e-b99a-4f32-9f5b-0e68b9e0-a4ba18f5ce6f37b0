@@ -157,3 +157,50 @@ func TestS3SegmentSender(t *testing.T) {
 	// Make the request
 	assert.Nil(uut.ForwardSegment(utCtxt, testSegment))
 }
+
+func TestS3SegmentSenderUploadFailure(t *testing.T) {
+	assert := assert.New(t)
+	log.SetLevel(log.DebugLevel)
+
+	utCtxt := context.Background()
+
+	mockS3 := mocks.NewS3Client(t)
+	mockSQL := mocks.NewConnectionManager(t)
+	mockDB := mocks.NewPersistenceManager(t)
+	mockSQL.On("NewPersistanceManager").Return(mockDB)
+	mockDB.On("Close").Return()
+
+	uut, err := forwarder.NewS3SegmentSender(utCtxt, mockS3, mockSQL, nil, nil)
+	assert.Nil(err)
+
+	testSegmentID := uuid.NewString()
+	testBucket := uuid.NewString()
+	testObjectKey := fmt.Sprintf("segments/%s.ts", testSegmentID)
+	testSegment := common.VideoSegmentWithData{
+		VideoSegment: common.VideoSegment{
+			ID:       testSegmentID,
+			SourceID: uuid.NewString(),
+			Segment: hls.Segment{
+				Name: uuid.NewString(),
+				URI:  fmt.Sprintf("s3://%s/%s", testBucket, testObjectKey),
+			},
+		},
+		Content: []byte(uuid.NewString()),
+	}
+
+	// The object store write fails
+	mockS3.On(
+		"PutObject",
+		mock.AnythingOfType("context.backgroundCtx"),
+		testBucket,
+		testObjectKey,
+		testSegment.Content,
+	).Return(fmt.Errorf("object store unavailable")).Once()
+	mockDB.On("MarkExternalError", mock.Anything).Return()
+
+	// The request must fail, and the segment must NOT be marked as uploaded
+	// (no MarkLiveStreamSegmentsUploaded expectation is installed, so the mock
+	// fails the test if the sender marks the segment anyway)
+	assert.Error(uut.ForwardSegment(utCtxt, testSegment))
+	mockDB.AssertNotCalled(t, "MarkLiveStreamSegmentsUploaded", mock.Anything, mock.Anything)
+}
