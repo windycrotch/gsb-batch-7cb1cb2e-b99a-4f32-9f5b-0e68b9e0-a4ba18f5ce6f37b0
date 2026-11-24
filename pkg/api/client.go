@@ -17,18 +17,19 @@ import (
 
 // Client handles authenticated requests to Discord REST API endpoints.
 type Client struct {
-	httpClient  *http.Client
-	transport   *RegionTransport
-	apiBase     string
-	token       string
-	timezone    string
-	buildNumber int
-	locale      string
-	fp          Fingerprint
-	stateMu     sync.RWMutex
-	fpMu        sync.RWMutex
-	propsMu     sync.Mutex
-	propsCache  map[string]string
+	httpClient     *http.Client
+	transport      *RegionTransport
+	apiBase        string
+	token          string
+	timezone       string
+	buildNumber    int
+	locale         string
+	fp             Fingerprint
+	stateMu        sync.RWMutex
+	fpMu           sync.RWMutex
+	propsMu        sync.Mutex
+	propsCache     map[string]string
+	egressBindings sync.Map
 }
 
 // BuildSuperPropertiesWithLocale produces a base64-encoded client fingerprint
@@ -151,7 +152,7 @@ func (c *Client) Fingerprint() Fingerprint {
 // SetRegionProxy registers a regional proxy for a sweep target code. Every
 // request made with api.WithRegionInfo for that code is tunneled through it.
 func (c *Client) SetRegionProxy(code, proxyURL string) error {
-	if c.transport == nil {
+	if c == nil || c.transport == nil {
 		return fmt.Errorf("client transport is unavailable")
 	}
 	return c.transport.SetProxy(code, proxyURL)
@@ -159,14 +160,14 @@ func (c *Client) SetRegionProxy(code, proxyURL string) error {
 
 // RemoveRegionProxy unregisters a regional proxy.
 func (c *Client) RemoveRegionProxy(code string) {
-	if c.transport != nil {
+	if c != nil && c.transport != nil {
 		c.transport.RemoveProxy(code)
 	}
 }
 
 // HasRegionProxy reports whether a proxy is registered for a region code.
 func (c *Client) HasRegionProxy(code string) bool {
-	if c.transport == nil {
+	if c == nil || c.transport == nil {
 		return false
 	}
 	return c.transport.HasProxy(code)
@@ -174,10 +175,19 @@ func (c *Client) HasRegionProxy(code string) bool {
 
 // CloseIdleConnections releases pooled connections held by every route.
 func (c *Client) CloseIdleConnections() {
+	if c == nil {
+		return
+	}
+	if c.httpClient != nil {
+		c.httpClient.CloseIdleConnections()
+	}
 	if c.transport != nil {
 		c.transport.CloseIdleConnections()
 	}
 }
+
+// ReleaseIdleConnections is a descriptive alias for scan cleanup callers.
+func (c *Client) ReleaseIdleConnections() { c.CloseIdleConnections() }
 
 // SetLocale changes the default locale/timezone used when a request has no
 // explicit region or locale override.
@@ -466,6 +476,10 @@ func (c *Client) FetchQuestsMultiRegion(ctx context.Context, regions []string) (
 
 // EnrollQuestWithCaptcha sends enrollment payload to POST /api/v9/quests/{qid}/enroll, optionally with captcha solution.
 func (c *Client) EnrollQuestWithCaptcha(ctx context.Context, quest Quest, captchaKey, captchaRqtoken string) error {
+	// A quest must always re-enter through the egress that discovered it, even
+	// if the caller passed a background context or only the quest value.
+	ctx = c.questEgressContext(ctx, quest)
+
 	payload := EnrollPayload{
 		Location:              11,
 		IsTargeted:            false,
@@ -555,6 +569,7 @@ func (c *Client) EnrollQuest(ctx context.Context, quest Quest) error {
 
 // SendVideoProgress updates video watch timestamp on POST /api/v9/quests/{qid}/video-progress.
 func (c *Client) SendVideoProgress(ctx context.Context, questID string, timestamp float64) (*ProgressUpdateResponse, error) {
+	ctx = c.questIDEgressContext(ctx, questID)
 	payload := VideoProgressPayload{Timestamp: timestamp}
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
@@ -610,6 +625,7 @@ func (c *Client) SendVideoProgress(ctx context.Context, questID string, timestam
 
 // SendHeartbeat sends a game activity heartbeat to POST /api/v9/quests/{qid}/heartbeat.
 func (c *Client) SendHeartbeat(ctx context.Context, questID string, streamKey string, terminal bool) (*ProgressUpdateResponse, error) {
+	ctx = c.questIDEgressContext(ctx, questID)
 	payload := HeartbeatPayload{
 		StreamKey: streamKey,
 		Terminal:  terminal,

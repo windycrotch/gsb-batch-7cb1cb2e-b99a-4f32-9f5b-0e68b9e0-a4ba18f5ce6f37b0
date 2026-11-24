@@ -63,17 +63,22 @@ func (o SweepOptions) withDefaults() SweepOptions {
 
 // TargetReport describes the outcome of one sweep target.
 type TargetReport struct {
-	Code     string
-	Locale   string
-	Timezone string
-	Proxy    string
-	Attempts int
-	Status   int
-	Ok       bool
-	Err      string
-	Quests   int
-	Excluded int
-	Latency  time.Duration
+	Code            string
+	Locale          string
+	Timezone        string
+	Proxy           string
+	Attempts        int
+	Status          int
+	Ok              bool
+	RateLimited     bool
+	RateLimit       bool
+	EverRateLimited bool
+	Limited         bool
+	Err             string
+	Quests          int
+	Excluded        int
+	Latency         time.Duration
+	RetryAfter      time.Duration
 }
 
 // SweepResult is the union of every successful target in a discovery sweep.
@@ -86,6 +91,13 @@ type SweepResult struct {
 	Requests               int
 	Succeeded              int
 	Failed                 int
+	RateLimited            int
+	GenericFailed          int
+	Errors                 int
+	Canceled               bool
+	Cancelled              bool
+	Aborted                bool
+	Incomplete             bool
 	Duration               time.Duration
 }
 
@@ -128,6 +140,35 @@ func (r *SweepResult) FailedTargets() []string {
 	return failed
 }
 
+// RateLimitedTargets returns targets whose final outcome was HTTP 429.
+func (r *SweepResult) RateLimitedTargets() []string {
+	if r == nil {
+		return nil
+	}
+	limited := make([]string, 0, r.RateLimited)
+	for _, target := range r.Targets {
+		if !target.Ok && (target.RateLimited || target.Status == http.StatusTooManyRequests) {
+			limited = append(limited, target.Code)
+		}
+	}
+	return limited
+}
+
+// EverRateLimitedTargets returns targets that received at least one 429,
+// including targets which subsequently recovered.
+func (r *SweepResult) EverRateLimitedTargets() []string {
+	if r == nil {
+		return nil
+	}
+	codes := make([]string, 0)
+	for _, target := range r.Targets {
+		if target.EverRateLimited || target.RateLimited {
+			codes = append(codes, target.Code)
+		}
+	}
+	return codes
+}
+
 // ExcludedCount returns how many distinct quests Discord excluded for the account.
 func (r *SweepResult) ExcludedCount() int {
 	if r == nil {
@@ -149,16 +190,50 @@ func (r *SweepResult) HasProxyTargets() bool {
 	return false
 }
 
+// RateLimitedCount is an alias for callers that prefer a method over the field.
+func (r *SweepResult) RateLimitedCount() int {
+	if r == nil {
+		return 0
+	}
+	return r.RateLimited
+}
+
+// HasRateLimited reports whether the final report contains a 429 target.
+func (r *SweepResult) HasRateLimited() bool {
+	return r != nil && r.RateLimited > 0
+}
+
+// IsRateLimited reports whether this target's final outcome was HTTP 429.
+func (t TargetReport) IsRateLimited() bool {
+	return !t.Ok && (t.RateLimited || t.RateLimit || t.Limited || t.Status == http.StatusTooManyRequests)
+}
+
 func (r *SweepResult) summarize() {
 	r.Succeeded = 0
 	r.Failed = 0
+	r.RateLimited = 0
+	r.GenericFailed = 0
+	r.Errors = 0
+	r.Incomplete = false
 	for _, target := range r.Targets {
 		if target.Ok {
 			r.Succeeded++
+			continue
+		}
+		r.Failed++
+		if target.IsRateLimited() {
+			r.RateLimited++
 		} else {
-			r.Failed++
+			r.GenericFailed++
+			r.Errors++
 		}
 	}
+	r.Incomplete = r.Canceled || r.Cancelled || r.Aborted || r.Failed > 0
+}
+
+// WasCanceled reports whether the sweep ended because its context was canceled.
+func (r *SweepResult) WasCanceled() bool {
+	return r != nil && (r.Canceled || r.Cancelled || r.Aborted)
 }
 
 func (r *SweepResult) failureSummary() string {
@@ -230,21 +305,23 @@ func (p *sweepPacer) penalty(retryAfter time.Duration) {
 	if p == nil {
 		return
 	}
-	raised := p.floor * 3 / 2
+	needed := p.floor * 3 / 2
 	if retryAfter > 0 {
-		needed := retryAfter + p.buffer
-		if needed > raised {
-			raised = needed
+		if required := retryAfter + p.buffer; required > needed {
+			needed = required
 		}
 	}
-	if raised < p.min {
-		raised = p.min
+	if needed < p.min {
+		needed = p.min
 	}
-	if p.max > 0 && raised > p.max {
-		raised = p.max
+
+	// The adaptive request floor may be capped, but an explicit Retry-After
+	// deadline must never be shortened by that cap.
+	p.floor = needed
+	if p.max > 0 && p.floor > p.max {
+		p.floor = p.max
 	}
-	p.floor = raised
-	p.next = time.Now().Add(p.floor)
+	p.next = time.Now().Add(needed)
 }
 
 func sleepContext(ctx context.Context, delay time.Duration) bool {
@@ -341,6 +418,16 @@ func mergeSweepPayload(result *SweepResult, payload *QuestResponse, target Regio
 		quest.DiscoveredLocale = target.Locale
 		quest.DiscoveredTimezone = target.Timezone
 		quest.RegionProxied = target.ProxyURL != ""
+		if target.ProxyURL != "" {
+			binding := EgressFingerprint(target.ProxyURL)
+			quest.EgressBinding = binding
+			quest.EgressID = binding
+			quest.ProxyBinding = binding
+			quest.Binding = binding
+			quest.BoundProxy = target.ProxyURL
+			quest.BoundProxyURL = target.ProxyURL
+			quest.ProxyURL = target.ProxyURL
+		}
 		quest.SeenIn = appendRegion(quest.SeenIn, target.Code)
 		index[quest.ID] = len(result.Quests)
 		result.Quests = append(result.Quests, quest)
@@ -385,9 +472,30 @@ func (c *Client) SweepQuests(ctx context.Context, targets []RegionTarget, opts S
 	opts = opts.withDefaults()
 	startedAt := time.Now()
 	result := &SweepResult{Quests: []Quest{}, Excluded: []ExcludedQuest{}}
+	if c != nil {
+		// Release keep-alive sockets created by this scan once it ends. Active
+		// requests have already returned by this point, so no in-flight work is
+		// closed.
+		defer c.CloseIdleConnections()
+	}
 	if len(targets) == 0 {
 		return result, fmt.Errorf("quest sweep has no targets")
 	}
+
+	// The host's own egress is always queried first, even if a caller supplied
+	// targets in another order. Stable partitioning preserves proxy order.
+	orderedTargets := make([]RegionTarget, 0, len(targets))
+	for _, target := range targets {
+		if isDirectRegionCode(target.Code) {
+			orderedTargets = append(orderedTargets, target)
+		}
+	}
+	for _, target := range targets {
+		if !isDirectRegionCode(target.Code) {
+			orderedTargets = append(orderedTargets, target)
+		}
+	}
+	targets = orderedTargets
 
 	seen := make(map[string]bool, len(targets))
 	unique := make([]RegionTarget, 0, len(targets))
@@ -474,9 +582,27 @@ func (c *Client) SweepQuests(ctx context.Context, targets []RegionTarget, opts S
 			if status == http.StatusOK && payload != nil {
 				pacer.success()
 				report.Ok = true
+				report.RateLimited = false
+				report.RateLimit = false
+				report.Limited = false
 				report.Err = ""
 				report.Quests = len(payload.Quests)
 				report.Excluded = len(payload.ExcludedQuests)
+				for i := range payload.Quests {
+					boundQuest := payload.Quests[i]
+					if target.ProxyURL != "" {
+						binding := EgressFingerprint(target.ProxyURL)
+						boundQuest.RegionProxied = true
+						boundQuest.EgressBinding = binding
+						boundQuest.EgressID = binding
+						boundQuest.ProxyBinding = binding
+						boundQuest.Binding = binding
+						boundQuest.BoundProxy = target.ProxyURL
+						boundQuest.BoundProxyURL = target.ProxyURL
+						boundQuest.ProxyURL = target.ProxyURL
+					}
+					c.RememberQuestEgress(boundQuest)
+				}
 				mergeSweepPayload(result, payload, target)
 				return false
 			}
@@ -494,6 +620,11 @@ func (c *Client) SweepQuests(ctx context.Context, targets []RegionTarget, opts S
 				if retryAfter <= 0 {
 					retryAfter = 3 * time.Second
 				}
+				report.RateLimited = true
+				report.RateLimit = true
+				report.EverRateLimited = true
+				report.Limited = true
+				report.RetryAfter = retryAfter
 				pacer.penalty(retryAfter)
 				report.Err = fmt.Sprintf("HTTP 429: rate limited (retry_after %s)", retryAfter.Round(100*time.Millisecond))
 				continue
@@ -526,6 +657,14 @@ func (c *Client) SweepQuests(ctx context.Context, targets []RegionTarget, opts S
 				}
 				result.Targets[j].Err = "not attempted: sweep aborted (" + abortErr + ")"
 			}
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				result.Canceled = true
+				result.Cancelled = true
+				result.Aborted = true
+				result.Duration = time.Since(startedAt)
+				result.summarize()
+				return result, fmt.Errorf("quest discovery aborted: %s: %w", abortErr, ctxErr)
+			}
 			result.Duration = time.Since(startedAt)
 			result.summarize()
 			return result, fmt.Errorf("quest discovery aborted: %s", abortErr)
@@ -546,6 +685,14 @@ func (c *Client) SweepQuests(ctx context.Context, targets []RegionTarget, opts S
 		}
 		attemptTarget(index, false)
 	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		result.Canceled = true
+		result.Cancelled = true
+		result.Aborted = true
+		result.Duration = time.Since(startedAt)
+		result.summarize()
+		return result, fmt.Errorf("quest sweep canceled: %w", ctxErr)
+	}
 
 	for i := range result.Targets {
 		result.Targets[i].Err = redactTargetError(result.Targets[i].Err, unique[i])
@@ -553,7 +700,12 @@ func (c *Client) SweepQuests(ctx context.Context, targets []RegionTarget, opts S
 	result.Duration = time.Since(startedAt)
 	result.summarize()
 	if result.Succeeded == 0 {
-		return result, fmt.Errorf("quest discovery failed on every target (%s)", result.failureSummary())
+		allRateLimited := result.Failed > 0 && result.RateLimited == result.Failed
+		allFailed := fmt.Errorf("quest discovery failed on every target (%s)", result.failureSummary())
+		if allRateLimited {
+			return result, fmt.Errorf("%w: %v", ErrRateLimited, allFailed)
+		}
+		return result, allFailed
 	}
 	return result, nil
 }

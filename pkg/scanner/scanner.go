@@ -60,18 +60,26 @@ func (c QuestCategory) Localized() string {
 
 // AnalyzedQuest summarizes quest requirements and user progression.
 type AnalyzedQuest struct {
-	Quest      api.Quest
-	ID         string
-	Title      string
-	Category   QuestCategory
-	TaskType   string
-	AppID      string
-	TargetSec  int
-	CurrentSec float64
-	State      QuestState
-	IsExpired  bool
-	ExpiresAt  string
-	Region     string
+	Quest        api.Quest
+	ID           string
+	Title        string
+	Category     QuestCategory
+	TaskType     string
+	AppID        string
+	TargetSec    int
+	CurrentSec   float64
+	State        QuestState
+	IsExpired    bool
+	ExpiresAt    string
+	Region       string
+	FromCache    bool
+	FromSnapshot bool
+	Snapshot     bool
+}
+
+// IsSnapshotFiller reports whether this analyzed row came from snapshot fallback.
+func (q AnalyzedQuest) IsSnapshotFiller() bool {
+	return q.FromCache || q.FromSnapshot || q.Snapshot || api.IsSnapshotFiller(q.Quest)
 }
 
 // AnalyzeQuest inspects an api.Quest and classifies its state and primary requirement.
@@ -81,13 +89,16 @@ func AnalyzeQuest(q api.Quest) AnalyzedQuest {
 		reg = "US"
 	}
 	aq := AnalyzedQuest{
-		Quest:     q,
-		ID:        q.ID,
-		Title:     extractTitle(q),
-		Region:    reg,
-		State:     StateAvailable,
-		Category:  CategoryUnknown,
-		ExpiresAt: q.Config.ExpiresAt,
+		Quest:        q,
+		ID:           q.ID,
+		Title:        extractTitle(q),
+		Region:       reg,
+		State:        StateAvailable,
+		Category:     CategoryUnknown,
+		ExpiresAt:    q.Config.ExpiresAt,
+		FromCache:    api.IsSnapshotFiller(q),
+		FromSnapshot: api.IsSnapshotFiller(q),
+		Snapshot:     api.IsSnapshotFiller(q),
 	}
 
 	if q.UserStatus != nil {
@@ -207,30 +218,41 @@ func AnalyzeAll(rawQuests []api.Quest) []AnalyzedQuest {
 // progress lines are suppressed (daemon mode).
 func AutoEnrollPending(ctx context.Context, client *api.Client, quests []AnalyzedQuest, enablePortal bool, portalPort int, quiet bool) ([]string, error) {
 	enrolled := make([]string, 0, len(quests))
+	var egressFailures []error
 	for _, q := range quests {
 		if q.State != StateAvailable || q.IsExpired {
 			continue
 		}
-		if q.Quest.FromCache {
+		if api.IsSnapshotFiller(q.Quest) {
 			// Snapshot quests carry stale sealed traffic metadata; enrolling them
 			// is likely to fail and wastes rate-limit budget.
 			continue
 		}
-		if q.Quest.RegionProxied && q.Region != "" && !client.HasRegionProxy(q.Region) {
-			// The proxy that discovered this quest is no longer configured.
-			continue
+
+		ambient := api.RegionInfo{
+			Code:     q.Region,
+			Locale:   q.Quest.DiscoveredLocale,
+			Timezone: q.Quest.DiscoveredTimezone,
 		}
+		regionInfo := api.MergeRegionInfo(ambient, q.Quest.EgressInfo())
+		if regionInfo.RequiresEgress() {
+			if err := client.CheckEgress(regionInfo); err != nil {
+				// The discovering proxy was removed/replaced. Do not let the HTTP
+				// transport silently retry through direct egress; report this as
+				// an explicit per-quest execution failure.
+				egressErr := fmt.Errorf("quest %s cannot re-enroll through its discovering egress %s: %w", q.ID, q.Region, err)
+				egressFailures = append(egressFailures, egressErr)
+				if !quiet {
+					fmt.Printf(" [Auto-Enroll] %v\n", egressErr)
+				}
+				continue
+			}
+		}
+
 		// Enroll through the region that discovered the quest: Discord binds the
 		// sealed traffic metadata to the fetch IP, so a direct request for a
 		// proxy-discovered quest can be rejected.
-		questCtx := ctx
-		if q.Region != "" {
-			questCtx = api.WithRegionInfo(ctx, api.RegionInfo{
-				Code:     q.Region,
-				Locale:   q.Quest.DiscoveredLocale,
-				Timezone: q.Quest.DiscoveredTimezone,
-			})
-		}
+		questCtx := api.WithRegionInfo(ctx, regionInfo)
 
 		if !quiet {
 			if i18n.GetLanguage() == i18n.LangVI {
@@ -288,10 +310,10 @@ func AutoEnrollPending(ctx context.Context, client *api.Client, quests []Analyze
 		// Polite delay between enrollments to respect Discord burst rate limits.
 		// The delay is jittered so the cadence does not look clockwork.
 		if !pacing.Sleep(ctx, 2500*time.Millisecond, EnrollSpread) {
-			return enrolled, ctx.Err()
+			return enrolled, errors.Join(append(egressFailures, ctx.Err())...)
 		}
 	}
-	return enrolled, nil
+	return enrolled, errors.Join(egressFailures...)
 }
 
 // ApplyEnrolledState marks the given quest IDs as enrolled in place so a pass can
@@ -360,6 +382,9 @@ func FormatQuestTable(quests []AnalyzedQuest, showExpired bool) string {
 			progressStr = "N/A"
 		}
 		title := q.Title
+		if q.FromSnapshot || api.IsSnapshotFiller(q.Quest) {
+			title = "[SNAPSHOT] " + title
+		}
 		if len([]rune(title)) > 24 {
 			title = string([]rune(title)[:21]) + "..."
 		}

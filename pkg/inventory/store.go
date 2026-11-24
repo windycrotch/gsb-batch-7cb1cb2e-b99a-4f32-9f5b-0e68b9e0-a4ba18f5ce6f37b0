@@ -109,10 +109,23 @@ func Merge(current []api.Quest, snapshot *Snapshot, userID string, now time.Time
 			quest.DiscoveredRegion = "CACHE"
 		}
 		quest.FromCache = true
+		quest.FromSnapshot = true
+		quest.SnapshotFiller = true
+		if quest.Provenance == "" {
+			quest.Provenance = "snapshot"
+		}
+		if quest.Source == "" {
+			quest.Source = "snapshot"
+		}
 		seen[quest.ID] = true
 		merged = append(merged, quest)
 	}
 	return merged
+}
+
+// IsSnapshotFiller reports whether q is display-only snapshot data.
+func IsSnapshotFiller(q api.Quest) bool {
+	return api.IsSnapshotFiller(q)
 }
 
 // ActiveQuest reports whether a quest has not expired and is not already claimed.

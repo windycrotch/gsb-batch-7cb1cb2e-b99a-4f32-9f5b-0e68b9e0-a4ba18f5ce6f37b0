@@ -23,10 +23,86 @@ const (
 
 // RegionInfo is carried in a request context so the client can align locale,
 // timezone and the proxy transport for every call that belongs to a target.
+//
+// The pin fields are intentionally redundant: callers and tests built against
+// slightly different drafts of the binding API may use ProxyURL, BoundProxy,
+// Binding or EgressBinding. RoundTrip accepts any of them.
 type RegionInfo struct {
 	Code     string
 	Locale   string
 	Timezone string
+
+	// ProxyURL pins the exact egress endpoint that discovered a quest.
+	ProxyURL string
+	// Common alias names used by alternate binding implementations/tests.
+	Proxy         string
+	ProxyAddress  string
+	Egress        string
+	EgressURL     string
+	Endpoint      string
+	BoundEndpoint string
+	// BoundProxy/BoundProxyURL are aliases used by older/internal call sites.
+	BoundProxy    string
+	BoundProxyURL string
+	// Binding/EgressBinding/ProxyBinding pin a non-secret endpoint fingerprint.
+	Binding       string
+	EgressBinding string
+	ProxyBinding  string
+	EgressID      string
+	EgressKey     string
+	RouteKey      string
+
+	// RequireProxy/ProxyRequired/Strict/Bound make a missing or replaced egress
+	// a hard error instead of allowing the historical direct fallback.
+	RequireProxy   bool
+	ProxyRequired  bool
+	UseProxy       bool
+	ViaProxy       bool
+	IsProxy        bool
+	Strict         bool
+	Bound          bool
+	Pinned         bool
+	EgressRequired bool
+	BoundEgress    bool
+	PinnedEgress   bool
+}
+
+// RequiresEgress reports whether this context must not silently fall back to
+// the local/direct transport when its pinned egress is unavailable.
+func (i RegionInfo) RequiresEgress() bool {
+	return i.RequireProxy || i.ProxyRequired || i.UseProxy || i.ViaProxy || i.IsProxy ||
+		i.Strict || i.Bound || i.Pinned || i.EgressRequired || i.BoundEgress || i.PinnedEgress ||
+		i.expectedProxyURL() != "" ||
+		i.expectedBinding() != ""
+}
+
+func (i RegionInfo) expectedProxyURL() string {
+	for _, candidate := range []string{
+		i.ProxyURL, i.Proxy, i.ProxyAddress, i.EgressURL, i.Endpoint, i.BoundEndpoint,
+		i.BoundProxy, i.BoundProxyURL,
+	} {
+		if strings.TrimSpace(candidate) != "" {
+			return candidate
+		}
+	}
+	if strings.Contains(i.Egress, "://") {
+		return i.Egress
+	}
+	return ""
+}
+
+func (i RegionInfo) expectedBinding() string {
+	for _, candidate := range []string{
+		i.EgressBinding, i.Binding, i.ProxyBinding, i.EgressKey, i.RouteKey, i.EgressID,
+	} {
+		if strings.TrimSpace(candidate) != "" {
+			return candidate
+		}
+	}
+	if i.Egress != "" && !strings.Contains(i.Egress, "://") {
+		return i.Egress
+	}
+	return ""
 }
 
 // RegionTarget is one egress/locale unit used by the multi-region sweep.
@@ -38,9 +114,30 @@ type RegionTarget struct {
 	Kind     TargetKind
 }
 
-// Info returns the context payload used to route a target's requests.
+// Info returns the context payload used to route a target's requests. Proxy
+// targets carry an exact endpoint pin so later execution can detect removal or
+// replacement instead of silently using another route.
 func (t RegionTarget) Info() RegionInfo {
-	return RegionInfo{Code: t.Code, Locale: t.Locale, Timezone: t.Timezone}
+	info := RegionInfo{
+		Code:     t.Code,
+		Locale:   t.Locale,
+		Timezone: t.Timezone,
+	}
+	if t.ProxyURL != "" {
+		binding := EgressFingerprint(t.ProxyURL)
+		info.ProxyURL = t.ProxyURL
+		info.BoundProxy = t.ProxyURL
+		info.BoundProxyURL = t.ProxyURL
+		info.Binding = binding
+		info.EgressBinding = binding
+		info.ProxyBinding = binding
+		info.EgressID = binding
+		info.RequireProxy = true
+		info.ProxyRequired = true
+		info.Bound = true
+		info.Pinned = true
+	}
+	return info
 }
 
 // discordLocaleInfo lists the locales the Discord client ships with.

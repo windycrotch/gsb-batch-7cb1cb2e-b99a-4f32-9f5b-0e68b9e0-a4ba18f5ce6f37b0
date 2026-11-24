@@ -300,6 +300,12 @@ func discoverQuests(ctx context.Context, cfg *config.Config, apiClient *api.Clie
 	if result == nil {
 		result = &api.SweepResult{}
 	}
+	if ctx.Err() != nil {
+		// Cancellation must not fall back to a snapshot or present a partial
+		// sweep as a usable pass. The sweep result remains available for tests
+		// and diagnostics, but the error is authoritative.
+		return result, 0, ctx.Err()
+	}
 
 	// A complete sweep is authoritative: never resurrect snapshot quests that
 	// Discord itself no longer returns for a healthy account.
@@ -313,7 +319,10 @@ func discoverQuests(ctx context.Context, cfg *config.Config, apiClient *api.Clie
 	restored := 0
 	snapshot, loadErr := inventory.Load(inventory.Path(cfg.CacheDir))
 	if loadErr == nil && snapshot != nil {
-		merged := inventory.Merge(result.Quests, snapshot, userID, now, 15*time.Minute)
+		// Snapshot age itself is not an extra correctness condition for display:
+		// only quests that have themselves expired are filtered by Merge. The
+		// filler marker prevents unsafe automatic enrollment.
+		merged := inventory.Merge(result.Quests, snapshot, userID, now, 0)
 		if len(merged) > len(result.Quests) {
 			restored = len(merged) - len(result.Quests)
 			result.Quests = merged
@@ -409,6 +418,57 @@ func regionInfoFor(region string) api.RegionInfo {
 	return api.RegionInfo{Code: region, Locale: "en-US", Timezone: "America/New_York"}
 }
 
+// regionInfoForQuest prefers the exact locale/timezone and egress pin remembered
+// on the quest. The global target list is only a fallback for older values.
+func regionInfoForQuest(q scanner.AnalyzedQuest) api.RegionInfo {
+	info := q.Quest.EgressInfo()
+	region := info.Code
+	if region == "" {
+		region = q.Region
+	}
+	if region == "" {
+		region = "LOCAL"
+	}
+
+	target := api.RegionTarget{}
+	found := false
+	for _, candidate := range sweepTargets {
+		if strings.EqualFold(candidate.Code, region) {
+			target = candidate
+			found = true
+			break
+		}
+	}
+
+	ambient := api.RegionInfo{Code: region}
+	if found {
+		ambient = target.Info()
+	} else {
+		ambient = regionInfoFor(region)
+	}
+	if info.Locale != "" {
+		ambient.Locale = info.Locale
+	}
+	if info.Timezone != "" {
+		ambient.Timezone = info.Timezone
+	}
+	merged := api.MergeRegionInfo(ambient, info)
+	merged.Code = region
+	return merged
+}
+
+// questContext binds a quest execution call to its discovering egress while
+// preserving cancellation.
+func questContext(parent context.Context, q scanner.AnalyzedQuest) context.Context {
+	return api.WithRegionInfo(parent, regionInfoForQuest(q))
+}
+
+// questEgressContext is a descriptive alias used by call sites and tests that
+// name the binding explicitly.
+func questEgressContext(parent context.Context, q scanner.AnalyzedQuest) context.Context {
+	return questContext(parent, q)
+}
+
 // printSweepReport prints per-target sweep results so a failed region can never
 // be silently swallowed again.
 func printSweepReport(result *api.SweepResult, restored int) {
@@ -423,7 +483,12 @@ func printSweepReport(result *api.SweepResult, restored int) {
 	for _, target := range result.Targets {
 		state := "OK "
 		if !target.Ok {
-			state = "ERR"
+			switch {
+			case target.RateLimited || target.Status == 429:
+				state = "429"
+			default:
+				state = "ERR"
+			}
 		}
 		proxy := target.Proxy
 		if proxy == "" {
@@ -473,7 +538,7 @@ func countSkippedEnrollments(quests []scanner.AnalyzedQuest, client *api.Client)
 		if quest.State != scanner.StateAvailable || quest.IsExpired {
 			continue
 		}
-		if quest.Quest.FromCache {
+		if api.IsSnapshotFiller(quest.Quest) {
 			skipped++
 			continue
 		}
@@ -860,7 +925,7 @@ func runAPIRunnerLoop(ctx context.Context, cfg *config.Config, client *api.Clien
 				case <-time.After(laneDelay):
 				}
 
-				questCtx := api.WithRegionInfo(ctx, regionInfoFor(quest.Region))
+				questCtx := questContext(ctx, quest)
 				processOneQuest(questCtx, client, quest, idx, len(bucket))
 			}(i+1, q)
 		}
@@ -909,6 +974,7 @@ const (
 )
 
 func completeVideoAPI(ctx context.Context, client *api.Client, q scanner.AnalyzedQuest) error {
+	ctx = questContext(ctx, q)
 	secondsNeeded := float64(q.TargetSec)
 	secondsDone := q.CurrentSec
 
@@ -1030,6 +1096,7 @@ func errorBackoff(consecutive int) time.Duration {
 }
 
 func completeHeartbeatAPI(ctx context.Context, client *api.Client, q scanner.AnalyzedQuest) error {
+	ctx = questContext(ctx, q)
 	secondsNeeded := float64(q.TargetSec)
 	secondsDone := q.CurrentSec
 	pid := rand.Intn(28000) + 2000
@@ -1136,6 +1203,7 @@ func completeHeartbeatAPI(ctx context.Context, client *api.Client, q scanner.Ana
 }
 
 func completeActivityAPI(ctx context.Context, client *api.Client, q scanner.AnalyzedQuest) error {
+	ctx = questContext(ctx, q)
 	secondsNeeded := float64(q.TargetSec)
 	secondsDone := q.CurrentSec
 	streamKey := "call:0:1"
@@ -1445,7 +1513,7 @@ func runSpooferQuest(ctx context.Context, cfg *config.Config, apiClient *api.Cli
 			}
 		}
 
-		rawQuests, fetchErr := apiClient.FetchQuests(api.WithRegionInfo(ctx, regionInfoFor(region)))
+		rawQuests, fetchErr := apiClient.FetchQuests(questContext(ctx, quest))
 		if fetchErr != nil {
 			if errors.Is(fetchErr, api.ErrQuestExpired) {
 				return nil

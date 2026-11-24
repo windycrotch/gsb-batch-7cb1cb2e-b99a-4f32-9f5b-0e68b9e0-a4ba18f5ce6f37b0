@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // User flags bitmask constants (Discord API)
@@ -176,11 +177,117 @@ type Quest struct {
 	TrafficMetadataSealed *string     `json:"traffic_metadata_sealed"`
 	TargetedContent       []int       `json:"targeted_content,omitempty"`
 	RegionProxied         bool        `json:"region_proxied,omitempty"`
-	FromCache             bool        `json:"-"`
+	FromCache             bool        `json:"from_cache,omitempty"`
+	FromSnapshot          bool        `json:"from_snapshot,omitempty"`
+	SnapshotFiller        bool        `json:"snapshot_filler,omitempty"`
+	Provenance            string      `json:"provenance,omitempty"`
+	Source                string      `json:"source,omitempty"`
 	DiscoveredRegion      string      `json:"discovered_region,omitempty"`
 	DiscoveredLocale      string      `json:"discovered_locale,omitempty"`
 	DiscoveredTimezone    string      `json:"discovered_timezone,omitempty"`
-	SeenIn                []string    `json:"-"`
+
+	// EgressBinding is a non-secret fingerprint persisted with the quest. The
+	// raw proxy URL is kept only in memory so proxy credentials are not written
+	// to the snapshot.
+	EgressBinding string `json:"egress_binding,omitempty"`
+	EgressID      string `json:"egress_id,omitempty"`
+	EgressKey     string `json:"egress_key,omitempty"`
+	RouteKey      string `json:"route_key,omitempty"`
+	Egress        string `json:"egress,omitempty"`
+	EgressURL     string `json:"-"`
+	ProxyBinding  string `json:"proxy_binding,omitempty"`
+	Binding       string `json:"binding,omitempty"`
+	BoundProxy    string `json:"-"`
+	BoundProxyURL string `json:"-"`
+	ProxyURL      string `json:"-"`
+	Proxy         string `json:"-"`
+	Endpoint      string `json:"-"`
+	EgressBound   bool   `json:"egress_bound,omitempty"`
+	EgressPinned  bool   `json:"egress_pinned,omitempty"`
+	RequireEgress bool   `json:"require_egress,omitempty"`
+
+	SeenIn []string `json:"-"`
+}
+
+// IsSnapshotFiller reports whether a quest is display-only data restored from
+// a previous complete snapshot. Several field names are accepted because the
+// fallback marker has historically been represented in more than one form.
+func (q Quest) IsSnapshotFiller() bool {
+	return IsSnapshotFiller(q)
+}
+
+// IsSnapshotFiller reports whether q was restored from a local snapshot.
+func IsSnapshotFiller(q Quest) bool {
+	return q.FromCache || q.FromSnapshot || q.SnapshotFiller ||
+		strings.EqualFold(q.Provenance, "snapshot") ||
+		strings.EqualFold(q.Source, "snapshot") ||
+		strings.EqualFold(q.DiscoveredRegion, "CACHE")
+}
+
+// EgressInfo returns the strict routing pin remembered by a quest.
+func (q Quest) EgressInfo() RegionInfo {
+	code := strings.TrimSpace(q.DiscoveredRegion)
+	binding := q.EgressBinding
+	if binding == "" {
+		binding = q.Binding
+	}
+	if binding == "" {
+		binding = q.ProxyBinding
+	}
+	if binding == "" {
+		binding = q.EgressKey
+	}
+	if binding == "" {
+		binding = q.RouteKey
+	}
+	if binding == "" {
+		binding = q.EgressID
+	}
+	if binding == "" && q.Egress != "" && !strings.Contains(q.Egress, "://") {
+		binding = q.Egress
+	}
+	proxyURL := firstNonEmptyString(q.ProxyURL, q.EgressURL, q.Proxy, q.BoundProxyURL, q.BoundProxy, q.Endpoint)
+	if proxyURL == "" && strings.Contains(q.Egress, "://") {
+		proxyURL = q.Egress
+	}
+	info := RegionInfo{
+		Code:          code,
+		Locale:        q.DiscoveredLocale,
+		Timezone:      q.DiscoveredTimezone,
+		ProxyURL:      proxyURL,
+		BoundProxy:    proxyURL,
+		BoundProxyURL: proxyURL,
+		Binding:       binding,
+		EgressBinding: binding,
+		ProxyBinding:  binding,
+		EgressID:      q.EgressID,
+	}
+	if q.RegionProxied || proxyURL != "" || binding != "" || q.EgressBound || q.EgressPinned || q.RequireEgress {
+		info.RequireProxy = true
+		info.ProxyRequired = true
+		info.EgressRequired = true
+		info.BoundEgress = q.EgressBound
+		info.PinnedEgress = q.EgressPinned
+		info.Strict = true
+		info.Bound = true
+		info.Pinned = true
+	}
+	return info
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+// RegionInfo returns the quest's remembered region and egress pin. It is a
+// convenience alias for callers that expect the method to match the type name.
+func (q Quest) RegionInfo() RegionInfo {
+	return q.EgressInfo()
 }
 
 // QuestConfig contains campaign metadata, timeframes, and task specifications.
