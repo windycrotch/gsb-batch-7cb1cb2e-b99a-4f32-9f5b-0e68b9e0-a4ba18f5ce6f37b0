@@ -11,7 +11,7 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
  * Lesser General Public License for more details.
  *
- *=================================================================
+ *==================================================================
  * modified by fduncanh 2021-2023
  */
 
@@ -25,10 +25,29 @@
 typedef struct raop_rtp_mirror_s raop_rtp_mirror_t;
 typedef struct h264codec_s h264codec_t;
 
+/* Reasons reported through the conn_reset callback when the mirror thread
+ * drops the connection on its own initiative. Reason 1 and 2 are the
+ * historical values (1 = network problem / client gone, 2 = unsupported
+ * HLS source). Reason 3 identifies an unsupported video codec. */
+#define RAOP_MIRROR_DISCONNECT_NETWORK   1
+#define RAOP_MIRROR_DISCONNECT_BAD_CODEC 3
+
 raop_rtp_mirror_t *raop_rtp_mirror_init(logger_t *logger, raop_callbacks_t *callbacks, raop_ntp_t *ntp,
                                         const char *remote, int remotelen, const unsigned char *aeskey);
 void raop_rtp_mirror_init_aes(raop_rtp_mirror_t *raop_rtp_mirror, uint64_t *streamConnectionID);
-void raop_rtp_mirror_start(raop_rtp_mirror_t *raop_rtp_mirror, unsigned short *mirror_data_lport, uint8_t show_client_FPS_data);
+
+/* Starts the mirror receiver (listening socket + receiver thread).
+ * Returns 0 on success, -1 if the receiver is already running or if the
+ * previous thread has not yet been reaped (caller must stop/destroy first),
+ * and -2 if the listening socket could not be created. */
+int raop_rtp_mirror_start(raop_rtp_mirror_t *raop_rtp_mirror, unsigned short *mirror_data_lport,
+                          uint8_t show_client_FPS_data);
 void raop_rtp_mirror_stop(raop_rtp_mirror_t *raop_rtp_mirror);
 void raop_rtp_mirror_destroy(raop_rtp_mirror_t *raop_rtp_mirror);
+
+/* State inspection, primarily for tests. When running is 0 and joined is 1
+ * the listening socket is guaranteed to be closed. */
+int raop_rtp_mirror_is_running(raop_rtp_mirror_t *raop_rtp_mirror);
+int raop_rtp_mirror_is_joined(raop_rtp_mirror_t *raop_rtp_mirror);
+int raop_rtp_mirror_listen_socket_valid(raop_rtp_mirror_t *raop_rtp_mirror);
 #endif //RAOP_RTP_MIRROR_H

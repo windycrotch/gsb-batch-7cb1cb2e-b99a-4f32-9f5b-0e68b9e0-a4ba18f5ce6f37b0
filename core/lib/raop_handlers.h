@@ -1000,8 +1000,13 @@ raop_handler_setup(raop_conn_t *conn,
 
                 if (conn->raop_rtp_mirror) {
                     raop_rtp_mirror_init_aes(conn->raop_rtp_mirror, &stream_connection_id);
-                    raop_rtp_mirror_start(conn->raop_rtp_mirror, &dport, raop->clientFPSdata);
-                    logger_log(raop->logger, LOGGER_DEBUG, "Mirroring initialized successfully");
+                    if (raop_rtp_mirror_start(conn->raop_rtp_mirror, &dport, raop->clientFPSdata) < 0) {
+                        logger_log(raop->logger, LOGGER_ERR, "Mirroring failed to start: receiver was still "
+                                   "running or its previous thread had not been reaped; disconnecting");
+                        http_response_set_disconnect(response, 1);
+                    } else {
+                        logger_log(raop->logger, LOGGER_DEBUG, "Mirroring initialized successfully");
+                    }
                 } else {
                     logger_log(raop->logger, LOGGER_ERR, "Mirroring not initialized at SETUP, playing will fail!");
                     http_response_set_disconnect(response, 1);

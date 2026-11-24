@@ -62,19 +62,20 @@
 #define TCP_KEEPIDLE SO_KEEPALIVE
 #endif
 
-//struct h264codec_s {
-//    unsigned char compatibility;
-//    short pps_size;
-//    short sps_size;
-//    unsigned char level;
-//    unsigned char number_of_pps;
-//    unsigned char* picture_parameter_set;
-//    unsigned char profile_high;
-//    unsigned char reserved_3_and_sps;
-//    unsigned char reserved_6_and_nal;
-//    unsigned char* sequence_parameter_set;
-//    unsigned char version;
-//};
+/* Why the mirror receiver thread is leaving its main loop. Every exit path
+ * (client closed the connection, connection reset, unsupported video codec,
+ * or an explicit stop request) funnels through the same cleanup code, which
+ * closes both the per-connection socket and the listening socket, clears the
+ * running flag and notifies the upper layer exactly once. */
+typedef enum mirror_exit_reason_e {
+    MIRROR_EXIT_STOP_REQUESTED = 0,
+    MIRROR_EXIT_CLIENT_CLOSED,
+    MIRROR_EXIT_CONN_RESET,
+    MIRROR_EXIT_SELECT_ERROR,
+    MIRROR_EXIT_ACCEPT_ERROR,
+    MIRROR_EXIT_UNSUPPORTED_CODEC,
+    MIRROR_EXIT_CODEC_REJECTED
+} mirror_exit_reason_t;
 
 struct raop_rtp_mirror_s {
     logger_t *logger;
@@ -89,16 +90,33 @@ struct raop_rtp_mirror_s {
     socklen_t remote_saddr_len;
 
     /* MUTEX LOCKED VARIABLES START */
-    /* These variables only edited mutex locked */
+    /* running, joined, mirror_data_sock, video_suspended and all lifecycle
+     * transitions are only edited while run_mutex is held. */
     int running;
     int joined;
+
+    /* Set once the upper layer has been told the video stopped for the
+     * current session, so the notification is emitted exactly once no
+     * matter whether the thread or stop() initiates teardown. Reset on
+     * every successful start. */
+    int stop_notified;
+
+    /* Listening socket, -1 when no receiver is active. The receiver thread
+     * closes it as the last step of its cleanup; stop() also closes it when
+     * asking the thread to leave, so the invariant is that it is valid iff
+     * running is true. */
+    int mirror_data_sock;
+
+    /* True between a pause (0x56/0x5e codec packet) and the next resume.
+     * Guarded by run_mutex so that pause/resume callbacks can never race
+     * with thread teardown. */
+    int video_suspended;
 
     int flush;
     thread_handle_t thread_mirror;
     mutex_handle_t run_mutex;
 
     /* MUTEX LOCKED VARIABLES END */
-    int mirror_data_sock;
 
     unsigned short mirror_data_lport;
 
@@ -155,6 +173,9 @@ raop_rtp_mirror_t *raop_rtp_mirror_init(logger_t *logger, raop_callbacks_t *call
     }
     raop_rtp_mirror->running = 0;
     raop_rtp_mirror->joined = 1;
+    raop_rtp_mirror->stop_notified = 1; /* nothing running, nothing to report */
+    raop_rtp_mirror->video_suspended = 0;
+    raop_rtp_mirror->mirror_data_sock = -1;
     raop_rtp_mirror->flush = NO_FLUSH;
 
     MUTEX_CREATE(raop_rtp_mirror->run_mutex);
@@ -165,6 +186,123 @@ void
 raop_rtp_mirror_init_aes(raop_rtp_mirror_t *raop_rtp_mirror, uint64_t *streamConnectionID)
 {
     mirror_buffer_init_aes(raop_rtp_mirror->buffer, streamConnectionID);
+}
+
+/* Pause/resume callbacks are serialized with thread teardown: once the
+ * running flag is cleared, a resume packet that was already dequeued cannot
+ * flip the upper layer back to "mirroring", and a pause is suppressed when
+ * the stream is already being torn down. */
+static void
+raop_rtp_mirror_pause_locked(raop_rtp_mirror_t *raop_rtp_mirror)
+{
+    if (!raop_rtp_mirror->running || raop_rtp_mirror->video_suspended) {
+        return;
+    }
+    raop_rtp_mirror->video_suspended = 1;
+    if (raop_rtp_mirror->callbacks.video_pause) {
+        raop_rtp_mirror->callbacks.video_pause(raop_rtp_mirror->callbacks.cls);
+    }
+}
+
+static void
+raop_rtp_mirror_resume_locked(raop_rtp_mirror_t *raop_rtp_mirror)
+{
+    if (!raop_rtp_mirror->running || !raop_rtp_mirror->video_suspended) {
+        return;
+    }
+    raop_rtp_mirror->video_suspended = 0;
+    if (raop_rtp_mirror->callbacks.video_resume) {
+        raop_rtp_mirror->callbacks.video_resume(raop_rtp_mirror->callbacks.cls);
+    }
+}
+
+/* Single teardown path shared by every reason the receiver loop can end.
+ * Runs on the receiver thread itself and is responsible for:
+ *  - closing the per-connection socket,
+ *  - closing the listening socket and clearing its descriptor,
+ *  - clearing the running flag and the suspended flag,
+ *  - notifying the upper layer that the video stopped, exactly once,
+ *  - reporting the disconnect reason (network vs unsupported codec).
+ *
+ * The receiver thread is the single owner of all upper-layer stop
+ * notifications: it cannot be joined until it has returned, so notifying
+ * here can never deadlock against stop(), and both self-exit (client gone,
+ * reset, bad codec) and an explicit stop request end in exactly one
+ * notification. stop() only clears the running flag, shuts the listening
+ * socket to unblock select()/accept(), and then joins this thread. */
+static void
+raop_rtp_mirror_thread_cleanup(raop_rtp_mirror_t *raop_rtp_mirror, int stream_fd,
+                               mirror_exit_reason_t reason, int codec_unsupported)
+{
+    assert(raop_rtp_mirror);
+
+    /* Close the socket of this particular client connection first. */
+    if (stream_fd != -1) {
+        CLOSESOCKET(stream_fd);
+    }
+
+    int notify_stopped = 0;
+    int report_reason = 0;
+
+    if (codec_unsupported) {
+        report_reason = RAOP_MIRROR_DISCONNECT_BAD_CODEC;
+    } else if (reason == MIRROR_EXIT_CONN_RESET ||
+               reason == MIRROR_EXIT_SELECT_ERROR ||
+               reason == MIRROR_EXIT_ACCEPT_ERROR) {
+        report_reason = RAOP_MIRROR_DISCONNECT_NETWORK;
+    }
+
+    MUTEX_LOCK(raop_rtp_mirror->run_mutex);
+
+    /* The receiver thread is the sole owner of the single upper-layer stop
+     * notification. Two situations reach this cleanup:
+     *  - the thread decided to leave itself (running still 1): clear the
+     *    flags and notify;
+     *  - stop() asked first (running already 0): still notify here, because
+     *    stop() only joins the thread and never notifies itself.
+     * The stop_notified flag makes sure the notification fires exactly once
+     * even if the two paths race. */
+    if (raop_rtp_mirror->running) {
+        raop_rtp_mirror->running = 0;
+    }
+    if (!raop_rtp_mirror->stop_notified) {
+        notify_stopped = 1;
+        raop_rtp_mirror->stop_notified = 1;
+    }
+    raop_rtp_mirror->video_suspended = 0;
+
+    /* The listening socket must never outlive the running state. stop() may
+     * already have closed it; either way the stored descriptor is invalid
+     * from this point on. */
+    if (raop_rtp_mirror->mirror_data_sock != -1) {
+        int listen_sock = raop_rtp_mirror->mirror_data_sock;
+        raop_rtp_mirror->mirror_data_sock = -1;
+        MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
+        CLOSESOCKET(listen_sock);
+        MUTEX_LOCK(raop_rtp_mirror->run_mutex);
+    }
+
+    MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
+
+    if (notify_stopped) {
+        /* Upper layer: the video has stopped. This overrides any earlier
+         * pause notification, so a pause-then-disconnect sequence ends in
+         * "stopped", never "paused". */
+        if (raop_rtp_mirror->callbacks.mirror_video_running) {
+            raop_rtp_mirror->callbacks.mirror_video_running(raop_rtp_mirror->callbacks.cls, false);
+        }
+        if (report_reason && raop_rtp_mirror->callbacks.conn_reset) {
+            raop_rtp_mirror->callbacks.conn_reset(raop_rtp_mirror->callbacks.cls, report_reason);
+        }
+        if (codec_unsupported && raop_rtp_mirror->callbacks.video_reset) {
+            raop_rtp_mirror->callbacks.video_reset(raop_rtp_mirror->callbacks.cls,
+                                                    RESET_TYPE_RTP_SHUTDOWN);
+        }
+    }
+
+    logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG,
+               "raop_rtp_mirror receiver thread finished (exit reason %d, unsupported codec %d)",
+               (int) reason, codec_unsupported);
 }
 
 #define RAOP_PACKET_LEN 32768
@@ -183,7 +321,8 @@ raop_rtp_mirror_thread(void *arg)
     size_t sps_pps_len = 0;
     unsigned char* payload = NULL;
     unsigned int readstart = 0;
-    bool conn_reset = false;
+    mirror_exit_reason_t exit_reason = MIRROR_EXIT_STOP_REQUESTED;
+    bool codec_unsupported = false;
     uint64_t ntp_timestamp_nal = 0;
     uint64_t ntp_timestamp_raw = 0;
     uint64_t ntp_timestamp_remote = 0;
@@ -195,10 +334,8 @@ raop_rtp_mirror_thread(void *arg)
     video_codec_t codec = VIDEO_CODEC_UNKNOWN;
     const char h264[] = "h264";
     const char h265[] = "h265";
-    bool unsupported_codec = false;
-    bool video_stream_suspended = false;
     bool first_packet = true;
-    
+
     while (1) {
         fd_set rfds;
         struct timeval tv;
@@ -206,8 +343,13 @@ raop_rtp_mirror_thread(void *arg)
         if (!raop_rtp_mirror->running) {
             MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
             logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "raop_rtp_mirror->running is no longer true");
+            exit_reason = MIRROR_EXIT_STOP_REQUESTED;
             break;
         }
+        /* stop() may close the listening socket out from under select();
+         * take a local copy under the lock so the descriptor cannot be
+         * recycled while we are about to use it. */
+        int listen_sock = raop_rtp_mirror->mirror_data_sock;
         MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
 
         /* Set timeout valu to 5ms */
@@ -218,8 +360,13 @@ raop_rtp_mirror_thread(void *arg)
         FD_ZERO(&rfds);
         int nfds = 0;
         if (stream_fd == -1) {
-            FD_SET(raop_rtp_mirror->mirror_data_sock, &rfds);
-            nfds = raop_rtp_mirror->mirror_data_sock+1;
+            if (listen_sock == -1) {
+                /* stop() tore the listening socket down; leave at once. */
+                exit_reason = MIRROR_EXIT_STOP_REQUESTED;
+                break;
+            }
+            FD_SET(listen_sock, &rfds);
+            nfds = listen_sock+1;
         } else {
             FD_SET(stream_fd, &rfds);
             nfds = stream_fd+1;
@@ -232,21 +379,21 @@ raop_rtp_mirror_thread(void *arg)
             int sock_err = SOCKET_GET_ERROR();
             logger_log(raop_rtp_mirror->logger, LOGGER_ERR,
                        "raop_rtp_mirror error in select %d %s", sock_err, SOCKET_ERROR_STRING(sock_err));
+            exit_reason = MIRROR_EXIT_SELECT_ERROR;
             break;
         }
 
-        if (stream_fd == -1 &&
-	    (raop_rtp_mirror && raop_rtp_mirror->mirror_data_sock >= 0) &&
-            FD_ISSET(raop_rtp_mirror->mirror_data_sock, &rfds)) {
+        if (stream_fd == -1 && listen_sock != -1 && FD_ISSET(listen_sock, &rfds)) {
             struct sockaddr_storage saddr;
             socklen_t saddrlen = 0;
             logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "raop_rtp_mirror accepting client");
             saddrlen = sizeof(saddr);
-            stream_fd = accept(raop_rtp_mirror->mirror_data_sock, (struct sockaddr *)&saddr, &saddrlen);
+            stream_fd = accept(listen_sock, (struct sockaddr *)&saddr, &saddrlen);
             if (stream_fd == -1) {
                 int sock_err = SOCKET_GET_ERROR();
                 logger_log(raop_rtp_mirror->logger, LOGGER_ERR,
                            "raop_rtp_mirror error in accept %d %s", sock_err, SOCKET_ERROR_STRING(sock_err));
+                exit_reason = MIRROR_EXIT_ACCEPT_ERROR;
                 break;
             }
 
@@ -258,6 +405,7 @@ raop_rtp_mirror_thread(void *arg)
                 int sock_err = SOCKET_GET_ERROR();
                 logger_log(raop_rtp_mirror->logger, LOGGER_ERR,
                            "raop_rtp_mirror could not set stream socket timeout %d %s", sock_err, SOCKET_ERROR_STRING(sock_err));
+                exit_reason = MIRROR_EXIT_ACCEPT_ERROR;
                 break;
             }
 
@@ -304,15 +452,22 @@ raop_rtp_mirror_thread(void *arg)
             if (payload == NULL && ret == 0) {
                 logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG,
                            "raop_rtp_mirror tcp socket was closed by client (recv returned 0); got %d bytes of 128 byte header",readstart);
-                FD_CLR(stream_fd, &rfds);
+                /* A connection that vanished before its first full header
+                 * (a probe or an aborted reconnect) does not end the mirror
+                 * service: drop the half-open connection and go back to
+                 * accepting. A disconnect once streaming has begun is
+                 * handled below through the common teardown path. */
+                CLOSESOCKET(stream_fd);
                 stream_fd = -1;
+                readstart = 0;
+                memset(packet, 0, 128);
                 continue;
             } else if (payload == NULL && ret == -1) {
                 int sock_err = SOCKET_GET_ERROR();
                 if (sock_err == SOCKET_ERRORNAME(EAGAIN) || sock_err == SOCKET_ERRORNAME(EWOULDBLOCK)) continue; // Timeouts can happen even if the connection is fine
                 logger_log(raop_rtp_mirror->logger, LOGGER_ERR,
                            "raop_rtp_mirror error  in header recv: %d %s", sock_err, SOCKET_ERROR_STRING(sock_err));
-                if (sock_err == SOCKET_ERRORNAME(ECONNRESET)) conn_reset = true;; 
+                exit_reason = MIRROR_EXIT_CONN_RESET;
                 break;
             }
 
@@ -326,7 +481,7 @@ raop_rtp_mirror_thread(void *arg)
                 n -= 3;
                 p += 3;
             }
-	    /* include SECONDS_1900_TO_1970 in the offset adjustment */
+		    /* include SECONDS_1900_TO_1970 in the offset adjustment */
             ntp_timestamp_raw = raop_ntp_adjust_remote_timestamp_offset(raop_rtp_mirror->ntp, byteutils_get_long(packet, 8), true);
             ntp_timestamp_remote = raop_ntp_timestamp_to_nano_seconds(raop_rtp_mirror->ntp, ntp_timestamp_raw);
             if (first_packet) {
@@ -347,7 +502,7 @@ raop_rtp_mirror_thread(void *arg)
              * 0x1e 0x00 : old protocol (seen in AirMyPC) no-payload once-per-second packets     *
              * 0x16 0x01 : seen in most unencrypted h264  SPS+PPS packets                        *
              * 0x56 0x01 : unencrypted h264 SPS+PPS packets (video stream stops, client sleeps)  *
-             * 0x1e 0x01 : unencrypted h265/HEVC SPS+PPS packets                                 
+             * 0x1e 0x01 : unencrypted h265/HEVC SPS+PPS packets                                 *
              * 0x5e 0x01 : unencrypted h265 SPS+PPS packets (video stream stops, client sleeps)  */
 
             /* unencrypted packets with a SPS and a PPS NAL are sent initially, and also when a  *
@@ -376,12 +531,13 @@ raop_rtp_mirror_thread(void *arg)
 
             if (ret == 0) {
                 logger_log(raop_rtp_mirror->logger, LOGGER_ERR, "raop_rtp_mirror tcp socket was closed by client (recv returned 0)");
+                exit_reason = MIRROR_EXIT_CLIENT_CLOSED;
                 break;
             } else if (ret == -1) {
                 int sock_err = SOCKET_GET_ERROR();
                 if (sock_err == SOCKET_ERRORNAME(EAGAIN) || sock_err == SOCKET_ERRORNAME(EWOULDBLOCK)) continue; // Timeouts can happen even if the connection is fine
                 logger_log(raop_rtp_mirror->logger, LOGGER_ERR, "raop_rtp_mirror error in recv: %d %s", sock_err, SOCKET_ERROR_STRING(sock_err));
-                if (errno == SOCKET_ERRORNAME(ECONNRESET)) conn_reset = true;
+                exit_reason = MIRROR_EXIT_CONN_RESET;
                 break;
             }
 
@@ -413,13 +569,13 @@ raop_rtp_mirror_thread(void *arg)
                  *           7   Sequence parameter set (SPS)
                  *           8   Picture parameter set (PPS)
                  *
-                 * if a previous unencrypted packet contains an SPS (type 7) and PPS (type 8) NAL which has not 
-                 * yet been sent, it should be prepended to the current NAL.    The M1 Macs have increased the h264 level, 
-                 * and now the first  encrypted packet after the  unencrypted SPS+PPS packet may also contain a SEI (type 6) NAL 
+                 * if a previous unencrypted packet contains an SPS (type 7) and PPS (type 8) NAL which has not
+                 * yet been sent, it should be prepended to the current NAL.    The M1 Macs have increased the h264 level,
+                 * and now the first  encrypted packet after the  unencrypted SPS+PPS packet may also contain a SEI (type 6) NAL
                  * prepended to its VCL NAL.
                  *
-                 * A non-zero value of sps_pps_len will signal that the  previous packet contained a SPS NAL + a PPS NAL, 
-                 * that has not yet been sent.   This will trigger prepending it to the current NAL, and sps_pps_len 
+                 * A non-zero value of sps_pps_len will signal that the  previous packet contained a SPS NAL + a PPS NAL,
+                 * that has not yet been sent.   This will trigger prepending it to the current NAL, and sps_pps_len
                  * will be set to 0 after the sps_pps-prepended packet is finalized.  */
 
                 if (sps_pps_len & (ntp_timestamp_raw != ntp_timestamp_nal)) {
@@ -428,7 +584,7 @@ raop_rtp_mirror_thread(void *arg)
                                    "video payload\n%llu\n%llu , discarding", ntp_timestamp_raw, ntp_timestamp_nal);
                         sps_pps_len = 0;
                 }
-		
+
                 if (sps_pps_len) {
                     payload_out = (unsigned char*) malloc(payload_size + sps_pps_len);
                     if (!payload_out) {
@@ -488,8 +644,8 @@ raop_rtp_mirror_thread(void *arg)
                             break;
                         case 6:
                             if (logger_debug) {
-                                char *str = utils_data_to_string(payload_decrypted + nalu_size, nc_len, 16); 
-                                logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "raop_rtp_mirror SEI NAL size = %d", nc_len);		
+                                char *str = utils_data_to_string(payload_decrypted + nalu_size, nc_len, 16);
+                                logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "raop_rtp_mirror SEI NAL size = %d", nc_len);
                                 logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG,
                                            "raop_rtp_mirror h264 Supplemental Enhancement Information:\n%s", str);
                                 free(str);
@@ -497,8 +653,8 @@ raop_rtp_mirror_thread(void *arg)
                             break;
                         case 7:
                             if (logger_debug) {
-                                char *str = utils_data_to_string(payload_decrypted + nalu_size, nc_len, 16); 
-                                logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "raop_rtp_mirror SPS NAL size = %d", nc_len);		
+                                char *str = utils_data_to_string(payload_decrypted + nalu_size, nc_len, 16);
+                                logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "raop_rtp_mirror SPS NAL size = %d", nc_len);
                                 logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG,
                                            "raop_rtp_mirror h264 Sequence Parameter Set:\n%s", str);
                                 free(str);
@@ -506,8 +662,8 @@ raop_rtp_mirror_thread(void *arg)
                             break;
                         case 8:
                             if (logger_debug) {
-                                char *str = utils_data_to_string(payload_decrypted + nalu_size, nc_len, 16); 
-                                logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "raop_rtp_mirror PPS NAL size = %d", nc_len);		
+                                char *str = utils_data_to_string(payload_decrypted + nalu_size, nc_len, 16);
+                                logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "raop_rtp_mirror PPS NAL size = %d", nc_len);
                                 logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG,
                                            "raop_rtp_mirror h264 Picture Parameter Set :\n%s", str);
                                 free(str);
@@ -529,7 +685,7 @@ raop_rtp_mirror_thread(void *arg)
                     payload_out[0] = 1; /* mark video data as invalid h264 (failed decryption) */
                 }
 
-		
+
                 payload_decrypted = NULL;
                 video_decode_struct video_data;
                 video_data.is_h265 = h265_video;
@@ -551,7 +707,7 @@ raop_rtp_mirror_thread(void *arg)
                 free(payload_out);
                 break;
             case 0x01:
-                /* 128-byte observed packet header structure 
+                /* 128-byte observed packet header structure
                    bytes 0-15: length + timestamp
                    bytes 16-19 float width_source   (value is x.0000, x = unsigned short)
                    bytes 20-23 float height_source  (value is x.0000, x = unsigned short)
@@ -560,11 +716,11 @@ raop_rtp_mirror_thread(void *arg)
                    bytes 44-47 float height_source  (value is x.0000, x = unsigned short)
                    bytes 48-51 float x_offset       (value is x.0000, x = unsigned short)
                    bytes 48-51 float y_ofset        (value is x.0000, x = unsigned short)
-                   bytes 56-59 float width 
-                   bytes 60-63 float height 
-                   bytes 64-127 all 0x0 
+                   bytes 56-59 float width
+                   bytes 60-63 float height
+                   bytes 64-127 all 0x0
                 */
-	      
+
                 // The information in the payload contains an SPS and a PPS NAL
                 // The sps_pps is not encrypted
                 logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "\nReceived unencrypted codec packet from client:"
@@ -574,19 +730,19 @@ raop_rtp_mirror_thread(void *arg)
                 if (packet[6] == 0x56 || packet[6] == 0x5e) {
                     logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "This packet indicates video stream is stopping");
                 }
-                if (!video_stream_suspended && (packet[6] == 0x56 || packet[6] == 0x5e)) {
-                    video_stream_suspended = true;
-                    raop_rtp_mirror->callbacks.video_pause(raop_rtp_mirror->callbacks.cls);
-                } else if (video_stream_suspended && (packet[6] == 0x16 || packet[6] == 0x1e)) {
-                    raop_rtp_mirror->callbacks.video_resume(raop_rtp_mirror->callbacks.cls);
-                    video_stream_suspended = false;
+                MUTEX_LOCK(raop_rtp_mirror->run_mutex);
+                if (packet[6] == 0x56 || packet[6] == 0x5e) {
+                    raop_rtp_mirror_pause_locked(raop_rtp_mirror);
+                } else if (packet[6] == 0x16 || packet[6] == 0x1e) {
+                    raop_rtp_mirror_resume_locked(raop_rtp_mirror);
                 }
+                MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
 
                 assert (raop_rtp_mirror->callbacks.video_set_codec_and_size);
                 ntp_timestamp_nal = ntp_timestamp_raw;
 
                 /* these "floats" are in fact integers that fit into unsigned shorts */
-                float width_0 = byteutils_get_float(packet, 16);  
+                float width_0 = byteutils_get_float(packet, 16);
                 float height_0 = byteutils_get_float(packet, 20);
                 float width_source = byteutils_get_float(packet, 40);    // duplication of width_0
                 float height_source = byteutils_get_float(packet, 44);   // duplication of height_0
@@ -607,7 +763,11 @@ raop_rtp_mirror_thread(void *arg)
                     logger_log(raop_rtp_mirror->logger, LOGGER_ERR, "raop_rtp_mirror: received type 0x01 packet with no payload:\n"
                                "this indicates non-h264 video but Airplay features bit 42 (SupportsScreenMultiCodec) is not set\n"
                                "use startup option \"-h265\" to set this bit and support h265 (4K) video");
-                    unsupported_codec = true;
+                    /* Unsupported codec: drop the connection through the same
+                     * teardown path as a normal disconnect, tagged so the
+                     * upper layer can tell the two reasons apart. */
+                    codec_unsupported = true;
+                    exit_reason = MIRROR_EXIT_UNSUPPORTED_CODEC;
                     break;
                 }
                 /* test for a H265 VPS/SPS/PPS */
@@ -623,14 +783,16 @@ raop_rtp_mirror_thread(void *arg)
                                                                                 (unsigned short) x_offset, (unsigned short) y_offset,
                                                                                 (unsigned short) width, (unsigned short) height)  < 0) {
                             logger_log(raop_rtp_mirror->logger, LOGGER_ERR, "failed to set video codec as H265 ");
-                            /* drop connection */
-                            conn_reset = true;
+                            /* drop connection through the common teardown path */
+                            codec_unsupported = true;
+                            exit_reason = MIRROR_EXIT_CODEC_REJECTED;
                             break;
                         }
                     } else if (codec != VIDEO_CODEC_H265) {
                         logger_log(raop_rtp_mirror->logger, LOGGER_ERR, "invalid video codec change to H265: codec was set previously");
-                        /* drop connection */
-                        conn_reset = true;
+                        /* drop connection through the common teardown path */
+                        codec_unsupported = true;
+                        exit_reason = MIRROR_EXIT_CODEC_REJECTED;
                         break;
                     }
                     unsigned char vps_start_code[] = { 0xa0, 0x00, 0x01, 0x00 };
@@ -638,10 +800,12 @@ raop_rtp_mirror_thread(void *arg)
                     unsigned char pps_start_code[] = { 0xa2, 0x00, 0x01, 0x00 };
 
                     unsigned char * ptr = payload + 0x75;
- 
+
                     if (memcmp(ptr, vps_start_code, 4)) {
                         logger_log(raop_rtp_mirror->logger, LOGGER_ERR, "non-conforming HEVC VPS/SPS/PPS payload (VPS)");
-                        raop_rtp_mirror->callbacks.video_pause(raop_rtp_mirror->callbacks.cls);
+                        MUTEX_LOCK(raop_rtp_mirror->run_mutex);
+                        raop_rtp_mirror_pause_locked(raop_rtp_mirror);
+                        MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
                         break;
                     }
                     short vps_size = byteutils_get_short_be(ptr, 3);
@@ -655,7 +819,9 @@ raop_rtp_mirror_thread(void *arg)
                     ptr += vps_size;
                     if (memcmp(ptr, sps_start_code, 4)) {
                         logger_log(raop_rtp_mirror->logger, LOGGER_ERR, "non-conforming HEVC VPS/SPS/PPS payload (SPS)");
-                        raop_rtp_mirror->callbacks.video_pause(raop_rtp_mirror->callbacks.cls);
+                        MUTEX_LOCK(raop_rtp_mirror->run_mutex);
+                        raop_rtp_mirror_pause_locked(raop_rtp_mirror);
+                        MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
                         break;
                     }
                     short sps_size = byteutils_get_short_be(ptr, 3);
@@ -668,8 +834,10 @@ raop_rtp_mirror_thread(void *arg)
                     }
                     ptr += sps_size;
                     if (memcmp(ptr, pps_start_code, 4)) {
-                       logger_log(raop_rtp_mirror->logger, LOGGER_ERR, "non-conforming HEVC VPS/SPS/PPS payload (PPS)");			
-                        raop_rtp_mirror->callbacks.video_pause(raop_rtp_mirror->callbacks.cls);
+                       logger_log(raop_rtp_mirror->logger, LOGGER_ERR, "non-conforming HEVC VPS/SPS/PPS payload (PPS)");
+                        MUTEX_LOCK(raop_rtp_mirror->run_mutex);
+                        raop_rtp_mirror_pause_locked(raop_rtp_mirror);
+                        MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
                         break;
                     }
                     short pps_size = byteutils_get_short_be(ptr, 3);
@@ -689,19 +857,19 @@ raop_rtp_mirror_thread(void *arg)
                     ptr = sps_pps;
                     memcpy(ptr, nal_start_code, 4);
                     ptr += 4;
-			   
+
                     memcpy(ptr, vps, vps_size);
                     ptr += vps_size;
-			   
-                    memcpy(ptr, nal_start_code, 4);
-                    ptr += 4
-			   ;
-                    memcpy(ptr, sps, sps_size);
-                    ptr += sps_size;
-			   
+
                     memcpy(ptr, nal_start_code, 4);
                     ptr += 4;
-			   
+
+                    memcpy(ptr, sps, sps_size);
+                    ptr += sps_size;
+
+                    memcpy(ptr, nal_start_code, 4);
+                    ptr += 4;
+
                     memcpy(ptr, pps, pps_size);
                 } else {
                     if (codec == VIDEO_CODEC_UNKNOWN) {
@@ -712,14 +880,16 @@ raop_rtp_mirror_thread(void *arg)
                                                                                 (unsigned short) x_offset, (unsigned short) y_offset,
                                                                                 (unsigned short) width, (unsigned short) height)  < 0) {
                             logger_log(raop_rtp_mirror->logger, LOGGER_ERR, "failed to set video codec as H264 ");
-                            /* drop connection */
-                            conn_reset = true;
+                            /* drop connection through the common teardown path */
+                            codec_unsupported = true;
+                            exit_reason = MIRROR_EXIT_CODEC_REJECTED;
                             break;
                         }
                     } else if (codec != VIDEO_CODEC_H264) {
                         logger_log(raop_rtp_mirror->logger, LOGGER_ERR, "invalid codec change to H264: codec was set previously");
-                        /* drop connection */
-                        conn_reset = true;
+                        /* drop connection through the common teardown path */
+                        codec_unsupported = true;
+                        exit_reason = MIRROR_EXIT_CODEC_REJECTED;
                         break;
                     }
                     short sps_size = byteutils_get_short_be(payload,6);
@@ -729,11 +899,11 @@ raop_rtp_mirror_thread(void *arg)
                     int data_size = 6;
                     if (logger_debug) {
                         char *str = utils_data_to_string(payload, data_size, 16);
-                        logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "raop_rtp_mirror: SPS+PPS header size = %d", data_size);		
+                        logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "raop_rtp_mirror: SPS+PPS header size = %d", data_size);
                         logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "raop_rtp_mirror h264 SPS+PPS header:\n%s", str);
                         free(str);
                         str = utils_data_to_string(sequence_parameter_set, sps_size,16);
-                        logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "raop_rtp_mirror SPS NAL size = %d",  sps_size);		
+                        logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "raop_rtp_mirror SPS NAL size = %d",  sps_size);
                         logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "raop_rtp_mirror h264 Sequence Parameter Set:\n%s", str);
                         free(str);
                         str = utils_data_to_string(picture_parameter_set, pps_size, 16);
@@ -741,7 +911,7 @@ raop_rtp_mirror_thread(void *arg)
                         logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "raop_rtp_mirror h264 Picture Parameter Set:\n%s", str);
                         free(str);
                     }
-                    data_size = payload_size - sps_size - pps_size - 11; 
+                    data_size = payload_size - sps_size - pps_size - 11;
                     if (data_size > 0 && logger_debug) {
                         char *str = utils_data_to_string (picture_parameter_set + pps_size, data_size, 16);
                         logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "remainder size = %d", data_size);
@@ -801,7 +971,7 @@ raop_rtp_mirror_thread(void *arg)
                     //char *str = utils_data_to_string(packet, 128, 16);
                     //logger_log(raop_rtp_mirror->logger, LOGGER_WARNING, "type 5 video packet header:\n%s", str);
                     //free (str);
-		    
+
                     int plist_size = payload_size;
                     if (payload_size > 25000) {
                         plist_size = payload_size - 25000;
@@ -836,34 +1006,14 @@ raop_rtp_mirror_thread(void *arg)
             payload = NULL;
             memset(packet, 0, 128);
             readstart = 0;
-            if (unsupported_codec) {
+            if (codec_unsupported) {
                 break;
             }
         }
     }
-    /* Close the stream file descriptor */
-    if (stream_fd != -1) {
-        CLOSESOCKET(stream_fd);
-    }
 
-    // Ensure running reflects the actual state
-    MUTEX_LOCK(raop_rtp_mirror->run_mutex);
-    raop_rtp_mirror->running = false;
-    MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
-    if (raop_rtp_mirror->callbacks.mirror_video_running) {
-        raop_rtp_mirror->callbacks.mirror_video_running(raop_rtp_mirror->callbacks.cls, false);
-    }
-
-    logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "raop_rtp_mirror exiting TCP thread");
-    if (conn_reset&& raop_rtp_mirror->callbacks.conn_reset) {
-        raop_rtp_mirror->callbacks.conn_reset(raop_rtp_mirror->callbacks.cls, 1);
-    }
-
-    if (unsupported_codec) {
-        CLOSESOCKET(raop_rtp_mirror->mirror_data_sock);
-        raop_rtp_mirror_stop(raop_rtp_mirror);
-        raop_rtp_mirror->callbacks.video_reset(raop_rtp_mirror->callbacks.cls, RESET_TYPE_RTP_SHUTDOWN);
-    }
+    free(payload);
+    raop_rtp_mirror_thread_cleanup(raop_rtp_mirror, stream_fd, exit_reason, codec_unsupported);
 
     return 0;
 }
@@ -898,69 +1048,108 @@ raop_rtp_mirror_init_socket(raop_rtp_mirror_t *raop_rtp_mirror, int use_ipv6)
     return -1;
 }
 
-void
+int
 raop_rtp_mirror_start(raop_rtp_mirror_t *raop_rtp_mirror, unsigned short *mirror_data_lport,
                       uint8_t show_client_FPS_data)
 {
+    assert(raop_rtp_mirror);
+    assert(mirror_data_lport);
+
     logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "raop_rtp_mirror starting mirroring");
     int use_ipv6 = 0;
 
-    assert(raop_rtp_mirror);
-    assert(mirror_data_lport);
     raop_rtp_mirror->show_client_FPS_data = show_client_FPS_data;
 
     MUTEX_LOCK(raop_rtp_mirror->run_mutex);
+    /* Refuse while a receiver is running or while a previous receiver
+     * thread has exited but not yet been reaped: starting another thread
+     * here would orphan the old one and leak its socket. */
     if (raop_rtp_mirror->running || !raop_rtp_mirror->joined) {
         MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
-        return;
+        logger_log(raop_rtp_mirror->logger, LOGGER_WARNING,
+                   "raop_rtp_mirror start refused: receiver already running or thread not yet joined");
+        return -1;
     }
+    /* Invariant: not running and joined means the listening socket is gone. */
+    assert(raop_rtp_mirror->mirror_data_sock == -1);
 
     if (raop_rtp_mirror->remote_saddr.ss_family == AF_INET6) {
         use_ipv6 = 1;
     }
-    //use_ipv6 = 0;
-     
+
     raop_rtp_mirror->mirror_data_lport = *mirror_data_lport;
     if (raop_rtp_mirror_init_socket(raop_rtp_mirror, use_ipv6) < 0) {
         logger_log(raop_rtp_mirror->logger, LOGGER_ERR, "raop_rtp_mirror initializing socket failed");
+        raop_rtp_mirror->mirror_data_sock = -1;
         MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
-        return;
+        return -2;
     }
     *mirror_data_lport = raop_rtp_mirror->mirror_data_lport;
 
     /* Create the thread and initialize running values */
     raop_rtp_mirror->running = 1;
     raop_rtp_mirror->joined = 0;
+    raop_rtp_mirror->stop_notified = 0;
+    raop_rtp_mirror->video_suspended = 0;
+
+    THREAD_CREATE(raop_rtp_mirror->thread_mirror, raop_rtp_mirror_thread, raop_rtp_mirror);
+    if (raop_rtp_mirror->thread_mirror == 0) {
+        /* Thread creation failed: roll back to the fully stopped state
+         * instead of leaving running set with no thread to clear it. */
+        int sock = raop_rtp_mirror->mirror_data_sock;
+        raop_rtp_mirror->mirror_data_sock = -1;
+        raop_rtp_mirror->running = 0;
+        raop_rtp_mirror->joined = 1;
+        MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
+        CLOSESOCKET(sock);
+        logger_log(raop_rtp_mirror->logger, LOGGER_ERR, "raop_rtp_mirror failed to create receiver thread");
+        return -2;
+    }
+
     if (raop_rtp_mirror->callbacks.mirror_video_running) {
         raop_rtp_mirror->callbacks.mirror_video_running(raop_rtp_mirror->callbacks.cls, true);
     }
-
-    THREAD_CREATE(raop_rtp_mirror->thread_mirror, raop_rtp_mirror_thread, raop_rtp_mirror);
     MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
+    return 0;
 }
 
 void raop_rtp_mirror_stop(raop_rtp_mirror_t *raop_rtp_mirror) {
     assert(raop_rtp_mirror);
 
-    /* Check that we are running and thread is not
-     * joined (should never be while still running) */
     MUTEX_LOCK(raop_rtp_mirror->run_mutex);
-    if (!raop_rtp_mirror->running || raop_rtp_mirror->joined) {
+
+    /* Idempotent fast path: fully stopped and reaped, or never started.
+     * A repeated stop returns immediately without blocking, touching any
+     * socket or notifying the upper layer again. */
+    if (raop_rtp_mirror->joined) {
         MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
         return;
     }
+
+    /* Reachable states here:
+     *  - running=1, joined=0: request the receiver thread to leave and
+     *    shut the listening socket so a blocked select()/accept() returns;
+     *  - running=0, joined=0: the thread already exited on its own (client
+     *    gone, reset, unsupported codec) and is simply waiting to be reaped.
+     */
     raop_rtp_mirror->running = 0;
+    int listen_sock = raop_rtp_mirror->mirror_data_sock;
+    raop_rtp_mirror->mirror_data_sock = -1;
+    thread_handle_t thread = raop_rtp_mirror->thread_mirror;
+
     MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
 
-    /* Join the thread */
-    THREAD_JOIN(raop_rtp_mirror->thread_mirror);
-
-    if (raop_rtp_mirror->mirror_data_sock != -1) {
-        CLOSESOCKET(raop_rtp_mirror->mirror_data_sock);
-        raop_rtp_mirror->mirror_data_sock = -1;
+    if (listen_sock != -1) {
+        CLOSESOCKET(listen_sock);
     }
 
-    /* Mark thread as joined */
+    /* Reap the receiver thread. Its single, idempotent cleanup tolerates
+     * the listening socket already being closed, owns the upper-layer stop
+     * notification and closes the per-connection socket. The join can never
+     * wait on a thread that is waiting on us: the socket shutdown above
+     * unblocks its select(), and no callback ever calls stop(). */
+    THREAD_JOIN(thread);
+
     MUTEX_LOCK(raop_rtp_mirror->run_mutex);
     raop_rtp_mirror->joined = 1;
     MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
@@ -971,6 +1160,36 @@ void raop_rtp_mirror_destroy(raop_rtp_mirror_t *raop_rtp_mirror) {
         raop_rtp_mirror_stop(raop_rtp_mirror);
         MUTEX_DESTROY(raop_rtp_mirror->run_mutex);
         mirror_buffer_destroy(raop_rtp_mirror->buffer);
-	free(raop_rtp_mirror);
+        free(raop_rtp_mirror);
     }
+}
+
+int
+raop_rtp_mirror_is_running(raop_rtp_mirror_t *raop_rtp_mirror)
+{
+    assert(raop_rtp_mirror);
+    MUTEX_LOCK(raop_rtp_mirror->run_mutex);
+    int running = raop_rtp_mirror->running;
+    MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
+    return running;
+}
+
+int
+raop_rtp_mirror_is_joined(raop_rtp_mirror_t *raop_rtp_mirror)
+{
+    assert(raop_rtp_mirror);
+    MUTEX_LOCK(raop_rtp_mirror->run_mutex);
+    int joined = raop_rtp_mirror->joined;
+    MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
+    return joined;
+}
+
+int
+raop_rtp_mirror_listen_socket_valid(raop_rtp_mirror_t *raop_rtp_mirror)
+{
+    assert(raop_rtp_mirror);
+    MUTEX_LOCK(raop_rtp_mirror->run_mutex);
+    int valid = (raop_rtp_mirror->mirror_data_sock != -1);
+    MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
+    return valid;
 }

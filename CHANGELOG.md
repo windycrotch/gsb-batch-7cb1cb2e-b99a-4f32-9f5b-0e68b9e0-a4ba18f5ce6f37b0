@@ -5,6 +5,19 @@ All notable changes to **UxPlay Desktop** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Mirror Receiver Lifecycle State Consistency**: Reworked the AirPlay mirror receiver start/stop/thread-exit paths so the "running" flag, the joined receiver thread and the listening socket always converge together. A receiver thread that exits because the client closed the stream, the connection was reset, an unsupported video codec was offered, or an explicit stop was requested now closes both the per-connection socket and the listening socket, clears the running flag and notifies the upper layer exactly once through a single teardown path.
+- **Repeated Stop Safety**: `stop` is fully idempotent — repeated calls return immediately without blocking, re-notifying the upper layer or touching released sockets, and can no longer deadlock against a thread that is itself shutting down.
+- **Restart Guard**: Starting the receiver while it is running, or while a previously exited receiver thread has not yet been reaped, is now rejected (and disconnects the request) instead of orphaning a thread and leaking a socket/port.
+- **Pause/Resume vs. Disconnect Races**: Pause and resume callbacks are serialized with thread teardown. A pause followed by a disconnect now always ends in "stopped" (never stuck on "paused"), and a resume packet processed during the disconnect window can no longer flip the state back to "mirroring".
+- **Unsupported Codec Disconnect Reason**: When the receiver drops a connection because the client offered an unsupported/rejected video codec, it goes through the same teardown path as a normal disconnect and reports a distinct reason code (`conn_reset` reason 3) so the upper layer can tell the two cases apart.
+- **Half-Open Connection Robustness**: A client that connects and vanishes before sending a full packet header no longer tears down the whole mirror service; the receiver drops the half-open connection and returns to accepting.
+
+### Added
+- **Native Mirror Receiver Lifecycle Tests**: Added 13 automated C tests under `tests/mirror_receiver_tests` that drive the real receiver thread over loopback TCP (no iPad, Bonjour or GStreamer required), covering start/stop, idempotent stop, restart refusal, client close, connection reset, unsupported/rejected codec, pause-then-disconnect, late-resume-after-disconnect, port release and repeated lifecycle cycles. Wired into the CI build.
+
 ## [1.2.5] - 2026-11-24
 
 ### Added

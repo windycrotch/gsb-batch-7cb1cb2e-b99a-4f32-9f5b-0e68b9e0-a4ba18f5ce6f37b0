@@ -82,8 +82,10 @@ public class LogParser : ILogParser
                  trimmed.Contains("video_reset", StringComparison.OrdinalIgnoreCase) ||
                  trimmed.Contains("TEARDOWN", StringComparison.OrdinalIgnoreCase) ||
                  trimmed.Contains("lost connection with client", StringComparison.OrdinalIgnoreCase) ||
+                 trimmed.Contains("stopped mirroring: client offered an unsupported video codec", StringComparison.OrdinalIgnoreCase) ||
                  trimmed.Contains("tcp socket was closed by client", StringComparison.OrdinalIgnoreCase) ||
                  trimmed.Contains("running is no longer true", StringComparison.OrdinalIgnoreCase) ||
+                 trimmed.Contains("receiver thread finished", StringComparison.OrdinalIgnoreCase) ||
                  trimmed.Contains("Connection closed on socket", StringComparison.OrdinalIgnoreCase) ||
                  trimmed.Contains("Disconnecting on software request", StringComparison.OrdinalIgnoreCase) ||
                  trimmed.Contains("client HTTP request POST stop", StringComparison.OrdinalIgnoreCase) ||

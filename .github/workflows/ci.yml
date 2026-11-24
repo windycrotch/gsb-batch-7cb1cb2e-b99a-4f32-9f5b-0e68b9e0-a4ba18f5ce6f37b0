@@ -78,6 +78,10 @@ jobs:
         cmake -S core -B core/build -G Ninja -DCMAKE_BUILD_TYPE=Release
         cmake --build core/build
 
+    - name: Run Mirror Receiver Lifecycle Tests
+      shell: msys2 {0}
+      run: bash tests/mirror_receiver_tests/build_and_test.sh
+
     - name: Setup .NET 8 SDK
       uses: actions/setup-dotnet@v4
       with:

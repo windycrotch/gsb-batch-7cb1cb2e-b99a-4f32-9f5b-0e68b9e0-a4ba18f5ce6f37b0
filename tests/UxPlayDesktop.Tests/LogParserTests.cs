@@ -129,6 +129,27 @@ public class LogParserTests
     }
 
     [Fact]
+    public void ParseLine_UnsupportedCodecStop_SetsDisconnectedFlag()
+    {
+        var line = "*** ERROR stopped mirroring: client offered an unsupported video codec";
+        var result = _parser.ParseLine(line);
+
+        Assert.True(result.ClientDisconnected);
+        Assert.Equal(ServerState.Listening, result.NewState);
+        Assert.Equal(LogLevel.Error, result.LogEntry.Level);
+    }
+
+    [Fact]
+    public void ParseLine_ReceiverThreadFinished_SetsDisconnectedFlag()
+    {
+        var line = "raop_rtp_mirror receiver thread finished (exit reason 2, unsupported codec 1)";
+        var result = _parser.ParseLine(line);
+
+        Assert.True(result.ClientDisconnected);
+        Assert.Equal(ServerState.Listening, result.NewState);
+    }
+
+    [Fact]
     public void ParseLine_ConnectionClosedOnSocket_SetsDisconnectedFlag()
     {
         var line = "Connection closed on socket 10396";

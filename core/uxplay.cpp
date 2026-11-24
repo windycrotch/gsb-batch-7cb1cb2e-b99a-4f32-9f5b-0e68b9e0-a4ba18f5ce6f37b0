@@ -2848,7 +2848,10 @@ extern "C" void conn_reset (void *cls, int reason) {
 	break;
     case 2:
         LOGI("*** ERROR Unsupported HLS streaming source: (exit attempt to stream)");
-	break;      
+	break;
+    case 3:
+        LOGI("*** ERROR stopped mirroring: client offered an unsupported video codec");
+	break;
     default:
       break;
     }
