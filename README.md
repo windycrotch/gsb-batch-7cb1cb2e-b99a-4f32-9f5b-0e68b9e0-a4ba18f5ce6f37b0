@@ -165,6 +165,9 @@ compose.yaml       The media engine and the server for Docker, plus the model se
   starts at the first comma or after a few words, while the sentence goes on.
   Translating a sentence in pieces can read less naturally than in one go.
 - When both participants pick the same language the audio is relayed untouched.
+- You can change the language you speak during a call with the **I speak**
+  selector: the translation streams for both directions are replaced at once,
+  and whatever the old ones were still saying is dropped.
 - While your translation is playing to the other person, your microphone is
   silenced, so two devices in the same room cannot feed each other's voice
   back in a loop. Wait for it to finish before going on. **Headphones** turns

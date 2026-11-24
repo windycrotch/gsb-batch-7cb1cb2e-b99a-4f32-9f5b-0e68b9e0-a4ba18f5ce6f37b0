@@ -100,7 +100,9 @@ button.danger { border-color: var(--danger); color: var(--danger); }
 .link input { flex: 1; min-width: 0; font-size: 0.85rem; }
 
 .bar strong { display: block; font-size: 1.1rem; }
-.actions { display: flex; gap: 0.5rem; }
+.actions { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+.picker { display: flex; align-items: center; gap: 0.4rem; font-size: 0.8rem; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); }
+.picker select { padding: 0.45rem 0.5rem; font-size: 0.85rem; text-transform: none; letter-spacing: normal; }
 #status { min-height: 1.5rem; font-size: 0.9rem; }
 
 #captions {

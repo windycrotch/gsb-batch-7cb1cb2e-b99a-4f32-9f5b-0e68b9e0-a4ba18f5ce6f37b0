@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.9.0
+
+- Change the language you speak during a call. The call bar gains an **I
+  speak** selector, backed by a new `lang` signalling message answered with a
+  `lang` event for both participants.
+- Exactly one translation stream is in effect per direction at any moment.
+  Joining, leaving, changing language, toggling headphones and the engine
+  coming back all replace the affected streams; a replaced stream is retired
+  whole, so speech and captions it still returns are neither delivered nor
+  counted. If the engine refuses the new pair, the direction stays bare and
+  the next change tries again. Concurrent changes in one room settle on the
+  last pairing. On shutdown every stream is asked to finish and no room writes
+  to a session that is already closed.
+
 ## 0.8.0
 
 - Model profiles pick every model in one setting: `light` (whisper base,

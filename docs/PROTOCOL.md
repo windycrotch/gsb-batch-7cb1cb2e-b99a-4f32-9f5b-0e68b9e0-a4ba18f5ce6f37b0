@@ -74,6 +74,7 @@ same origin as the page unless the server was started with `-allow-origin`.
 ```json
 {"type": "join", "room": "3f9c…", "lang": "fr", "name": "Em", "token": "tqk2a8.Jdy…"}
 {"type": "offer", "sdp": "…"}
+{"type": "lang", "lang": "es"}
 {"type": "same-room", "sameRoom": true}
 {"type": "headphones", "headphones": true}
 {"type": "leave"}
@@ -90,7 +91,16 @@ offer by default; same room mode needs it. `same-room` turns that mode on or
 off for both participants. `headphones` does the same for headphones mode: the
 server reopens the translation streams with the early flag and stops the echo
 guard, which would otherwise silence the speaker while the start of their
-sentence is already playing.
+sentence is already playing. `lang` changes the language this participant
+speaks, mid-call; the server replaces the translation streams for both
+directions and tells everyone with a `lang` event. An unsupported language is
+answered with an `error` and changes nothing.
+
+Whatever causes it — a join, a leave, a language change, a headphones toggle, a
+media engine reconnect — the room keeps exactly one translation stream in
+effect per direction, matching the current pairing. The stream being replaced
+is closed on the engine side, and anything it still returns (speech or
+captions) is dropped and left out of the counters.
 
 ### Server → client
 
@@ -102,6 +112,7 @@ sentence is already playing.
 {"type": "answer", "sdp": "…"}
 {"type": "peer-joined", "peer": {"id": "41aa…", "name": "Bob", "lang": "en"}}
 {"type": "peer-left", "id": "41aa…"}
+{"type": "lang", "id": "9f2c…", "lang": "es"}
 {"type": "caption", "from": "9f2c…", "kind": "source", "utterance": 3, "final": false, "text": "bonjour à"}
 {"type": "caption", "from": "9f2c…", "kind": "translation", "utterance": 3, "final": false, "text": "hello to"}
 {"type": "caption", "from": "9f2c…", "kind": "source", "utterance": 3, "final": true, "text": "bonjour à tous"}
@@ -116,7 +127,8 @@ sentence is already playing.
 to both participants; `from` is the speaker. A caption with `"final": false` is
 a live draft that the next caption for the same `from`, `utterance` and `kind`
 replaces. `same-room` and `headphones` tell both participants that one of them changed
-that mode. `media` announces that the translation engine went away or came back.
+that mode. `lang` says that `id` now speaks `lang`, so both sides can relabel
+the call. `media` announces that the translation engine went away or came back.
 
 A join that cannot be honoured (missing, forged or expired invitation, full
 room, room limit, invalid name or language) gets an `error` and the socket is closed with status 1008. Errors after joining

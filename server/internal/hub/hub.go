@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -197,9 +198,31 @@ func New(cfg Config) (*Hub, error) {
 
 func (h *Hub) Close() {
 	h.stop()
+	// Retire the streams before waiting out the sessions: the engine link is
+	// still up, so its Close frames can be delivered, and no room can post to
+	// a session once its peers are marked closed.
+	h.closeRooms()
 	h.sessions.Wait()
 	if h.mux != nil {
 		_ = h.mux.Close()
+	}
+}
+
+// closeRooms ends every remaining stream and stops the rooms from writing to
+// sessions that are already over.
+func (h *Hub) closeRooms() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for id, room := range h.rooms {
+		room.mu.Lock()
+		for _, peer := range room.peers {
+			peer.closed.Store(true)
+			room.retire(peer)
+		}
+		room.peers = nil
+		room.floor = nil
+		room.mu.Unlock()
+		delete(h.rooms, id)
 	}
 }
 
@@ -311,11 +334,9 @@ func (h *Hub) leave(peer *Peer) {
 	room.mu.Lock()
 	index := slices.Index(room.peers, peer)
 	if index >= 0 {
+		peer.closed.Store(true)
 		room.peers = slices.Delete(room.peers, index, index+1)
-		if peer.stream != nil {
-			go peer.stream.Close()
-			peer.stream, peer.streamTo = nil, nil
-		}
+		room.retire(peer)
 		if room.floor == peer {
 			room.floor = nil
 		}
@@ -347,6 +368,13 @@ func (h *Hub) mediaChanged(connected bool) {
 	status := message{Type: "media", Connected: &connected, Backend: h.cfg.Link.Backend()}
 	for _, room := range rooms {
 		room.mu.Lock()
+		// Streams belong to the connection they were opened on. When it goes
+		// away every direction is bare; when it comes back every room builds a
+		// fresh set for the pairing as it stands now. Either way the bridges
+		// the old connection left behind must never deliver again.
+		for _, peer := range room.peers {
+			room.retire(peer)
+		}
 		if connected {
 			room.rewire()
 		}
@@ -397,32 +425,77 @@ func (r *Room) other(p *Peer) *Peer {
 	return nil
 }
 
-// rewire makes each peer's engine stream match the current pairing. The caller holds r.mu.
+// setLang changes one participant's language and rebuilds the streams that
+// depended on the old pairing. An unsupported language changes nothing.
+func (r *Room) setLang(p *Peer, lang string) error {
+	if !slices.Contains(Languages, lang) {
+		return fmt.Errorf("%w: %q", ErrBadLanguage, lang)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if p.Lang == lang {
+		return nil
+	}
+	p.Lang = lang
+	r.rewire()
+	for _, peer := range r.peers {
+		peer.notify(message{Type: "lang", ID: p.ID, Lang: lang})
+	}
+	r.hub.log.Info("peer changed language", "room", r.id, "peer", p.ID, "lang", lang)
+	return nil
+}
+
+// retire takes the peer's current translation stream out of effect: from the
+// moment it returns, the bridge delivers nothing more and counts nothing more,
+// and the engine is asked to finish the stream. Taking b.mu after setting the
+// flag waits out a callback that is already delivering, so no stale speech or
+// caption can land after the new stream is installed.
+func (r *Room) retire(p *Peer) {
+	b := p.stream
+	if b == nil {
+		return
+	}
+	p.stream = nil
+	b.retired.Store(true)
+	b.mu.Lock()
+	b.mu.Unlock()
+	if b.stream != nil {
+		go b.stream.Close()
+	}
+}
+
+// rewire makes each peer's engine stream match the current pairing. The caller
+// holds r.mu. Old streams are retired before new ones are opened, so the two
+// can never both be in effect. A stream that cannot be opened leaves its
+// direction bare until the next change tries again.
 func (r *Room) rewire() {
 	for _, p := range r.peers {
 		other := r.other(p)
-		translate := other != nil && other.Lang != p.Lang
-		if p.stream != nil && (!translate || p.streamTo != other || p.streamEarly != r.headphones) {
-			go p.stream.Close()
-			p.stream, p.streamTo = nil, nil
+		wanted := other != nil && other.Lang != p.Lang
+		if b := p.stream; b != nil &&
+			(!wanted || b.to != other || b.source != p.Lang || b.target != other.Lang || b.early != r.headphones) {
+			r.retire(p)
 		}
-		if !translate || p.stream != nil {
+		if !wanted || p.stream != nil {
 			continue
 		}
-		b := &bridge{room: r, from: p, to: other}
+		b := &bridge{room: r, from: p, to: other, source: p.Lang, target: other.Lang, early: r.headphones}
 		stream, err := r.hub.cfg.Link.Open(p.Lang, other.Lang, r.headphones, b)
 		if err != nil {
 			r.hub.log.Warn("cannot open translation stream", "room", r.id, "peer", p.ID, "error", err)
 			continue
 		}
 		b.stream = stream
-		p.stream, p.streamTo, p.streamEarly = stream, other, r.headphones
+		p.stream = b
 	}
 }
 
 func (r *Room) route(from *Peer, sequence uint16, payload []byte, level int) {
 	r.mu.Lock()
-	other, stream, guard := r.other(from), from.stream, r.hub.cfg.EchoGuard && !r.headphones
+	other := r.other(from)
+	direct := other != nil && other.Lang == from.Lang
+	stream := from.stream
+	guard := r.hub.cfg.EchoGuard && !r.headphones
 	if r.sameRoom && !r.hasFloor(from, level, time.Now()) {
 		payload = silentFrame
 		r.hub.floorMuted.Inc()
@@ -432,7 +505,7 @@ func (r *Room) route(from *Peer, sequence uint16, payload []byte, level int) {
 
 	switch {
 	case other == nil:
-	case other.Lang == from.Lang:
+	case direct:
 		other.writeSample(payload)
 		r.hub.packetsDirect.Inc()
 	case stream != nil:
@@ -440,27 +513,66 @@ func (r *Room) route(from *Peer, sequence uint16, payload []byte, level int) {
 			payload = silentFrame
 			r.hub.muted.Inc()
 		}
-		stream.Write(sequence, payload)
-		r.hub.packetsEngine.Inc()
+		// Hold the bridge for the write so a stream retired concurrently
+		// cannot receive another packet after it stopped being in effect.
+		stream.mu.Lock()
+		if !stream.retired.Load() {
+			stream.stream.Write(sequence, payload)
+			r.hub.packetsEngine.Inc()
+		}
+		stream.mu.Unlock()
 	}
 }
 
+// bridge carries one direction of a call: one speaker's audio into the engine,
+// the translation and captions back out. A bridge is never patched in place;
+// when the pairing changes the room retires it and builds another, and a
+// retired bridge delivers nothing and counts nothing.
 type bridge struct {
 	room   *Room
 	from   *Peer
 	to     *Peer
+	source string
+	target string
+	early  bool
 	stream *medialink.Stream
+
+	// retired is set once, before the stream is asked to close. mu makes the
+	// flag a barrier: retire waits for it, so a callback either sees retired
+	// or finishes before retire returns and nothing of this bridge is in
+	// flight afterwards.
+	retired atomic.Bool
+	mu      sync.Mutex
+}
+
+// active reports whether this bridge is still the one the room routes through.
+// Only the flag is consulted: the room sets it before it lets go of the
+// bridge, so a callback that sees it clear has nothing left to do, and a
+// callback that does not is finished before the flag is relied upon (retire
+// waits on mu).
+func (b *bridge) active() bool {
+	return !b.retired.Load()
 }
 
 // While the listener plays the translation, the speaker's microphone may pick
 // it up from the listener's loudspeaker and send it round again.
 func (b *bridge) OnSpeech(packet []byte) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.active() {
+		return
+	}
 	b.from.quietUntil.Store(time.Now().Add(opusDuration(packet) + echoTail).UnixNano())
 	b.to.writeSample(packet)
 	b.room.hub.speechOut.Inc()
 }
 
 func (b *bridge) OnCaption(kind captionKind, utterance uint32, text string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.active() {
+		return
+	}
 	final := !kind.Partial()
 	caption := message{Type: "caption", From: b.from.ID, Kind: kind.String(), Utterance: &utterance, Final: &final, Text: text}
 	b.from.notify(caption)
@@ -473,15 +585,23 @@ func (b *bridge) OnCaption(kind captionKind, utterance uint32, text string) {
 }
 
 func (b *bridge) OnError(text string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.active() {
+		return
+	}
 	b.room.hub.log.Warn("translation error", "room", b.room.id, "peer", b.from.ID, "error", text)
 	b.from.notify(message{Type: "error", Message: text})
 }
 
+// OnClosed is called by the engine link when the stream is gone. It must not
+// take b.mu: retire holds b.mu only to wait out a delivery, never across this.
 func (b *bridge) OnClosed() {
 	b.room.mu.Lock()
 	defer b.room.mu.Unlock()
-	if b.from.stream == b.stream {
-		b.from.stream, b.from.streamTo = nil, nil
+	b.retired.Store(true)
+	if b.from.stream == b {
+		b.from.stream = nil
 	}
 }
 

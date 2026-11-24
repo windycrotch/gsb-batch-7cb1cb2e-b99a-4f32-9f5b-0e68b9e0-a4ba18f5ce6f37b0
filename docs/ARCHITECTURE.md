@@ -120,9 +120,12 @@ dependencies stay out of the Rust link line.
 
 ## The server
 
-- **Rooms** hold at most two peers. Whenever membership or the engine link
-  changes, the room recomputes which translation streams should exist and opens
-  or closes them to match.
+- **Rooms** hold at most two peers. Whenever membership, a participant's
+  language, a mode, or the engine link changes, the room recomputes which
+  translation streams should exist and opens or closes them to match. A
+  replaced stream is retired as a unit: the room drops its handler first, so
+  speech and captions the engine still returns from it are neither delivered
+  nor counted, and only then asks the engine to finish it.
 - **Signalling** is one WebSocket per participant: `join`, one `offer`/`answer`
   exchange with complete ICE candidates, then events. See
   [PROTOCOL.md](PROTOCOL.md).

@@ -10,7 +10,6 @@ import (
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 
-	"github.com/whispem/ambivox/server/internal/medialink"
 	"github.com/whispem/ambivox/server/internal/protocol"
 )
 
@@ -70,25 +69,33 @@ type Peer struct {
 	send chan []byte
 
 	quietUntil atomic.Int64
+	closed     atomic.Bool
 
-	mu  sync.Mutex
-	pc  *webrtc.PeerConnection
-	out *webrtc.TrackLocalStaticSample
+	// out is read on the audio path without taking p.mu, which a negotiation
+	// holds for as long as ICE gathering takes.
+	out atomic.Pointer[webrtc.TrackLocalStaticSample]
 
-	// Guarded by room.mu.
-	stream      *medialink.Stream
-	streamTo    *Peer
-	streamEarly bool
-	level       int
-	levelAt     time.Time
+	mu sync.Mutex
+	pc *webrtc.PeerConnection
+
+	// Guarded by room.mu. stream is the one translation stream currently in
+	// effect for this peer's microphone; the whole bridge is replaced whenever
+	// the pairing changes, so a retired bridge can never deliver anything.
+	stream  *bridge
+	level   int
+	levelAt time.Time
 }
 
 func (p *Peer) info() *peerInfo {
 	return &peerInfo{ID: p.ID, Name: p.Name, Lang: p.Lang}
 }
 
-// notify queues a signalling message; a peer too slow to drain its queue loses it.
+// notify queues a signalling message; a peer too slow to drain its queue loses
+// it, and a peer whose session is over is not written to at all.
 func (p *Peer) notify(m message) {
+	if p.closed.Load() {
+		return
+	}
 	data, err := json.Marshal(m)
 	if err != nil {
 		return
@@ -100,10 +107,9 @@ func (p *Peer) notify(m message) {
 }
 
 func (p *Peer) writeSample(payload []byte) {
-	p.mu.Lock()
-	out := p.out
-	p.mu.Unlock()
-	if out != nil {
+	// The outgoing track is swapped atomically so the audio path never waits
+	// on p.mu, which a negotiation holds for as long as gathering takes.
+	if out := p.out.Load(); out != nil {
 		_ = out.WriteSample(media.Sample{Data: payload, Duration: opusDuration(payload)})
 	}
 }
@@ -180,14 +186,16 @@ func (p *Peer) negotiate(offer string, onFail func()) (string, error) {
 		return fail(ErrShuttingDown)
 	}
 
-	p.pc, p.out = pc, out
+	p.pc = pc
+	p.out.Store(out)
 	return pc.LocalDescription().SDP, nil
 }
 
 func (p *Peer) closeConnection() {
 	p.mu.Lock()
 	pc := p.pc
-	p.pc, p.out = nil, nil
+	p.pc = nil
+	p.out.Store(nil)
 	p.mu.Unlock()
 	if pc != nil {
 		_ = pc.Close()

@@ -57,6 +57,23 @@ function send(message) {
   if (state.ws?.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify(message));
 }
 
+const LANGUAGE_NAMES = { en: 'English', fr: 'Français', es: 'Español', it: 'Italiano' };
+
+function fillLanguages(languages) {
+  const select = $('call-lang');
+  if (!languages?.length || select.options.length) return;
+  for (const code of languages) {
+    const option = document.createElement('option');
+    option.value = code;
+    option.textContent = LANGUAGE_NAMES[code] ?? code;
+    select.append(option);
+  }
+}
+
+$('call-lang').addEventListener('change', () => {
+  send({ type: 'lang', lang: $('call-lang').value });
+});
+
 function addCaption({ from, kind, utterance, text, final = true }) {
   const id = `caption-${from}-${utterance}`;
   let item = document.getElementById(id);
@@ -113,6 +130,12 @@ async function connect(iceServers) {
   send({ type: 'offer', sdp: pc.localDescription.sdp });
 }
 
+function setLang(lang) {
+  $('call-lang').value = lang;
+  if (state.me) state.me.lang = lang;
+  if (state.peer) $('peer-label').textContent = `Talking with ${state.peer.name} (${state.peer.lang})`;
+}
+
 async function handle(message) {
   switch (message.type) {
     case 'joined':
@@ -120,6 +143,8 @@ async function handle(message) {
       showSameRoom(message.sameRoom);
       showHeadphones(message.headphones);
       setPeer(message.peer ?? null);
+      fillLanguages(message.languages);
+      setLang(message.lang);
       setStatus(message.connected ? `Translation engine: ${message.backend}` : 'Translation engine offline');
       await connect(message.iceServers ?? []);
       break;
@@ -129,6 +154,13 @@ async function handle(message) {
     case 'peer-joined':
       showError('');
       setPeer(message.peer);
+      break;
+    case 'lang':
+      if (state.me && state.me.id === message.id) setLang(message.lang);
+      else if (state.peer && state.peer.id === message.id) {
+        state.peer.lang = message.lang;
+        $('peer-label').textContent = `Talking with ${state.peer.name} (${state.peer.lang})`;
+      }
       break;
     case 'same-room':
       showSameRoom(message.sameRoom);
