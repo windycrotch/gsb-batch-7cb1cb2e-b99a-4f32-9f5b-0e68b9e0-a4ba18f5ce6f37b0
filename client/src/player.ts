@@ -1,0 +1,494 @@
+import { GatewayOpcodes, type GatewayVoiceServerUpdateDispatchData, type GatewayVoiceStateUpdateDispatchData } from "discord-api-types/v10";
+
+import type { LinkDaveClient } from "./client.js";
+import { PlayerFilters } from "./filters.js";
+import type { Node } from "./node.js";
+import { Queue } from "./queue.js";
+import type {
+    FiltersPayload,
+    MigrateReadyPayload,
+    PlayerUpdatePayload,
+    TrackEndPayload,
+    TrackInfo,
+    TrackStartPayload,
+    VoiceConnectPayload,
+    VoiceDisconnectPayload,
+    VoiceServerEvent
+} from "./types.js";
+import { DisconnectReason, EventName, PlayerState, TrackEndReason } from "./types.js";
+import { unwrap } from "./utils.js";
+
+export interface PlayOptions {
+    startTime?: number;
+    requesterId?: string;
+    filters?: FiltersPayload;
+}
+
+export interface PlayerOptions {
+    voiceChannelId?: string;
+    selfMute?: boolean;
+    selfDeaf?: boolean;
+    inactivityTimeout?: number;
+}
+
+export type RawVoiceStateUpdate = Pick<GatewayVoiceStateUpdateDispatchData, "user_id" | "channel_id" | "session_id">;
+export type RawVoiceServerUpdate = Pick<GatewayVoiceServerUpdateDispatchData, "token" | "guild_id" | "endpoint">;
+
+interface VoiceState {
+    channelId: string;
+    sessionId: string;
+    event: VoiceServerEvent;
+}
+
+interface PendingVoiceState {
+    channelId?: string;
+    sessionId?: string;
+    serverEvent?: VoiceServerEvent;
+}
+
+export class Player {
+    public static readonly CONNECT_TIMEOUT = 10_000;
+
+    readonly #client: LinkDaveClient;
+    readonly #guildId: string;
+    readonly #queue: Queue;
+    readonly #filters = new PlayerFilters();
+
+    #node: Node;
+    #voiceChannelId: string | null = null;
+    #selfMute: boolean;
+    #selfDeaf: boolean;
+    #state: PlayerState = PlayerState.Idle;
+
+    #current: TrackInfo | null = null;
+    #voiceState: VoiceState | null = null;
+    #pendingVoice: PendingVoiceState | null = null;
+    #migrationTarget: Node | null = null;
+    #migrationResolve: ((value: unknown) => void) | null = null;
+    #inactivityTimeout: number;
+    #inactivityTimer: ReturnType<typeof setTimeout> | null = null;
+
+    constructor(client: LinkDaveClient, guildId: string, node: Node, options?: PlayerOptions) {
+        this.#client = client;
+        this.#guildId = guildId;
+        this.#node = node;
+        this.#queue = new Queue(this);
+        this.#voiceChannelId = options?.voiceChannelId ?? null;
+        this.#selfMute = options?.selfMute ?? false;
+        this.#selfDeaf = options?.selfDeaf ?? true;
+        this.#inactivityTimeout = options?.inactivityTimeout ?? 0;
+    }
+
+    get guildId() {
+        return this.#guildId;
+    }
+
+    get voiceChannelId() {
+        return this.#voiceChannelId;
+    }
+
+    get state() {
+        return this.#state;
+    }
+
+    get current() {
+        return this.#current;
+    }
+
+    get node() {
+        return this.#node;
+    }
+
+    get queue() {
+        return this.#queue;
+    }
+
+    get playing() {
+        return this.#state === PlayerState.Playing;
+    }
+
+    get paused() {
+        return this.#state === PlayerState.Paused;
+    }
+
+    get connecting() {
+        return this.#state === PlayerState.Connecting;
+    }
+
+    get connected() {
+        return this.#voiceState !== null;
+    }
+
+    get filters(): PlayerFilters {
+        return this.#filters;
+    }
+
+    connect(channelId?: string, timeoutMs = Player.CONNECT_TIMEOUT) {
+        const targetChannel = channelId ?? this.#voiceChannelId;
+        if (!targetChannel) {
+            throw new RangeError("No voice channel ID provided");
+        }
+
+        if (this.connecting) {
+            throw new Error("Player is already connecting");
+        }
+
+        this.#pendingVoice = null;
+        this.#voiceChannelId = targetChannel;
+        this.#state = PlayerState.Connecting;
+
+        this.#sendVoiceStateUpdate(targetChannel);
+
+        return new Promise<VoiceConnectPayload>((resolve, reject) => {
+            const cleanup = () => {
+                if (this.#state === PlayerState.Connecting) {
+                    this.#state = PlayerState.Idle;
+                }
+
+                this.#node.off(EventName.VoiceConnect, onConnect);
+                this.#node.off(EventName.VoiceDisconnect, onDisconnect);
+
+                clearTimeout(timer);
+            };
+
+            const timer = setTimeout(
+                () => {
+                    cleanup();
+
+                    const hadVoiceState = this.#voiceState !== null;
+                    this.disconnect();
+
+                    if (hadVoiceState && this.#node.connected) {
+                        void this.#sendNodeDisconnect();
+                    }
+
+                    reject(new Error(`Voice connection timed out for guild "${this.#guildId}"`));
+                },
+                timeoutMs
+            );
+
+            const onConnect = (event: VoiceConnectPayload) => {
+                if (event.guild_id !== this.#guildId) return;
+                cleanup();
+                resolve(event);
+            };
+
+            const onDisconnect = (event: VoiceDisconnectPayload) => {
+                if (event.guild_id !== this.#guildId) return;
+                if (event.reason === DisconnectReason.Requested) return;
+
+                cleanup();
+                reject(new Error(`Voice connection failed for guild "${this.#guildId}": ${event.reason ?? "unknown"}`));
+            };
+
+            this.#node.on(EventName.VoiceConnect, onConnect);
+            this.#node.on(EventName.VoiceDisconnect, onDisconnect);
+        });
+    }
+
+    disconnect() {
+        this.#sendVoiceStateUpdate(null);
+        this.#cleanup();
+    }
+
+    async handleVoiceStateUpdate(data: RawVoiceStateUpdate) {
+        if (!data.channel_id) {
+            const hadVoiceState = this.#voiceState !== null;
+            this.#cleanup();
+
+            if (hadVoiceState && this.#node.connected) {
+                await this.#sendNodeDisconnect();
+            }
+
+            return;
+        }
+
+        this.#pendingVoice ??= {};
+        this.#pendingVoice.channelId = data.channel_id;
+        this.#pendingVoice.sessionId = data.session_id;
+
+        this.#tryConnectLinkDave();
+    }
+
+    async handleVoiceServerUpdate(data: RawVoiceServerUpdate) {
+        if (!data.endpoint) {
+            const hadVoiceState = this.#voiceState !== null;
+            this.#cleanup();
+
+            if (hadVoiceState && this.#node.connected) {
+                await this.#sendNodeDisconnect();
+            }
+
+            return;
+        }
+
+        this.#pendingVoice ??= {};
+
+        const endpoint = data.endpoint || this.#pendingVoice.serverEvent?.endpoint;
+        if (!endpoint) throw new Error("Missing voice server endpoint"); // TODO
+
+        this.#pendingVoice.serverEvent = {
+            token: data.token,
+            guild_id: data.guild_id,
+            endpoint
+        };
+
+        this.#tryConnectLinkDave();
+    }
+
+    #tryConnectLinkDave() {
+        const pending = this.#pendingVoice;
+        if (!pending?.channelId || !pending.sessionId || !pending.serverEvent) {
+            return;
+        }
+
+        this.#connectToLinkDave(pending.channelId, pending.sessionId, pending.serverEvent);
+        this.#pendingVoice = null;
+    }
+
+    #connectToLinkDave(channelId: string, sessionId: string, event: VoiceServerEvent) {
+        this.#voiceChannelId = channelId;
+        this.#voiceState = { channelId, sessionId, event };
+
+        this.#node.sendVoiceUpdate({
+            client_id: this.#client.clientId,
+            guild_id: this.#guildId,
+            channel_id: channelId,
+            session_id: sessionId,
+            event
+        });
+    }
+
+    #sendVoiceStateUpdate(channelId: string | null) {
+        this.#client._sendToShard(this.#guildId, {
+            op: GatewayOpcodes.VoiceStateUpdate,
+            d: {
+                guild_id: this.#guildId,
+                channel_id: channelId,
+                self_mute: channelId === null ? false : this.#selfMute,
+                self_deaf: channelId === null ? false : this.#selfDeaf
+            }
+        });
+    }
+
+    async #sendNodeDisconnect() {
+        const [, err] = await unwrap(this.#node.sendDisconnect(this.#guildId));
+        if (err) this.#node.emit(EventName.Error, err as Error);
+    }
+
+    async play(url: string, options: PlayOptions = {}, isFromQueue = false) {
+        if (!isFromQueue) this.#queue._deactivate();
+        await this.#sendPlay(url, options);
+    }
+
+    _onQueueEmpty() {
+        if (this.#state === PlayerState.Idle) return;
+
+        this.#state = PlayerState.Idle;
+        this.#current = null;
+        this.#startTimer();
+    }
+
+    async #sendPlay(url: string, options: PlayOptions = {}) {
+        const filters = options.filters ?? this.#filters.toPayload();
+        await this.#node.sendPlay(this.#guildId, {
+            url,
+            ...(options.startTime !== undefined && { start_time: options.startTime }),
+            ...(options.requesterId !== undefined && { requester_id: options.requesterId }),
+            ...(filters !== undefined && { filters })
+        });
+    }
+
+    async pause() {
+        await this.#node.sendPause(this.#guildId);
+    }
+
+    async resume() {
+        await this.#node.sendResume(this.#guildId);
+    }
+
+    async stop() {
+        this.#queue._deactivate();
+        await this.#node.sendStop(this.#guildId);
+        this.#state = PlayerState.Idle;
+        this.#current = null;
+    }
+
+    async seek(position: number) {
+        await this.#node.sendSeek(this.#guildId, { position });
+    }
+
+    async destroy() {
+        this.disconnect();
+
+        if (!this.#node.connected) {
+            this.#client._onPlayerDestroy(this.#guildId);
+            return;
+        }
+
+        const waitForVoiceDisconnect = this.#waitForNodeVoiceDisconnect(Player.CONNECT_TIMEOUT);
+        await unwrap(this.#node.sendDisconnect(this.#guildId));
+
+        if (await waitForVoiceDisconnect) return;
+        this.#client._onPlayerDestroy(this.#guildId);
+    }
+
+    #waitForNodeVoiceDisconnect(timeoutMs: number) {
+        return new Promise<boolean>((resolve) => {
+            const cleanup = () => {
+                this.#node.off(EventName.VoiceDisconnect, onDisconnect);
+                clearTimeout(timeout);
+            };
+
+            const onDisconnect = (data: VoiceDisconnectPayload) => {
+                if (data.guild_id !== this.#guildId) return;
+                cleanup();
+                resolve(true);
+            };
+
+            const timeout = setTimeout(() => {
+                cleanup();
+                resolve(false);
+            }, timeoutMs);
+
+            this.#node.on(EventName.VoiceDisconnect, onDisconnect);
+        });
+    }
+
+    async moveNode(targetNode: Node) {
+        if (targetNode === this.#node) return;
+
+        if (!targetNode.connected || targetNode.draining) {
+            throw new Error(`Target node "${targetNode.name}" is not available`);
+        }
+
+        this.#migrationTarget = targetNode;
+        this.#node.sendPlayerMigrate(this.#guildId);
+
+        return new Promise((resolve) => {
+            this.#migrationResolve = resolve;
+        });
+    }
+
+    _onPlayerUpdate(data: PlayerUpdatePayload) {
+        if (data.state === PlayerState.Playing) this.#stopTimer();
+        else if (this.#state === PlayerState.Playing) this.#startTimer();
+
+        this.#state = data.state;
+    }
+
+    _onTrackStart(data: TrackStartPayload) {
+        this.#current = data.track;
+        this.#state = PlayerState.Playing;
+        this.#stopTimer();
+    }
+
+    _onTrackEnd(data: TrackEndPayload) {
+        if (!this.#queue.active || this.#queue.size === 0) {
+            this.#state = PlayerState.Idle;
+            this.#current = null;
+            this.#startTimer();
+        }
+
+        this.#queue._onTrackEnd(data.reason !== TrackEndReason.Stopped && data.reason !== TrackEndReason.Replaced);
+    }
+
+    _onVoiceConnect() {
+        if (this.#state !== PlayerState.Connecting) return;
+
+        this.#state = PlayerState.Idle;
+        this.#queue._onConnectReady();
+
+        if (!this.#queue.active) {
+            this.#startTimer();
+        }
+    }
+
+    #cleanup() {
+        this.#voiceChannelId = null;
+        this.#queue._deactivate();
+        this.#voiceState = null;
+        this.#pendingVoice = null;
+        this.#state = PlayerState.Idle;
+        this.#current = null;
+        this.#stopTimer();
+    }
+
+    _onVoiceDisconnect() {
+        this.#cleanup();
+    }
+
+    _onMigrateReady(data: MigrateReadyPayload) {
+        if (!this.#migrationTarget || data.guild_id !== this.#guildId) {
+            return;
+        }
+
+        const targetNode = this.#migrationTarget;
+        const oldNode = this.#node;
+
+        // Don't send disconnect to old node - we're migrating
+        this.#client._updatePlayerNode(this.#guildId, oldNode, targetNode);
+        this.#node = targetNode;
+
+        if (this.#voiceState) {
+            this.#node.sendVoiceUpdate({
+                client_id: this.#client.clientId,
+                guild_id: this.#guildId,
+                channel_id: this.#voiceState.channelId,
+                session_id: this.#voiceState.sessionId,
+                event: this.#voiceState.event
+            });
+        }
+
+        if (data.state === PlayerState.Playing && data.url) {
+            const onVoiceConnect = (event: VoiceConnectPayload) => {
+                if (event.guild_id !== this.#guildId) return;
+                this.#node.off(EventName.VoiceConnect, onVoiceConnect);
+
+                void this.#node.sendPlay(this.#guildId, {
+                    url: data.url,
+                    start_time: data.position,
+                    ...(data.requester_id !== undefined && { requester_id: data.requester_id }),
+                    ...(data.filters !== undefined && { filters: data.filters })
+                });
+            };
+
+            this.#node.on(EventName.VoiceConnect, onVoiceConnect);
+        }
+
+        this.#migrationTarget = null;
+        if (!this.#migrationResolve) return;
+
+        this.#migrationResolve(null);
+        this.#migrationResolve = null;
+    }
+
+    #startTimer() {
+        if (this.#inactivityTimeout <= 0) return;
+        this.#stopTimer();
+
+        this.#inactivityTimer = setTimeout(
+            () => {
+                if (this.#state === PlayerState.Playing) return;
+                this.disconnect();
+
+                if (this.#node.connected) {
+                    void this.#node.sendDisconnect(this.#guildId);
+                }
+
+                this.#node.emit(EventName.VoiceDisconnect, {
+                    guild_id: this.#guildId,
+                    reason: DisconnectReason.Inactivity
+                });
+            },
+            this.#inactivityTimeout
+        );
+    }
+
+    #stopTimer() {
+        if (this.#inactivityTimer === null) return;
+        clearTimeout(this.#inactivityTimer);
+        this.#inactivityTimer = null;
+    }
+
+}

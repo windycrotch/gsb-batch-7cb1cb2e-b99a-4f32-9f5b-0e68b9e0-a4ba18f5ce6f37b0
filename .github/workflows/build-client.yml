@@ -1,0 +1,48 @@
+name: client
+
+on:
+    push:
+        branches:
+            - main
+
+permissions:
+    id-token: write
+    contents: read
+
+jobs:
+    build:
+        name: Publish NPM
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v7
+
+            - uses: oven-sh/setup-bun@v2
+              with:
+                  bun-version: "latest"
+
+            - name: Check if package version changed
+              id: check_publish
+              run: bun ./scripts/check-version.ts
+
+            - run: bun install --frozen-lockfile
+              working-directory: ./client
+            - run: bun run build
+              working-directory: ./client
+
+            - uses: actions/setup-node@v7
+              with:
+                  node-version: "latest"
+                  registry-url: "https://registry.npmjs.org"
+
+            - name: Publish NPM
+              if: env.publish != 'true'
+              run: |
+                  SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+                  npm version "${{ env.version }}-dev.${SHORT_SHA}" --no-git-tag-version
+                  npm publish --provenance --access public --tag dev
+              working-directory: ./client
+
+            - name: Publish NPM (Release)
+              if: env.publish == 'true'
+              run: npm publish --provenance --access public
+              working-directory: ./client

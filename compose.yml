@@ -1,0 +1,21 @@
+services:
+    linkdave:
+        build:
+            context: .
+            dockerfile: Dockerfile
+        image: linkdave:latest
+        container_name: linkdave
+        restart: unless-stopped
+        ports:
+            - "18080:8080"
+        logging:
+            driver: json-file
+            options:
+                max-size: "10m"
+                max-file: "3"
+        environment:
+            LINKDAVE_PASSWORD: ${LINKDAVE_PASSWORD}
+            LINKDAVE_SOURCE_HTTPS_ENABLED: true
+            LINKDAVE_SOURCE_IP_ADDRESS_PUBLIC_ENABLED: true
+            SENTRY_DSN: ${SENTRY_DSN:-}
+            SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-production}

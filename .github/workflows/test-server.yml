@@ -1,0 +1,56 @@
+name: server
+
+on:
+    pull_request:
+        branches:
+            - main
+
+permissions:
+    contents: read
+    packages: write
+    pull-requests: write
+
+jobs:
+    test:
+        name: Test Server
+        runs-on: ubuntu-latest
+        env:
+            IMAGE_BASE: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
+
+        steps:
+            - uses: actions/checkout@v7
+
+            - name: Log in to GHCR
+              uses: docker/login-action@v4
+              with:
+                  registry: ghcr.io
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Docker meta
+              id: meta
+              uses: docker/metadata-action@v6
+              with:
+                  images: ${{ env.IMAGE_BASE }}
+                  tags: |
+                      type=raw,value=pr-${{ github.event.pull_request.number }}
+                      type=sha,format=short,pattern={{sha}}
+
+            - name: Build and push Docker image
+              uses: docker/build-push-action@v7
+              with:
+                  context: .
+                  push: ${{ github.actor == github.repository_owner }}
+                  build-args: BUILD_VERSION=pr-${{ github.event.pull_request.number }}
+                  tags: ${{ steps.meta.outputs.tags }}
+
+            - name: Comment on PR
+              uses: marocchino/sticky-pull-request-comment@v3
+              if: github.actor == github.repository_owner
+              with:
+                  header: docker-test-pr
+                  message: |
+                      You can pull and run this PR's version of linkdave using:
+                      ```bash
+                      docker pull ${{ env.IMAGE_BASE }}:pr-${{ github.event.pull_request.number }}
+                      ```
