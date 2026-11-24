@@ -1,0 +1,43 @@
+<!--index.html-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>VoiceFlow Chat</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="config.js"></script>
+    <!-- 配置 WebSocket URL -->
+    <script>
+        const port = window.VOICEFLOW_SERVER_PORT || '18080';
+        const WEBSOCKET_URL = window.location.protocol === 'https:' 
+          ? `wss://${window.location.host}/ws`
+          : `ws://${window.location.host}/ws`;
+    </script>
+</head>
+<body>
+    <div class="chat-container">
+        <div class="chat-header">
+            <h2>VoiceFlow Chat</h2>
+            <div class="mode-switch">
+                <label class="switch">
+                    <input type="checkbox" id="mode-toggle">
+                    <span class="slider round"></span>
+                </label>
+                <span id="mode-label">persistent mode</span>
+            </div>
+        </div>
+        <div class="chat-window" id="chat-window">
+            <!-- 消息将被添加到这里 -->
+        </div>
+        <div class="chat-input">
+            <input type="text" id="text-input" placeholder="输入文字消息...">
+            <button id="send-text-btn">发送</button>
+            <button id="record-voice-btn">🎤</button>
+            <input type="file" id="upload-audio-input" accept="audio/*" style="display: none;">
+            <button id="upload-audio-btn">上传音频</button>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>

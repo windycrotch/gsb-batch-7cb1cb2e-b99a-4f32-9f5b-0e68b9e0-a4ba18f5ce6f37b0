@@ -1,0 +1,51 @@
+# Copyright © 2023 telepace open source community. All rights reserved.
+# Licensed under the MIT License (the "License");
+# you may not use this file except in compliance with the License.
+
+repository:
+  name: "telepace"
+  description: "telepace instant messaging"
+  homepage_url: "https://telepace.nsddd.top"
+  topics: telepace, kubernetes, chat, chatgpt
+
+  default_branch: main
+  allow_squash_merge: true
+  allow_merge_commit: true
+  allow_rebase_merge: true
+
+  has_wiki: false
+
+  teams:
+    - name: "maintainers"
+      permission: "admin"
+    - name: "telepace-maintainers"
+      permission: "maintain"
+    - name: "telepace-approvers"
+      permission: "push"
+    - name: "contributors"
+      permission: "push"
+
+branches:
+  - name: main
+    protection:
+      required_pull_request_reviews:
+        required_approving_review_count: 1
+        dismiss_stale_reviews: true
+        require_code_owner_reviews: true
+        dismissal_restrictions: {}
+        code_owner_approval: true
+        required_conversation_resolution: true
+
+      required_status_checks:
+        strict: true
+        contexts:
+          - "DCO"
+
+      enforce_admins: true
+
+      required_linear_history: true
+
+      restrictions:
+        users: []
+        apps: []
+        teams: []

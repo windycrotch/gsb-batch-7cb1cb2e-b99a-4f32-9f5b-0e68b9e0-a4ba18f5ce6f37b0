@@ -1,0 +1,12 @@
+# Copyright © 2023 telepace open source community. All rights reserved.
+# Licensed under the MIT License (the "License");
+# you may not use this file except in compliance with the License.
+
+blank_issues_enabled: false
+contact_links:
+  - name: 📢 Connect on slack
+    url: https://join.slack.com/t/telepace/shared_invite/zt-1se0k2bae-lkYzz0_T~BYh3rjkvlcUqQ
+    about: Support telepace-related requests or issues, get in touch with developers and help on slack
+  - name: 🌐 telepace Blog
+    url: https://telepace.nsddd.top
+    about: Open the telepace community blog

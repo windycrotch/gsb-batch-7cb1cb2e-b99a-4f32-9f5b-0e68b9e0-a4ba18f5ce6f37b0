@@ -1,0 +1,137 @@
+server:
+  port: 18080
+  enable_tls: false
+
+minio:
+  enabled: true
+  endpoint: "localhost:9000"
+  access_key: "your_access_key"
+  secret_key: "your_secret_key"
+  bucket_name: "telepace-pipeline"
+  secure: true
+  storage_path: "voiceflow/audio/"
+
+stt:
+  # 可选值：azure、 google、 local、 assemblyai-ws、 volcengine、 aws、 assemblyai、 whisper-v3
+  provider: whisper-v3
+
+tts:
+  # 可选值：azure、 google、 local、 volcengine
+  provider: volcengine
+
+llm:
+  # 可选值：openai、 local
+  provider: openai
+
+azure:
+  stt_key: ""
+  tts_key: ""
+  region: "eastus"
+
+google:
+  stt_key: "your_google_stt_key"
+  tts_key: "your_google_tts_key"
+
+aws:
+  region: "us-east-1"
+  access_key_id: ''
+  secret_access_key: ''
+
+openai:
+  api_key: ""
+  # OPENAI_BASE_URL='https://api.lqqq.cc/v1'       # Global provider
+  # OPENAI_BASE_URL='https://api.chatanywhere.cn'  # International version
+  # OPENAI_BASE_URL='https://api.chatanywhere.tech'  # Domestic version
+  base_url: ""
+
+volcengine:
+  # 语音识别(STT)配置
+  stt:
+    ws_url: 'wss://openspeech.bytedance.com/api/v3/sauc/bigmodel'  # 推荐直接配置非敏感信息
+    uid: 'test'                                                   # 用户 ID
+    rate: 16000                                                   # STT 采样率
+    format: 'pcm'                                                 # STT 音频格式
+    bits: 16                                                      # 位深度
+    channel: 1                                                    # 声道数
+    codec: 'pcm'                                                  # 编码格式
+    access_key: ''                                                # 必须存在字段，值可为空
+    app_key: ''                                                   # 必须存在字段，值可为空
+    # 小时版：volc.bigasr.sauc.duration
+    # 并发版：volc.bigasr.sauc.concurrent
+    resource_id: 'volc.bigasr.sauc.duration'                      # 资源 ID
+
+  # 语音合成(TTS)配置
+  tts:
+    ws_url: 'wss://openspeech.bytedance.com/api/v1/tts/ws_binary'  # 推荐直接配置非敏感信息
+    app_id: ''                                                    # 必须存在字段，值可为空
+    token: ''                                                     # 必须存在字段，值可为空
+    cluster: 'volcano_tts'                                        # TTS 集群
+    # https://www.volcengine.com/docs/6561/1257544
+    voice_type: 'zh_female_cancan_mars_bigtts'                    # 默认语音类型
+    encoding: 'mp3'                                               # 音频编码
+    speed_ratio: 1.0                                              # 语速比例
+    volume_ratio: 1.0                                             # 音量比例
+    pitch_ratio: 1.0                                              # 音调比例
+
+# AssemblyAI 相关参数
+assemblyai:
+  api_key: ""         # 你的 AssemblyAI API Key
+  model: "best"       # 选用 "best" 或 "nano"
+  language_detection: true
+  language_confidence_threshold: 0.1
+  default_language_code: "en"
+  language_code: ""
+  # 要禁用标点符号和文本格式，请在转录配置中将Punctuate和FormatText设置为false
+  punctuate: true
+  format_text: true
+  disfluencies: false
+  filter_profanity: false
+  # 如果指定了这两个值，将只转录音频片段
+  audio_start_from: 0
+  audio_end_at: 0
+  # 如果音频里声音占比小于此阈值则返回错误
+  speech_threshold: 0.3
+  # 是否对多声道音频进行分轨转录
+  multichannel: false
+
+  # 如果需要自定义词汇增强，可在这里指定
+  boost_param: "high"
+  word_boost:
+    - "aws"
+    - "telepace"
+    - "hello"
+    - "azure"
+    - "google cloud"
+
+  # 自定义拼写示例
+  # from 值不区分大小写，to 只支持单词且区分大小写
+  custom_spelling:
+    - from:
+      - "gettleman"
+      to: "Gettleman"
+    - from:
+      - "sequel"
+      to: "SQL"
+
+logging:
+  level: "info"
+  format: "text"
+  filename: ""
+  max_size: 100
+  max_backups: 3
+  max_age: 28
+  compress: true
+  report_caller: true
+
+# 添加 Whisper 配置段
+whisper:
+  api_key: "your-api-key"
+  endpoint: "https://audio-turbo.us-virginia-1.direct.fireworks.ai/v1/audio/transcriptions"
+  model: "whisper-v3-turbo"
+  temperature: 0
+  vad_model: "silero"
+  max_retries: 3
+  timeout: 30
+  language: "auto"
+  task: "transcribe"
+  batch_size: 30
