@@ -1,0 +1,93 @@
+// Package pcm is the high-level, clean-room PCM streaming API for go-flac.
+//
+// It bridges raw interleaved little-endian PCM and the FLAC codec core,
+// exposing an io.WriteCloser encoder and an io.Reader / io.WriterTo decoder.
+//
+// # Decoding
+//
+// NewDecoder returns a Decoder that reads interleaved little-endian PCM via
+// io.Reader and io.WriterTo. SeekToSample provides sample-accurate random
+// access when the source implements io.Seeker. A SEEKTABLE block in the stream
+// accelerates seeks by narrowing the binary search; plain binary search is the
+// fallback when no table is present. The decoder buffers its own reads, 64 KiB
+// at a time, so pass an *os.File directly; a bufio.Reader wrapper would hide the
+// io.Seeker and make SeekToSample return flac.ErrSeekUnsupported.
+//
+// A frame that passes its CRC checks but decodes to a sample outside its bit
+// depth, or carries a Rice residual outside the signed 32-bit range, is rejected
+// with an error wrapping flac.ErrSampleOutOfRange. Like a CRC failure it is
+// sticky: Read and WriteTo deliver the frames before it, then keep returning the
+// error, and the one-shot DecodeInterleaved returns no data.
+// SeekToSample skips such a frame as it skips one with a bad CRC.
+//
+// Native output is right-aligned at the stream's own bit depth in ceil(bits/8)
+// bytes per sample, so 12-bit audio arrives in 2-byte samples at 12-bit scale.
+// WithConvertTo normalises to a fixed width (8, 16, 24 or 32 bits) by shifting,
+// and OutputBitDepth reports the width Read yields:
+//
+//	dec, err := pcm.NewDecoder(r, pcm.WithConvertTo(16))
+//	// dec.OutputBitDepth() == 16, whatever dec.Info().BitDepth is
+//
+// # Encoding
+//
+// NewEncoder accepts an io.Writer (or io.WriteSeeker) and a Config. Provide an
+// io.WriteSeeker (for example an *os.File) so Close can write back the
+// finalized STREAMINFO totals and MD5; a plain io.Writer still produces a valid
+// stream, but those fields are left unknown.
+//
+// Opt-in SEEKTABLE emission: set Config.SeekTableInterval to a positive sample
+// count to insert a SEEKTABLE. An interval equal to the sample rate produces
+// roughly one seek point per second, for example:
+//
+//	enc, err := pcm.NewEncoder(f, pcm.Config{
+//	    SampleRate:        44100,
+//	    Channels:          2,
+//	    BitDepth:          16,
+//	    SeekTableInterval: 44100, // one seek point per second
+//	})
+//
+// SEEKTABLE emission requires an io.WriteSeeker sink (Close patches the
+// reserved block in place). Config.SeekTableMaxPoints caps the number of
+// reserved points (default 4096 when unset and an interval is given).
+//
+// # Reuse and one-shot encoding
+//
+// Encoder.Reset rebinds an existing encoder to a new sink and Config, reusing its
+// large internal buffers (the frame workspace and per-channel block buffers) when
+// the channel count and LPC order are unchanged. A producer that encodes many
+// independent streams can therefore pool encoders and skip the per-stream
+// workspace allocation:
+//
+//	var pool = sync.Pool{New: func() any { e, _ := pcm.NewEncoder(io.Discard, cfg); return e }}
+//
+//	enc := pool.Get().(*pcm.Encoder)
+//	defer pool.Put(enc)
+//	if err := enc.Reset(f, cfg); err != nil { /* ... */ }
+//	// write PCM, then Close.
+//
+// EncodeInterleaved is a one-shot helper for the common case of already holding a
+// complete interleaved little-endian PCM buffer in memory. It runs the
+// NewEncoder/Write/Close sequence (drawing from an internal encoder pool) and
+// returns the first error, so callers do not reimplement the Close finalization:
+//
+//	err := pcm.EncodeInterleaved(f, cfg, pcmBytes)
+//
+// # Reuse and decoding many streams
+//
+// Decoder.Reset rebinds an existing decoder to a new source and parses its header,
+// reusing the decoder's owned buffers (the read buffer, the frame and packed-PCM
+// scratch, and the MD5 hash) instead of allocating them again per stream. A
+// consumer that decodes many streams can pool decoders and pay the setup cost
+// once:
+//
+//	var pool = sync.Pool{New: func() any { return new(pcm.Decoder) }}
+//
+//	dec := pool.Get().(*pcm.Decoder)
+//	defer pool.Put(dec)
+//	if err := dec.Reset(r); err != nil { /* ... */ }
+//	// read PCM from dec until io.EOF.
+//
+// A zero-value Decoder is a valid Reset target, so the pool's New need not call
+// NewDecoder. Reset reuses the large setup buffers but re-parses each stream's
+// header, so it sharply reduces the bytes allocated per stream.
+package pcm

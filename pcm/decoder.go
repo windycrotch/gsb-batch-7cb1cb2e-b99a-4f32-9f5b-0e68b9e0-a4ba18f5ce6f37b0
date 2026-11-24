@@ -1,0 +1,803 @@
+package pcm
+
+import (
+	"crypto/md5"
+	"errors"
+	"fmt"
+	"hash"
+	"io"
+	"strings"
+
+	flac "github.com/tphakala/go-flac"
+	"github.com/tphakala/go-flac/internal/bitio"
+	"github.com/tphakala/go-flac/internal/frame"
+	"github.com/tphakala/go-flac/internal/meta"
+)
+
+// Decoder decodes a FLAC stream into interleaved little-endian PCM, right-aligned at
+// the stream's own bit depth unless WithConvertTo selects another (see OutputBitDepth).
+// It implements io.Reader and io.WriterTo, and offers sample-accurate SeekToSample;
+// seeking requires the underlying source to be an io.Seeker.
+//
+// The decoder buffers reads from its source itself, 64 KiB at a time, so an *os.File
+// can be passed directly. Do not wrap a source in a bufio.Reader when seeking is
+// needed: bufio.Reader does not implement io.Seeker, so SeekToSample would return
+// flac.ErrSeekUnsupported.
+type Decoder struct {
+	br       *bitio.Reader
+	rs       io.ReadSeeker // non-nil when the source is seekable
+	info     flac.StreamInfo
+	seekable bool
+
+	audioStart   int64            // absolute byte offset of the first frame
+	streamEnd    int64            // absolute file size
+	nominalBlock int              // STREAMINFO max block size; fixed-blocksize nominal
+	maxFrame     int              // STREAMINFO max frame size (0 unknown), seek-probe sizing
+	seekPoints   []meta.SeekPoint // parsed SEEKTABLE points (nil when absent); narrows seeks
+	vendor       string           // VORBIS_COMMENT vendor string ("" when absent)
+	comments     []string         // VORBIS_COMMENT "NAME=value" fields (nil when absent)
+
+	frame      frame.Frame
+	probeFrame frame.Frame  // scratch frame decoded by seek probes
+	probeBuf   []byte       // reusable seek-probe read buffer
+	resyncR    bitio.Reader // reusable scratch reader for the resync scan (avoids per-probe alloc)
+	buf        []byte       // packed PCM backing buffer, reused across frames
+	pending    []byte       // unread window into buf
+	bytesPS    int          // bytes per sample = ceil(bps/8)
+	md5        hash.Hash
+	decoded    uint64 // inter-channel samples decoded so far
+	seeked     bool   // a seek happened; disables the end-of-stream MD5 and sample-count checks
+	skipMD5    bool   // caller opted out of MD5 hashing + verification (SkipMD5Verification)
+	convertTo  int    // WithConvertTo target bit depth, valid only when convertSet
+	convertSet bool   // WithConvertTo was given for this NewDecoder or Reset call
+	outBits    int    // bit depth of the samples Read yields (native when no conversion)
+	done       bool
+	err        error
+}
+
+var (
+	_ io.Reader   = (*Decoder)(nil)
+	_ io.WriterTo = (*Decoder)(nil)
+)
+
+// DecoderOption configures a Decoder at construction (NewDecoder) or when it is
+// rebound to a new stream (Reset). Options are applied after the stream header is
+// parsed and before any audio is decoded. See SkipMD5Verification and WithConvertTo.
+type DecoderOption func(*Decoder)
+
+// SkipMD5Verification disables the decoder's MD5 integrity check: the decoder does not
+// hash decoded PCM and does not compare it against the stream's STREAMINFO MD5 at end
+// of stream, removing the MD5 pass from the decode hot path for callers that trust the
+// source or verify it elsewhere. The decoded samples are identical; only
+// flac.ErrMD5Mismatch can no longer be returned. The cheaper sample-count truncation
+// check (flac.ErrTruncatedStream) still runs. The policy applies to the NewDecoder or
+// Reset call it is passed to and is not remembered across a later Reset.
+func SkipMD5Verification() DecoderOption {
+	return func(d *Decoder) { d.skipMD5 = true }
+}
+
+// WithConvertTo makes the decoder emit signed little-endian integer PCM at bitDepth
+// bits per sample, which must be 8, 16, 24 or 32; any other value (including 0) makes
+// NewDecoder or Reset fail with an error wrapping flac.ErrUnsupported.
+//
+// Conversion shifts each sample by bitDepth minus the stream's STREAMINFO bit depth
+// (not its container width), so a 12-bit stream converted to 16 is scaled up by 4 bits.
+// Widening is exact; narrowing truncates with an arithmetic shift (no rounding, no
+// dither). 8-bit output is signed, like FLAC's native 8-bit and go-wav's WithConvertTo.
+// A frame whose header declares a depth other than the STREAMINFO depth is scaled as if
+// it were at the stream depth, as it is already packed at that width.
+//
+// Info() is unaffected and keeps describing the stream, including its native BitDepth;
+// OutputBitDepth reports the converted width. MD5 verification runs on the native
+// samples and works unchanged, and seeking still positions in samples. The option
+// applies to the NewDecoder or Reset call it is passed to and is not remembered across
+// a later Reset, like SkipMD5Verification. If given more than once, the last value wins.
+func WithConvertTo(bitDepth int) DecoderOption {
+	return func(d *Decoder) { d.convertTo, d.convertSet = bitDepth, true }
+}
+
+// NewDecoder reads the stream marker and metadata from r, returning a Decoder with Info
+// populated. Options (for example SkipMD5Verification or WithConvertTo) configure the
+// decoder before any audio is decoded; an invalid option value, such as a WithConvertTo
+// depth other than 8, 16, 24 or 32, returns an error wrapping flac.ErrUnsupported.
+func NewDecoder(r io.Reader, opts ...DecoderOption) (*Decoder, error) {
+	d := &Decoder{}
+	if err := d.init("NewDecoder", r); err != nil {
+		return nil, err
+	}
+	if err := d.applyOptions("NewDecoder", opts); err != nil {
+		return nil, err
+	}
+	return d, nil
+}
+
+// Reset rebinds the decoder to a new source r and parses its stream header,
+// reusing the decoder's owned buffers (the read buffer, the frame and packed-PCM
+// scratch, and the MD5 hash) instead of allocating them again. It lets a caller
+// that decodes many streams, or pools decoders through a sync.Pool, pay the
+// per-decoder setup cost once rather than per stream; per-frame decoding is
+// already allocation-free. A zero-value Decoder (new(Decoder)) is a valid Reset
+// target, which is the sync.Pool pattern.
+//
+// Reset reads from r's current position and does not reposition it; any read-ahead
+// buffered from a previous source is discarded. Retained buffers keep their
+// high-water size, so a decoder reused across streams of differing shapes holds
+// the largest buffer it has needed. As with NewDecoder, seeking requires r to be
+// an io.Seeker.
+//
+// On success the decoder behaves exactly as a fresh NewDecoder(r, opts...) would. If
+// Reset returns an error the decoder must not be used except through another Reset,
+// which fully recovers it; a nil r is rejected before any state changes, so the
+// previous stream stays intact.
+//
+// Options apply to this call only: a decoder built with SkipMD5Verification and later
+// Reset without it verifies again, so pass the option on every Reset that should keep
+// skipping (matching how Encoder.Reset re-derives its behavior from cfg each call). The
+// same holds for WithConvertTo. An invalid option value (a WithConvertTo depth other
+// than 8, 16, 24 or 32) makes Reset return an error wrapping flac.ErrUnsupported and
+// leaves the decoder in the same recoverable failed state as a bad header.
+func (d *Decoder) Reset(r io.Reader, opts ...DecoderOption) error {
+	if err := d.init("Reset", r); err != nil {
+		return err
+	}
+	return d.applyOptions("Reset", opts)
+}
+
+// applyOptions runs opts after a successful init, then derives the output format and
+// validates the WithConvertTo target. On an invalid target it clears the stream state
+// the same way a failed header parse does (including seekable, so SeekToSample cannot
+// revive the decoder) and poisons the decoder until the next Reset.
+func (d *Decoder) applyOptions(op string, opts []DecoderOption) error {
+	for _, opt := range opts {
+		opt(d)
+	}
+	d.outBits = d.info.BitDepth
+	if d.convertSet {
+		switch d.convertTo {
+		case 8, 16, 24, 32:
+		default:
+			err := fmt.Errorf("go-flac/pcm: %s: WithConvertTo: output bit depth %d (want 8, 16, 24 or 32): %w", op, d.convertTo, flac.ErrUnsupported)
+			d.clearStream()
+			d.err = err
+			return err
+		}
+		d.outBits = d.convertTo
+	}
+	return nil
+}
+
+// init rebinds the decoder to r and parses the stream header. It backs both
+// NewDecoder and Reset; op names the caller in error messages. Every per-stream
+// field is cleared before the header is parsed, so a failed parse leaves no stale
+// stream visible and the decoder stays recoverable by a later init.
+func (d *Decoder) init(op string, r io.Reader) error {
+	if r == nil {
+		return fmt.Errorf("go-flac/pcm: %s: nil reader", op)
+	}
+	rs, seekable := r.(io.ReadSeeker)
+	var base int64
+	if seekable {
+		// Capture the absolute position where the FLAC stream begins, before any byte
+		// is consumed, so audioStart is absolute even if r was advanced past a header.
+		b, err := rs.Seek(0, io.SeekCurrent)
+		if err != nil {
+			seekable = false // advertises io.Seeker but cannot seek; decode forward-only
+		} else {
+			base = b
+		}
+	}
+
+	// Reuse the owned read buffer (streamReadBlock) and the MD5 hash across streams. Both are
+	// nil on a zero-value (pooled) decoder, and br is nil after a failed seek
+	// (seekFailed), so fall back to construction in those cases.
+	if d.br == nil {
+		d.br = bitio.NewReaderSize(r, streamReadBlock)
+	} else {
+		d.br.Reset(r)
+	}
+	if d.md5 == nil {
+		d.md5 = md5.New()
+	} else {
+		d.md5.Reset()
+	}
+
+	d.clearStream()
+
+	sm, err := meta.ReadMetadata(d.br)
+	if err != nil {
+		d.err = err // poisoned, but a later Reset clears this and recovers the decoder
+		return err
+	}
+
+	if seekable {
+		audioStart := base + d.br.BytesRead()
+		resume, serr := rs.Seek(0, io.SeekCurrent) // read-ahead-advanced absolute file pos
+		var streamEnd int64
+		if serr == nil {
+			streamEnd, serr = rs.Seek(0, io.SeekEnd)
+		}
+		if serr == nil {
+			if _, rerr := rs.Seek(resume, io.SeekStart); rerr != nil { // restore; owned read-ahead buffer stays valid
+				// The cursor was advanced to EOF to measure length but cannot be restored,
+				// so the reader can no longer forward-decode: surface this as a hard error.
+				d.err = rerr
+				return rerr
+			}
+			d.rs = rs
+			d.seekable = true
+			d.audioStart = audioStart
+			d.streamEnd = streamEnd
+			d.nominalBlock = sm.MaxBlock
+			d.maxFrame = sm.MaxFrame
+			d.seekPoints = sm.SeekPoints
+		}
+		// If serr != nil the source advertises io.Seeker but cannot be measured (no
+		// SeekEnd support, etc.). The failed SeekCurrent/SeekEnd leaves the read cursor
+		// in place, so the decoder degrades to forward-only (seekable stays false)
+		// rather than failing construction.
+	}
+	// Commit the stream's identity only once init has fully succeeded, so any failed
+	// init (a bad header, or the seek-restore failure above) leaves Info() zero,
+	// matching the poisoned-decoder contract uniformly across every failure path.
+	d.info = sm.Info
+	d.bytesPS = (sm.Info.BitDepth + 7) / 8
+	// Tags are recovered regardless of seekability; they are absent (empty) unless the
+	// stream carried a VORBIS_COMMENT block.
+	d.vendor = sm.Vendor
+	d.comments = sm.Comments
+	return nil
+}
+
+// clearStream clears every per-stream field so nothing from a previous stream (or a
+// partially parsed failed one) can leak into this decode. It leaves br and md5 alone.
+// The reused buffers (frame, probeFrame, probeBuf, resyncR, buf) carry no cross-stream
+// meaning: each is fully rewritten before it is read.
+func (d *Decoder) clearStream() {
+	d.info = flac.StreamInfo{}
+	d.bytesPS = 0
+	d.pending = nil
+	d.decoded = 0
+	d.seeked = false
+	// Re-derive the MD5 and conversion policy each init: NewDecoder and Reset apply their
+	// options after init, so a reused decoder honors the current call's options, not a
+	// prior call's.
+	d.skipMD5 = false
+	d.convertTo, d.convertSet = 0, false
+	d.outBits = 0
+	d.done = false
+	d.err = nil
+	d.rs = nil
+	d.seekable = false
+	d.audioStart = 0
+	d.streamEnd = 0
+	d.nominalBlock = 0
+	d.maxFrame = 0
+	d.seekPoints = nil
+	d.vendor = ""
+	d.comments = nil
+}
+
+// Info returns the stream's STREAMINFO-derived properties. It always describes the
+// stream itself, so Info().BitDepth is the native depth even under WithConvertTo; see
+// OutputBitDepth for the depth of the samples Read yields.
+func (d *Decoder) Info() flac.StreamInfo { return d.info }
+
+// OutputBitDepth returns the bit depth of the samples Read and WriteTo yield: the
+// WithConvertTo target when that option was given, otherwise the stream's own
+// Info().BitDepth. Each sample occupies (OutputBitDepth()+7)/8 little-endian bytes.
+// It is 0 on a decoder whose NewDecoder or Reset failed.
+func (d *Decoder) OutputBitDepth() int { return d.outBits }
+
+// Vendor returns the VORBIS_COMMENT vendor string. It is "" both when the stream
+// carried no VORBIS_COMMENT block and when the block declared an empty vendor string,
+// so "" alone does not distinguish the two. The string is returned verbatim and is
+// not validated as UTF-8, so a stream written by another tool may yield a value that
+// is not valid UTF-8; the go-flac encoder rejects non-UTF-8 vendor strings, so a
+// vendor string written by this package always round-trips as valid UTF-8.
+func (d *Decoder) Vendor() string { return d.vendor }
+
+// Tags returns the stream's VORBIS_COMMENT fields as ordered flac.Tag values, each
+// split at the first '=' of its "NAME=value" comment. It returns nil both when the
+// stream carried no VORBIS_COMMENT block and when the block carried no comment fields
+// (a vendor-only block), so nil alone does not distinguish the two. A comment with no
+// '=' yields a Tag whose Name is the whole string and whose Value is empty. Order and
+// duplicate names are preserved. Values are returned verbatim and are not validated as
+// UTF-8: a value stored by another tool as non-UTF-8 bytes is returned unchanged. The
+// go-flac encoder rejects non-UTF-8 values, so tags written by this package always
+// round-trip as valid UTF-8.
+func (d *Decoder) Tags() []flac.Tag {
+	if len(d.comments) == 0 {
+		return nil
+	}
+	tags := make([]flac.Tag, len(d.comments))
+	for i, c := range d.comments {
+		name, value, _ := strings.Cut(c, "=")
+		tags[i] = flac.Tag{Name: name, Value: value}
+	}
+	return tags
+}
+
+// streamReadBlock is the size of the decoder's read buffer; each refill asks the
+// caller's source for up to that many bytes. The source is read directly with no
+// bufio in between, so on an *os.File each refill is one read call; 64 KiB cuts a
+// 1.2 MB file from about 150 calls to about 20. Decode throughput measured the same
+// as with the 8 KiB bitio default (BenchmarkDecodeReuse). Only this reader uses it:
+// the per-frame and resync readers keep the bitio default.
+const streamReadBlock = 64 << 10 // 64 KiB
+
+// probeChunkDefault sizes seek-probe reads when STREAMINFO max frame size is unknown.
+const probeChunkDefault = 1 << 18 // 256 KiB
+
+// maxProbeWindow caps a single seek-probe read. A real FLAC frame is far smaller, so
+// this bounds memory if a malformed STREAMINFO max frame size or a crafted truncated
+// frame would otherwise drive the probe window to the whole stream.
+const maxProbeWindow = 1 << 24 // 16 MiB
+
+// errSeekFrameCut is the seek failure for a target the source cuts off partway
+// through a frame. It wraps io.ErrUnexpectedEOF as decodeNextFrame does for the
+// same cut, and is a package value so a failed seek allocates no error.
+var errSeekFrameCut = fmt.Errorf("%w: %w", flac.ErrTruncatedStream, io.ErrUnexpectedEOF)
+
+// SeekToSample positions the decoder so the next Read/WriteTo yields audio starting at
+// sampleIndex. It requires the source to be an io.Seeker. It returns the sample index
+// positioned at (== sampleIndex on success). Seeking to or past a known TotalSamples,
+// or past the last frame of an unknown-length stream, positions at end-of-stream and
+// returns the stream's total sample count (the next read is io.EOF). A negative index
+// returns ErrInvalidSeek; a non-seekable source returns ErrSeekUnsupported.
+//
+// When the source ends inside a frame, after its first two bytes, a seek below any known
+// TotalSamples whose target lies in that frame (or, for an unknown-length stream,
+// anywhere past the last complete frame) returns an error wrapping
+// flac.ErrTruncatedStream and io.ErrUnexpectedEOF. A target in an earlier, complete
+// frame still lands, and reading on reports the truncation when it reaches the cut
+// frame.
+//
+// A seek that fails after those two argument checks leaves the decoder in a hard-failed
+// state, whether the failure came from the source (an I/O error while probing) or from
+// the stream itself (a frame that will not decode at the landing offset, or a frame the
+// source cuts short). The error is sticky, so a subsequent Read or WriteTo returns it
+// rather than resuming from an indeterminate position. Retrying the seek, once the
+// condition that caused it is gone, clears the state. ErrInvalidSeek and
+// ErrSeekUnsupported are argument and capability errors that touch no state, so they
+// leave the decoder readable.
+func (d *Decoder) SeekToSample(sampleIndex int64) (int64, error) {
+	if !d.seekable {
+		return 0, flac.ErrSeekUnsupported
+	}
+	if sampleIndex < 0 {
+		return 0, flac.ErrInvalidSeek
+	}
+	if total := int64(d.info.TotalSamples); total > 0 && sampleIndex >= total {
+		return d.seekToEnd(total)
+	}
+	if d.nominalBlock <= 0 {
+		// STREAMINFO did not record a max block size (MaxBlock == 0). Discover the
+		// fixed-blocksize nominal block size from the first frame so frame numbers map to
+		// sample numbers; for a variable-blocksize stream it stays 0 and is unused.
+		if err := d.ensureNominalBlock(); err != nil {
+			return d.seekFailed(err)
+		}
+	}
+	lo, hi := d.audioStart, d.streamEnd
+	if len(d.seekPoints) > 0 {
+		lo, hi = d.narrowBySeekTable(sampleIndex, lo, hi)
+	}
+	landStart, fs, endSample, err := d.searchFrame(sampleIndex, lo, hi)
+	if err != nil {
+		return d.seekFailed(err)
+	}
+	if landStart < 0 { // target is past the true end of an unknown-length stream
+		return d.seekToEnd(endSample)
+	}
+	landed, err := d.land(landStart, sampleIndex, fs)
+	if err != nil {
+		return d.seekFailed(err)
+	}
+	if total := int64(d.info.TotalSamples); total > 0 && landed > total {
+		// A corrupt stream whose frame numbers disagree with the declared STREAMINFO total
+		// can overshoot past it; never report a position beyond the stream's bounds.
+		landed = total
+	}
+	return landed, nil
+}
+
+// seekFailed marks the decoder unusable after a seek failed part-way, and returns the
+// error for SeekToSample to propagate. Every stage past the argument checks (the probes
+// and the landing decode) repositions the shared d.rs cursor, so on failure d.br's
+// buffered bytes and logical position no longer correspond to the source, and d.pending
+// may hold samples from the abandoned position. A caller that treats the seek error as
+// non-fatal and reads on would otherwise resume from the wrong offset and get silently
+// corrupted audio, so the error is made sticky instead: Read and WriteTo both surface
+// d.err before touching the reader. Dropping d.br keeps a stale reader from being used
+// even if some future path skips that gate. The state is recoverable, not terminal: a
+// later successful seek rebuilds d.br and clears d.err in land.
+func (d *Decoder) seekFailed(err error) (int64, error) {
+	d.err = err
+	d.pending = nil
+	d.br = nil
+	return 0, err
+}
+
+// searchFrame returns the byte offset and first sample of the frame containing target.
+// landStart < 0 means the source ends cleanly with no frame at or after lo containing
+// target; endSample is then the end of the last frame the linear scan decoded (0 if it
+// decoded none). A frame the source ends inside, after its first two bytes, returns
+// errSeekFrameCut.
+func (d *Decoder) searchFrame(target, lo, hi int64) (landStart, fs, endSample int64, err error) {
+	const linearWindow = 1 << 16 // bytes; below this, scan forward frame by frame
+	for hi-lo > linearWindow {
+		mid := lo + (hi-lo)/2
+		start, end, res, perr := d.probe(mid)
+		if perr != nil {
+			return 0, 0, 0, perr
+		}
+		if res != frame.FrameFound { // no complete frame in [mid, hi): search lower
+			hi = mid
+			continue
+		}
+		f := d.firstSample(&d.probeFrame)
+		switch {
+		case f > target:
+			if start >= hi {
+				hi = mid // [mid, hi) holds no frame; the target frame is below mid
+			} else {
+				hi = start
+			}
+		case target >= f+int64(d.probeFrame.BlockSize):
+			lo = end
+		default:
+			return start, f, 0, nil
+		}
+	}
+	// Linear scan the small remaining window.
+	b := lo
+	for {
+		start, end, res, perr := d.probe(b)
+		if perr != nil {
+			return 0, 0, 0, perr
+		}
+		if res == frame.FrameTruncated { // the source ends inside this frame
+			return 0, 0, 0, errSeekFrameCut
+		}
+		if res != frame.FrameFound { // reached EOF without containing frame: target is past the true end
+			return -1, 0, endSample, nil
+		}
+		f := d.firstSample(&d.probeFrame)
+		endSample = f + int64(d.probeFrame.BlockSize)
+		switch {
+		case f <= target && target < endSample:
+			return start, f, 0, nil
+		case f > target: // overshot (rare): land at this frame's first sample
+			return start, f, 0, nil
+		default:
+			b = end
+		}
+	}
+}
+
+// firstSample returns the first inter-channel sample index of a decoded frame.
+func (d *Decoder) firstSample(fr *frame.Frame) int64 {
+	if fr.VariableBlockSize {
+		return int64(fr.Number) // coded sample number
+	}
+	return int64(fr.Number) * int64(d.nominalBlock) // frame number * nominal block size
+}
+
+// probe finds the first CRC-16-valid frame, with all samples inside its bit depth,
+// at or after absolute offset b, decoding it into d.probeFrame. res is FrameFound with
+// the frame's absolute start and end offsets; FrameTruncated when a frame starts but the
+// source ends inside it; or FrameNotFound when no frame remains before streamEnd, or the
+// probe gave up at maxProbeWindow. It does not disturb d.br.
+func (d *Decoder) probe(b int64) (start, end int64, res frame.FindResult, err error) {
+	window := max(int64(2*d.maxFrame), probeChunkDefault)
+	window = min(window, maxProbeWindow)
+	for b < d.streamEnd {
+		n := min(d.streamEnd-b, window)
+		if _, err = d.rs.Seek(b, io.SeekStart); err != nil {
+			return 0, 0, frame.FrameNotFound, err
+		}
+		if int64(cap(d.probeBuf)) < n {
+			d.probeBuf = make([]byte, n)
+		}
+		buf := d.probeBuf[:n]
+		rn, rerr := io.ReadFull(d.rs, buf)
+		if rerr != nil && !errors.Is(rerr, io.ErrUnexpectedEOF) && !errors.Is(rerr, io.EOF) {
+			return 0, 0, frame.FrameNotFound, rerr
+		}
+		buf = buf[:rn] // only the bytes actually read; the reused buffer tail is stale
+		// A short read means the source ended before the measured streamEnd (truncated
+		// since NewDecoder measured it), so this is the physical end of the stream.
+		atEnd := b+int64(rn) >= d.streamEnd || int64(rn) < n
+		s, consumed, found := frame.FindNextFrame(&d.resyncR, buf, d.info, &d.probeFrame)
+		switch found {
+		case frame.FrameFound:
+			return b + int64(s), b + int64(s+consumed), frame.FrameFound, nil
+		case frame.FrameTruncated:
+			if atEnd {
+				// A frame starts but the physical end of the source cuts it short.
+				return 0, 0, frame.FrameTruncated, nil
+			}
+			if window >= maxProbeWindow {
+				// No complete frame fits the bounded probe window (a real FLAC frame is
+				// far smaller, so this is malformed): give up.
+				return 0, 0, frame.FrameNotFound, nil
+			}
+			window *= 2 // grow and retry from the same base
+			window = min(window, maxProbeWindow)
+		default: // FrameNotFound
+			if atEnd {
+				return 0, 0, frame.FrameNotFound, nil
+			}
+			b += int64(rn) - 1 // advance, overlapping 1 byte for a sync straddling the boundary
+		}
+	}
+	return 0, 0, frame.FrameNotFound, nil
+}
+
+// ensureNominalBlock discovers the fixed-blocksize nominal block size from the first
+// audio frame when STREAMINFO did not record a max block size (MaxBlock == 0). For a
+// variable-blocksize stream the nominal block size is unused, so it is left at zero.
+func (d *Decoder) ensureNominalBlock() error {
+	_, _, res, err := d.probe(d.audioStart)
+	if err != nil {
+		return err
+	}
+	if res == frame.FrameFound && !d.probeFrame.VariableBlockSize {
+		d.nominalBlock = d.probeFrame.BlockSize
+	}
+	return nil
+}
+
+// land seeks to landStart, decodes the containing frame, and drops (target-fs) leading
+// inter-channel samples. It returns the sample index actually positioned at.
+func (d *Decoder) land(landStart, target, fs int64) (int64, error) {
+	if _, err := d.rs.Seek(landStart, io.SeekStart); err != nil {
+		return 0, err
+	}
+	if d.br == nil { // dropped by seekFailed
+		d.br = bitio.NewReaderSize(d.rs, streamReadBlock)
+	}
+	d.br.ResetAt(d.rs, landStart)
+	d.seeked = true
+	d.done = false
+	d.err = nil
+	if err := frame.Decode(d.br, d.info, &d.frame); err != nil {
+		return 0, err
+	}
+	d.packFrame(false) // seeked is set above, so no hashing
+	if target < fs {
+		target = fs // overshoot clamp: land at the frame start
+	}
+	drop := (target - fs) * int64(len(d.frame.Channels)) * int64((d.outBits+7)/8)
+	d.pending = d.buf[drop:]
+	return target, nil
+}
+
+// seekToEnd positions the decoder at end-of-stream so the next read is io.EOF, and
+// returns total (the stream's sample count).
+func (d *Decoder) seekToEnd(total int64) (int64, error) {
+	d.seeked = true
+	d.done = true
+	d.pending = nil
+	d.err = nil
+	return total, nil
+}
+
+// narrowBySeekTable tightens [lo, hi] using the bracketing SEEKTABLE points. When no
+// SEEKTABLE was present d.seekPoints is empty and this is never called.
+func (d *Decoder) narrowBySeekTable(target, lo, hi int64) (newLo, newHi int64) {
+	newLo, newHi = lo, hi
+	for _, p := range d.seekPoints {
+		// Ignore a corrupt seek point whose byte offset is negative (overflow on the
+		// uint64 -> int64 conversion) or points outside the audio region, so it cannot
+		// push the search bounds out of [audioStart, streamEnd].
+		if int64(p.ByteOffset) < 0 || int64(p.ByteOffset) > d.streamEnd-d.audioStart {
+			continue
+		}
+		off := d.audioStart + int64(p.ByteOffset)
+		if int64(p.SampleNumber) <= target && off > newLo {
+			newLo = off
+		}
+		if int64(p.SampleNumber) > target && off < newHi {
+			newHi = off
+		}
+	}
+	return newLo, newHi
+}
+
+// decodeNextFrame decodes one frame, packs its PCM into d.buf, and feeds MD5.
+// d.pending is a window into d.buf that Read/WriteTo drain. Packing into d.buf
+// (reset to d.buf[:0]) keeps the backing array stable across frames, so append
+// reuses capacity instead of reallocating once it is warmed up. It returns io.EOF
+// when the stream ends cleanly.
+func (d *Decoder) decodeNextFrame() error {
+	if d.done {
+		return io.EOF
+	}
+	err := frame.Decode(d.br, d.info, &d.frame)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return d.finish() // clean end at a frame boundary
+		}
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			// Mid-frame cut: surface ErrTruncatedStream, keep io.ErrUnexpectedEOF in chain.
+			err = fmt.Errorf("%w: %w", flac.ErrTruncatedStream, err)
+		}
+		d.err = err
+		return err
+	}
+	d.decoded += uint64(d.frame.BlockSize)
+	// MD5 is meaningless once frames have been skipped, or when opted out.
+	d.packFrame(!d.seeked && !d.skipMD5)
+	d.pending = d.buf
+	return nil
+}
+
+// packFrame packs d.frame into d.buf at the output width. When hashNative is set it first
+// feeds the native packed bytes to MD5, which STREAMINFO's signature is defined over.
+func (d *Decoder) packFrame(hashNative bool) {
+	shift := d.outBits - d.info.BitDepth // 0 with no conversion or target == native depth
+	if shift == 0 || hashNative {
+		d.buf = appendPacked(d.buf[:0], &d.frame, d.bytesPS)
+		if hashNative {
+			d.md5.Write(d.buf)
+		}
+	}
+	if shift != 0 { // rescale after hashing, then repack at the output width
+		shiftSamples(&d.frame, shift)
+		d.buf = appendPacked(d.buf[:0], &d.frame, (d.outBits+7)/8)
+	}
+}
+
+// finish verifies the stream MD5 (unless the caller passed SkipMD5Verification) and
+// the sample count, when not seeked, and marks the decoder done.
+func (d *Decoder) finish() error {
+	d.done = true
+	if !d.seeked {
+		var zero [16]byte
+		if !d.skipMD5 && d.info.MD5 != zero {
+			var sum [16]byte
+			copy(sum[:], d.md5.Sum(nil))
+			if sum != d.info.MD5 {
+				d.err = flac.ErrMD5Mismatch
+				return d.err
+			}
+		} else if d.info.TotalSamples != 0 && d.decoded < d.info.TotalSamples {
+			d.err = flac.ErrTruncatedStream // inter-frame cut on a zero-MD5 stream
+			return d.err
+		}
+	}
+	return io.EOF
+}
+
+// Read fills p with interleaved little-endian PCM at OutputBitDepth.
+func (d *Decoder) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		// Per io.Reader, a zero-length read returns immediately; do not decode
+		// a frame just to copy nothing.
+		return 0, nil
+	}
+	if d.err != nil {
+		return 0, d.err
+	}
+	for len(d.pending) == 0 {
+		if err := d.decodeNextFrame(); err != nil {
+			return 0, err
+		}
+	}
+	n := copy(p, d.pending)
+	d.pending = d.pending[n:]
+	return n, nil
+}
+
+// WriteTo drains all decoded PCM into w.
+func (d *Decoder) WriteTo(w io.Writer) (int64, error) {
+	if d.err != nil {
+		return 0, d.err
+	}
+	var total int64
+	if len(d.pending) > 0 {
+		n, err := w.Write(d.pending)
+		total += int64(n)
+		d.pending = d.pending[n:]
+		if err != nil {
+			return total, err
+		}
+	}
+	for {
+		err := d.decodeNextFrame()
+		if errors.Is(err, io.EOF) {
+			return total, nil
+		}
+		if err != nil {
+			return total, err
+		}
+		n, werr := w.Write(d.pending)
+		total += int64(n)
+		d.pending = d.pending[n:]
+		if werr != nil {
+			return total, werr
+		}
+	}
+}
+
+// appendPacked appends the frame's interleaved little-endian PCM to dst. It grows
+// dst once to the exact size and writes by index, so a warmed-up reused buffer
+// packs each frame with no further allocation or per-byte append overhead.
+func appendPacked(dst []byte, fr *frame.Frame, bytesPS int) []byte {
+	nch := len(fr.Channels)
+	oldLen := len(dst)
+	newLen := oldLen + fr.BlockSize*nch*bytesPS
+	if cap(dst) < newLen {
+		grown := make([]byte, newLen)
+		copy(grown, dst)
+		dst = grown
+	} else {
+		dst = dst[:newLen]
+	}
+	idx := oldLen
+	// Specialize on the byte width (1..4 for all FLAC bit depths) so the inner
+	// loop and variable shift drop out of the per-sample hot path.
+	switch bytesPS {
+	case 1:
+		for i := range fr.BlockSize {
+			for ch := range nch {
+				dst[idx] = byte(fr.Channels[ch][i])
+				idx++
+			}
+		}
+	case 2:
+		// 16-bit PCM (CD audio, the common capture path) takes widened 64-bit
+		// stores for mono and stereo, mirroring the widened loads in
+		// deinterleaveSamples; every other channel count uses the scalar store.
+		// The widened paths are byte-identical to the scalar store on all hosts.
+		switch nch {
+		case 1:
+			// The helper fills dst[idx:] for the whole block; idx is not read again.
+			packLE16Mono(dst[idx:], fr.Channels[0], fr.BlockSize)
+		case 2:
+			packLE16Stereo(dst[idx:], fr.Channels[0], fr.Channels[1], fr.BlockSize)
+		default:
+			for i := range fr.BlockSize {
+				for ch := range nch {
+					v := uint16(fr.Channels[ch][i])
+					dst[idx] = byte(v)
+					dst[idx+1] = byte(v >> 8)
+					idx += 2
+				}
+			}
+		}
+	case 3:
+		for i := range fr.BlockSize {
+			for ch := range nch {
+				v := uint32(fr.Channels[ch][i])
+				dst[idx] = byte(v)
+				dst[idx+1] = byte(v >> 8)
+				dst[idx+2] = byte(v >> 16)
+				idx += 3
+			}
+		}
+	case 4:
+		for i := range fr.BlockSize {
+			for ch := range nch {
+				v := uint32(fr.Channels[ch][i])
+				dst[idx] = byte(v)
+				dst[idx+1] = byte(v >> 8)
+				dst[idx+2] = byte(v >> 16)
+				dst[idx+3] = byte(v >> 24)
+				idx += 4
+			}
+		}
+	default:
+		for i := range fr.BlockSize {
+			for ch := range nch {
+				v := uint32(fr.Channels[ch][i])
+				for b := range bytesPS {
+					dst[idx] = byte(v >> (uint(b) * 8))
+					idx++
+				}
+			}
+		}
+	}
+	return dst
+}
