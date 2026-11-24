@@ -7,7 +7,7 @@ type C[T SignalTypes] struct {
 
 // BufferIndex returns sample index in the channel of signal Buffer.
 func (c C[T]) BufferIndex(channel int, index int) int {
-	return c.channel * index
+	return c.Buffer.BufferIndex(c.channel, index)
 }
 
 // Channels always returns 1.
@@ -27,7 +27,7 @@ func (c C[T]) Length() int {
 
 // Sample returns signal value for provided channel and index.
 func (c C[T]) Sample(index int) T {
-	return c.Buffer.Sample(index * c.channel)
+	return c.Buffer.Sample(c.Buffer.BufferIndex(c.channel, index))
 }
 
 // SetSample sets sample value for provided index.

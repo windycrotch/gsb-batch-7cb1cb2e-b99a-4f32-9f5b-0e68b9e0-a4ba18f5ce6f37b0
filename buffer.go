@@ -13,12 +13,15 @@ type Buffer[T SignalTypes] struct {
 }
 
 // Slice the Buffer with respect to channels.
+// The returned Buffer shares the underlying data. Its capacity is reported
+// from the slice start up to the parent Buffer capacity, measured in
+// samples of a single channel.
 func (b *Buffer[T]) Slice(start, end int) *Buffer[T] {
 	start = b.BufferIndex(0, start)
 	end = b.BufferIndex(0, end)
 	return &Buffer[T]{
 		channels: b.channels,
-		data:     b.data[start:end],
+		data:     b.data[start:end:cap(b.data)],
 		bitDepth: b.bitDepth,
 	}
 }
@@ -71,18 +74,32 @@ func (b *Buffer[T]) Sample(i int) T {
 // Append appends [0:Length] samples from src to current Buffer.
 // Both buffers must have same number of channels and
 // bit depth, otherwise function will panic.
+// Only samples within the valid length of src are appended. If the
+// destination capacity is insufficient, the Buffer grows; the resulting
+// capacity is always aligned with the number of channels, so no samples
+// are lost or misplaced across channels.
 func (dst *Buffer[D]) Append(src *Buffer[D]) {
 	mustSame(dst.Channels(), src.Channels(), diffChannels)
 	offset := dst.Len()
-	if dst.Cap() < dst.Len()+src.Len() {
-		dst.data = append(dst.data, make([]D, src.Len())...)
-	} else {
-		dst.data = dst.data[:dst.Len()+src.Len()]
+	need := offset + src.Len()
+	if cap(dst.data) < need {
+		// Grow into an explicitly channel-aligned backing array. Built-in
+		// append could pick an arbitrary size-class capacity, so the new
+		// slice is allocated with an exact capacity instead.
+		grow := need
+		if n := dst.Channels(); n > 0 {
+			if r := grow % n; r != 0 {
+				grow += n - r
+			}
+		}
+		grown := make([]D, dst.Len(), grow)
+		copy(grown, dst.data)
+		dst.data = grown
 	}
+	dst.data = dst.data[:need]
 	for i := 0; i < src.Len(); i++ {
 		dst.SetSample(i+offset, src.Sample(i))
 	}
-	alignCapacity(&dst.data, dst.Channels(), dst.Cap())
 }
 
 // Channel returns a single channel of signal Buffer. It behaves exactly as

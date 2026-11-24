@@ -4,7 +4,6 @@ package signal
 
 import (
 	"math"
-	"reflect"
 	"time"
 
 	"golang.org/x/exp/constraints"
@@ -484,10 +483,4 @@ func WriteStriped[S, D SignalTypes](src [][]S, dst *Buffer[D]) (written int) {
 		}
 	}
 	return
-}
-
-// alignCapacity ensures that Buffer capacity is aligned with number of
-// channels.
-func alignCapacity(s interface{}, channels, c int) {
-	reflect.ValueOf(s).Elem().SetCap(c - c%channels)
 }
