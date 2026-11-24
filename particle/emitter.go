@@ -32,6 +32,12 @@ type Emitter struct {
 	idSeq      uint32
 	generation uint16
 
+	// renderer is the renderer this emitter currently belongs to.
+	// An emitter can be registered with at most one renderer at a time.
+	// It's used to keep AddEmitter idempotent so a re-added emitter
+	// never gets drawn twice or leaves stale batch entries.
+	renderer *Renderer
+
 	emitting bool
 	visible  bool
 	disposed bool
@@ -72,10 +78,37 @@ func (e *Emitter) IsDisposed() bool {
 	return e.disposed
 }
 
+// Dispose marks the emitter as disposed.
+//
+// A disposed emitter is removed from its renderer buckets on the next
+// Draw call and never emits or renders again. Disposal is permanent:
+// re-adding the same disposed emitter to a renderer is a no-op.
+// The emitter itself is not mutated otherwise, so its state remains
+// queryable (for example, via [Emitter.NumParticles]).
 func (e *Emitter) Dispose() {
 	e.disposed = true
 }
 
+// Clear removes all live particles from the emitter without changing
+// its emitting, visibility or disposal state.
+//
+// It's useful when an emitter has to be emptied immediately rather
+// than waiting for all of its particles to reach the end of their
+// lifetimes. Already rendered batches are not affected: the cleared
+// particles simply stop being drawn on the next Draw call.
+func (e *Emitter) Clear() {
+	if e.disposed {
+		return
+	}
+	e.particles = e.particles[:0]
+}
+
+// SetVisibility toggles the emitter visibility.
+//
+// A hidden emitter keeps updating normally: its particles age while
+// hidden, so making it visible again never rolls their lifetimes back
+// or double-counts them. It simply stops contributing to the drawn
+// batches until it becomes visible again.
 func (e *Emitter) SetVisibility(visible bool) { e.visible = visible }
 
 func (e *Emitter) SetLifetimeMultiplier(multiplier float64) {
@@ -100,6 +133,13 @@ func (e *Emitter) Update() {
 }
 
 func (e *Emitter) UpdateWithDelta(delta float64) {
+	// A disposed emitter is frozen: it neither emits new particles
+	// nor ages the existing ones. Its state stays queryable until
+	// the renderer drops it from its batches.
+	if e.disposed {
+		return
+	}
+
 	if e.emitting {
 		// With a very low emit interval, it's possible to have
 		// delta > emitInterval.

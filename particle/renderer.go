@@ -34,6 +34,13 @@ type rendererBucket struct {
 	emitters []*Emitter
 }
 
+// drawTriangles is a thin wrapper over [ebiten.Image.DrawTriangles].
+// It's a package-level variable so tests can replace it with a spy
+// that counts batch draws without needing a running game.
+var drawTriangles = func(dst *ebiten.Image, vertices []ebiten.Vertex, indices []uint16, img *ebiten.Image, opts *ebiten.DrawTrianglesOptions) {
+	dst.DrawTriangles(vertices, indices, img, opts)
+}
+
 func NewRenderer() *Renderer {
 	return &Renderer{
 		bucketIDByImage: make(map[*ebiten.Image]int, 8),
@@ -49,11 +56,41 @@ func (r *Renderer) IsDisposed() bool {
 // Dispose marks the renderer to be removed from the scene.
 // It does not dispose any of its associated emitters.
 // This is mostly relevant if you're using some scene framework.
+//
+// After disposal the renderer stops drawing any of its batches,
+// but the registered emitters are left untouched and their state
+// (particle counts, visibility, disposal flags) stays queryable.
 func (r *Renderer) Dispose() {
 	r.disposed = true
 }
 
+// AddEmitter registers e with the renderer so its particles get drawn
+// in the batch keyed by the emitter's template image.
+//
+// AddEmitter is idempotent for live emitters: adding an emitter that
+// already belongs to this renderer is a no-op, so a re-added emitter
+// can never be drawn twice or leave a stale duplicate in a batch.
+//
+// If e already belongs to another renderer, it's removed from that
+// renderer's batch first: an emitter is always registered with at
+// most one renderer at a time.
+//
+// Adding a disposed emitter is a no-op as well; disposal is permanent,
+// so a fresh emitter has to be created instead of reusing the old one.
+// Adding emitters to a disposed renderer is also a no-op.
 func (r *Renderer) AddEmitter(e *Emitter) {
+	if e.IsDisposed() || r.disposed {
+		return
+	}
+	if e.renderer == r {
+		// Already registered with this renderer.
+		return
+	}
+	if e.renderer != nil {
+		// Move the emitter out of its previous renderer's batch.
+		e.renderer.removeEmitter(e)
+	}
+
 	bucketID, ok := r.bucketIDByImage[e.tmpl.img]
 	var bucket *rendererBucket
 
@@ -81,7 +118,25 @@ func (r *Renderer) AddEmitter(e *Emitter) {
 		r.bucketIDByImage[e.tmpl.img] = id
 	}
 
+	e.renderer = r
 	bucket.emitters = append(bucket.emitters, e)
+}
+
+// removeEmitter drops e from its bucket in this renderer without
+// retiring the bucket; the bucket cleanup happens on the next Draw.
+func (r *Renderer) removeEmitter(e *Emitter) {
+	bucketID, ok := r.bucketIDByImage[e.tmpl.img]
+	if !ok {
+		return
+	}
+	bucket := r.bucketList[bucketID]
+	emitters := bucket.emitters[:0]
+	for _, member := range bucket.emitters {
+		if member != e {
+			emitters = append(emitters, member)
+		}
+	}
+	bucket.emitters = emitters
 }
 
 func (r *Renderer) Draw(dst *ebiten.Image) {
@@ -89,11 +144,24 @@ func (r *Renderer) Draw(dst *ebiten.Image) {
 }
 
 func (r *Renderer) DrawWithOptions(dst *ebiten.Image, opts graphics.DrawOptions) {
+	if r.disposed {
+		// A disposed renderer keeps its emitters and buckets intact
+		// (their state must stay queryable), it just never draws.
+		return
+	}
+
 	for _, bucket := range r.bucketList {
 		if bucket.img == nil {
 			continue // This bucket was retired, it's in the free list
 		}
-		activeEmitters := r.drawBucket(dst, bucket.img, opts, bucket.emitters)
+		activeEmitters, removedEmitters := r.drawBucket(dst, bucket.img, opts, bucket.emitters)
+		for _, e := range removedEmitters {
+			// These emitters were disposed and dropped from the batch;
+			// clear the ownership link so a fresh state can be tracked.
+			if e.renderer == r {
+				e.renderer = nil
+			}
+		}
 		if len(activeEmitters) == 0 {
 			delete(r.bucketIDByImage, bucket.img)
 			bucket.emitters = bucket.emitters[:0]
@@ -105,7 +173,7 @@ func (r *Renderer) DrawWithOptions(dst *ebiten.Image, opts graphics.DrawOptions)
 	}
 }
 
-func (r *Renderer) drawBucket(dst *ebiten.Image, img *ebiten.Image, opts graphics.DrawOptions, emitters []*Emitter) []*Emitter {
+func (r *Renderer) drawBucket(dst *ebiten.Image, img *ebiten.Image, opts graphics.DrawOptions, emitters []*Emitter) (active []*Emitter, removed []*Emitter) {
 	const batchThreshold = math.MaxUint16 / 24 // Doesn't have to be bigger
 	batchParticles := 0
 
@@ -118,6 +186,7 @@ func (r *Renderer) drawBucket(dst *ebiten.Image, img *ebiten.Image, opts graphic
 
 	for _, e := range emitters {
 		if e.IsDisposed() {
+			removed = append(removed, e)
 			continue
 		}
 		activeEmitters = append(activeEmitters, e)
@@ -147,7 +216,7 @@ func (r *Renderer) drawBucket(dst *ebiten.Image, img *ebiten.Image, opts graphic
 		r.drawBatch(dst, img, opts, batch)
 	}
 
-	return activeEmitters
+	return activeEmitters, removed
 }
 
 func (r *Renderer) drawBatch(dst, img *ebiten.Image, opts graphics.DrawOptions, emitters []*Emitter) {
@@ -244,5 +313,5 @@ func (r *Renderer) drawBatch(dst, img *ebiten.Image, opts graphics.DrawOptions, 
 	}
 
 	var drawOptions ebiten.DrawTrianglesOptions
-	dst.DrawTriangles(vertices, indices, img, &drawOptions)
+	drawTriangles(dst, vertices, indices, img, &drawOptions)
 }
