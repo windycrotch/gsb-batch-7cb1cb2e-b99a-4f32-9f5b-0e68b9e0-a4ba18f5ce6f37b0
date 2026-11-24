@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/dionysia-dev/dionysia/internal/service"
@@ -86,8 +87,19 @@ func (c *InputController) GetInput(ctx *gin.Context) {
 
 	input, err := c.inputHandler.GetInput(ctx, id)
 	if err != nil {
+		if service.IsInputNotFound(err) {
+			ctx.JSON(http.StatusNotFound, ErrorResponse{
+				Error: Error{
+					Code:    "INPUT_NOT_FOUND",
+					Message: "NotFound: input not found",
+				},
+			})
+
+			return
+		}
+
 		ctx.JSON(http.StatusInternalServerError, ErrorResponse{
-			Error: Error{Message: "InternalServerError: failed creating input"},
+			Error: Error{Message: "InternalServerError: failed getting input"},
 		})
 
 		return
@@ -118,6 +130,16 @@ func (c *InputController) DeleteInput(ctx *gin.Context) {
 	}
 
 	if err := c.inputHandler.DeleteInput(ctx, id); err != nil {
+		// Deleting an already absent input is an idempotent success, never an
+		// internal error (covers repeated/concurrent deletes).
+		if service.IsInputNotFound(err) {
+			ctx.JSON(http.StatusOK, SuccessResponse{
+				Message: "Input already deleted",
+			})
+
+			return
+		}
+
 		ctx.JSON(http.StatusInternalServerError, ErrorResponse{
 			Error: Error{Message: "InternalServerError: failed deleting input"},
 		})
@@ -197,11 +219,32 @@ func (n *NotificationController) EnqueuePackaging(ctx *gin.Context) {
 	}
 
 	if err := n.notificationHandler.PackageStream(ctx, id); err != nil {
-		ctx.JSON(http.StatusInternalServerError, ErrorResponse{
-			Error: Error{Message: "InternalServerError: while creating input"},
-		})
+		switch {
+		case errors.Is(err, service.ErrInputDeleting):
+			ctx.JSON(http.StatusConflict, ErrorResponse{
+				Error: Error{
+					Code:    "INPUT_DELETING",
+					Message: "Conflict: input is being deleted",
+				},
+			})
 
-		return
+			return
+		case service.IsInputNotFound(err):
+			ctx.JSON(http.StatusNotFound, ErrorResponse{
+				Error: Error{
+					Code:    "INPUT_NOT_FOUND",
+					Message: "NotFound: input not found",
+				},
+			})
+
+			return
+		default:
+			ctx.JSON(http.StatusInternalServerError, ErrorResponse{
+				Error: Error{Message: "InternalServerError: while creating input"},
+			})
+
+			return
+		}
 	}
 
 	ctx.JSON(http.StatusCreated, SuccessResponse{

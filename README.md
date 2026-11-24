@@ -76,6 +76,21 @@ To run the test suite:
 just test
 ```
 
+### Input deletion / packaging lifecycle
+
+Deleting an input rejects later packaging requests, causes already-queued
+tasks to be skipped (no gpac call, no HLS output), cancels and cleans up a
+running package, and keeps a failed input queryable with `status=failed`.
+Repeated/concurrent deletes are idempotent, and packaging a missing input
+returns `404` with `error.code=INPUT_NOT_FOUND`.
+
+Hermetic acceptance tests (with an embedded fake gpac covering success,
+failure and long-running modes) live in [`acceptance/`](acceptance/README.md):
+
+```sh
+go test ./acceptance -count=1 -v
+```
+
 Integrations test can be run with:
 
 ```sh

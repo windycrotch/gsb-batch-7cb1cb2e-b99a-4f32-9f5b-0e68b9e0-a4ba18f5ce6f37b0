@@ -15,6 +15,7 @@ type Config struct {
 	OriginTTL          int           `env:"ORIGIN_TTL" envDefault:"10"`
 	PlayoutPath        string        `env:"PLAYOUT_PATH" envDefault:"/tmp"`
 	PlayoutPort        string        `env:"PLAYOUT_PORT" envDefault:"8081"`
+	GPACBin            string        `env:"GPAC_BIN" envDefault:"gpac"`
 }
 
 func New() (*Config, error) {

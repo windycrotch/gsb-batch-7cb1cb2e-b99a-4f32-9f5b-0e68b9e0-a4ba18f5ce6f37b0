@@ -39,6 +39,9 @@ func NewAPICmd() *cobra.Command {
 					service.NewOriginHandler,
 					service.NewNotificationHandler,
 				),
+				fx.Invoke(func(cfg *config.Config) {
+					service.SetDefaultPlayoutPath(cfg.PlayoutPath)
+				}),
 				api.Module,
 			)
 

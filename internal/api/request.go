@@ -9,6 +9,8 @@ type InputData struct {
 	ID            uuid.UUID          `json:"id" swaggerignore:"true"`
 	Name          string             `json:"name" validate:"required"`
 	Format        string             `json:"format" validate:"required"`
+	Status        string             `json:"status,omitempty"`
+	StatusMessage string             `json:"status_message,omitempty"`
 	AudioProfiles []AudioProfileData `json:"audio_profiles"`
 	VideoProfiles []VideoProfileData `json:"video_profiles"`
 }
@@ -38,6 +40,8 @@ func (i *InputData) ToInput() *service.Input {
 		ID:            i.ID,
 		Name:          i.Name,
 		Format:        i.Format,
+		Status:        i.Status,
+		StatusMessage: i.StatusMessage,
 		AudioProfiles: audioProfiles,
 		VideoProfiles: videoProfiles,
 	}
@@ -68,6 +72,8 @@ func FromInput(input service.Input) InputData {
 		ID:            input.ID,
 		Name:          input.Name,
 		Format:        input.Format,
+		Status:        input.Status,
+		StatusMessage: input.StatusMessage,
 		AudioProfiles: audioProfiles,
 		VideoProfiles: videoProfiles,
 	}

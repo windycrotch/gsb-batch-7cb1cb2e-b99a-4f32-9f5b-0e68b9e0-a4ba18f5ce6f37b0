@@ -1,7 +1,9 @@
 CREATE TABLE inputs (
     id UUID PRIMARY KEY,
     name TEXT NOT NULL,
-    format TEXT NOT NULL
+    format TEXT NOT NULL,
+    status VARCHAR(32) NOT NULL DEFAULT 'active',
+    status_message TEXT
 );
 
 CREATE TABLE audio_profiles (

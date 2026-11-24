@@ -17,6 +17,10 @@ type ErrorDetail struct {
 }
 
 type Error struct {
+	// Code is an optional stable, machine-readable error code (e.g.
+	// INPUT_NOT_FOUND). It lets clients/acceptance distinguish lifecycle
+	// errors without parsing the human message or receiving a blanket 500.
+	Code    string        `json:"code,omitempty"`
 	Message string        `json:"message"`
 	Details []ErrorDetail `json:"details,omitempty"`
 }

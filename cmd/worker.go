@@ -4,6 +4,7 @@ import (
 	"log"
 
 	"github.com/dionysia-dev/dionysia/internal/config"
+	"github.com/dionysia-dev/dionysia/internal/db"
 	"github.com/dionysia-dev/dionysia/internal/logging"
 	"github.com/dionysia-dev/dionysia/internal/queue"
 	"github.com/dionysia-dev/dionysia/internal/task"
@@ -24,6 +25,8 @@ func NewWorker() *cobra.Command {
 			app := fx.New(
 				fx.Provide(config.New),
 				fx.Provide(logging.New),
+				fx.Provide(db.New),
+				fx.Provide(db.NewDBInputStore),
 				fx.Provide(queue.NewServer),
 				fx.Invoke(task.Run),
 			)

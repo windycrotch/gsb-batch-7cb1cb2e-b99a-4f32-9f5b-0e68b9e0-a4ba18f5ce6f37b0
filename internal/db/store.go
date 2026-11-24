@@ -19,6 +19,15 @@ type InputStore interface {
 	DeleteInput(context.Context, uuid.UUID) error
 }
 
+// InputStatusUpdater is an optional capability of an InputStore. It persists
+// the packaging lifecycle status of an input without removing the record.
+//
+// It is defined as a separate interface so existing InputStore
+// implementations (and test doubles) keep satisfying InputStore unchanged.
+type InputStatusUpdater interface {
+	UpdateInputStatus(ctx context.Context, id uuid.UUID, status, message string) error
+}
+
 type InputStoreDB struct {
 	DB *gorm.DB
 }
@@ -45,5 +54,46 @@ func (s *InputStoreDB) GetInput(ctx context.Context, id uuid.UUID) (model.Input,
 }
 
 func (s *InputStoreDB) DeleteInput(ctx context.Context, id uuid.UUID) error {
-	return s.DB.WithContext(ctx).Delete(&model.Input{}, "id = ?", id).Error
+	// Deletion is idempotent: removing an already absent input is not an
+	// error, so concurrent or repeated DELETE requests converge on the same
+	// result instead of producing an internal error.
+	return s.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("input_id = ?", id).Delete(&model.AudioProfile{}).Error; err != nil {
+			return err
+		}
+
+		if err := tx.Where("input_id = ?", id).Delete(&model.VideoProfile{}).Error; err != nil {
+			return err
+		}
+
+		if err := tx.Delete(&model.Input{}, "id = ?", id).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+
+			return err
+		}
+
+		return nil
+	})
+}
+
+func (s *InputStoreDB) UpdateInputStatus(ctx context.Context, id uuid.UUID, status, message string) error {
+	result := s.DB.WithContext(ctx).
+		Model(&model.Input{}).
+		Where("id = ?", id).
+		Updates(map[string]any{
+			"status":         status,
+			"status_message": message,
+		})
+
+	if result.Error != nil {
+		return result.Error
+	}
+
+	if result.RowsAffected == 0 {
+		return ErrNotFound
+	}
+
+	return nil
 }

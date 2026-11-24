@@ -4,12 +4,25 @@ import (
 	"context"
 	"log"
 
+	"github.com/dionysia-dev/dionysia/internal/config"
+	"github.com/dionysia-dev/dionysia/internal/db"
 	"github.com/dionysia-dev/dionysia/internal/service"
 	"github.com/hibiken/asynq"
 	"go.uber.org/fx"
 )
 
-func Run(lc fx.Lifecycle, srv *asynq.Server) {
+func Run(lc fx.Lifecycle, srv *asynq.Server, cfg *config.Config, store db.InputStore) {
+	// Install the dependency-aware packager so the package-level
+	// service.HandleStreamPackageTask (registered on the mux below)
+	// re-validates inputs, coordinates with deletion and persists status.
+	packager := service.NewStreamPackager(
+		store,
+		cfg,
+		service.WithPackagerCoordinator(service.DefaultCoordinator()),
+	)
+	service.SetDefaultStreamPackager(packager)
+	service.SetDefaultPlayoutPath(cfg.PlayoutPath)
+
 	lc.Append(fx.Hook{
 		OnStart: func(context.Context) error {
 			mux := asynq.NewServeMux()

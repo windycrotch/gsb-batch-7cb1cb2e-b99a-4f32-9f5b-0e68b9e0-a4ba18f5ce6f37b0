@@ -49,6 +49,7 @@ services:
     build: .
     restart: always
     depends_on:
+      - db
       - redis
     command: worker
     env_file:

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os/exec"
@@ -83,16 +84,15 @@ func (b *GPACCommandBuilder) Build(id, address, output string, input Input) *GPA
 		input.AudioProfiles = b.config.DefaultAudioProfiles
 	}
 
-	return &GPACCommand{
+	cmd := &GPACCommand{
 		ID:      id,
 		Address: address,
 		Output:  output,
 		Input:   input,
-		Runner: func(program string, args []string) error {
-			cmd := exec.Command(program, args...)
-			return cmd.Run()
-		},
 	}
+	cmd.Runner = cmd.defaultRunner
+
+	return cmd
 }
 
 type GPACCommand struct {
@@ -100,7 +100,42 @@ type GPACCommand struct {
 	Address string
 	Output  string
 	Input   Input
-	Runner  func(string, []string) error
+
+	// Bin optionally overrides the gpac executable name/path. It exists so
+	// acceptance tests can point at a local fake gpac script/binary. When
+	// empty, "gpac" is resolved from PATH.
+	Bin string
+	// Ctx binds the subprocess lifetime. Canceling it kills gpac, which is
+	// used when the underlying input is deleted while packaging is running.
+	Ctx context.Context
+
+	// Runner is the legacy execution seam. When non-nil, Execute invokes it
+	// with the resolved program name and built arguments; this keeps existing
+	// argument-asserting tests working without a real subprocess.
+	Runner func(program string, args []string) error
+}
+
+// program returns the configured gpac binary or the default "gpac".
+func (g *GPACCommand) program() string {
+	if g.Bin != "" {
+		return g.Bin
+	}
+
+	return "gpac"
+}
+
+func (g *GPACCommand) context() context.Context {
+	if g.Ctx != nil {
+		return g.Ctx
+	}
+
+	return context.Background()
+}
+
+// defaultRunner runs gpac as a real subprocess bound to g.Ctx. It is a
+// method value so it always observes the current Ctx/Bin fields.
+func (g *GPACCommand) defaultRunner(program string, args []string) error {
+	return exec.CommandContext(g.context(), program, args...).Run()
 }
 
 func (g *GPACCommand) Execute() error {
@@ -131,22 +166,24 @@ func (g *GPACCommand) Execute() error {
 
 	args = append(args, "-o", fmt.Sprintf("%s/%s/index.m3u8:segdur=%d:dmode=dynamic:profile=live:muxtype=ts", g.Output, g.ID, defaultSegmentDuration))
 
-	log.Printf("Executing gpac command: %s", strings.Join(args, " "))
+	program := g.program()
+	log.Printf("Executing gpac command: %s %s", program, strings.Join(args, " "))
 
-	return g.Runner("gpac", args)
+	if g.Runner != nil {
+		return g.Runner(program, args)
+	}
+
+	return g.defaultRunner(program, args)
 }
 
 func NewGPACCommand(id, address, output string, input Input) *GPACCommand {
-	runner := func(program string, args []string) error {
-		cmd := exec.Command(program, args...)
-		return cmd.Run()
-	}
-
-	return &GPACCommand{
+	command := &GPACCommand{
 		ID:      id,
 		Address: address,
 		Output:  output,
 		Input:   input,
-		Runner:  runner,
 	}
+	command.Runner = command.defaultRunner
+
+	return command
 }
