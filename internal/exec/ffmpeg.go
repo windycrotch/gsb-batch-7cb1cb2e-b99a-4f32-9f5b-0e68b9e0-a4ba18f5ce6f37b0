@@ -6,14 +6,13 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
-	"regexp"
 	"strings"
 	"time"
+
+	"github.com/steipete/camsnap/internal/redact"
 )
 
 const ffmpegLogTailLines = 20
-
-var rtspURLPattern = regexp.MustCompile(`(?i)rtsps?://[^\s]+`)
 
 // RunFFmpeg executes ffmpeg with a timeout, returning combined output on error.
 func RunFFmpeg(ctx context.Context, args ...string) error {
@@ -69,24 +68,11 @@ func RunFFmpegWithStderrLines(ctx context.Context, args []string, onLine func(st
 	return strings.Join(logTail, "\n"), cmd.Wait(), nil
 }
 
+// redactRTSPCredentials hides userinfo in any RTSP/RTSPS URLs embedded in
+// ffmpeg output. It is a thin wrapper around the shared redact package so
+// log handling and the gortsplib capture path apply identical rules.
 func redactRTSPCredentials(text string) string {
-	return rtspURLPattern.ReplaceAllStringFunc(text, func(rawURL string) string {
-		schemeEnd := strings.Index(rawURL, "://")
-		if schemeEnd < 0 {
-			return rawURL
-		}
-		authorityStart := schemeEnd + len("://")
-		tail := rawURL[authorityStart:]
-		authorityEnd := len(tail)
-		if i := strings.IndexAny(tail, "/?#"); i >= 0 {
-			authorityEnd = i
-		}
-		at := strings.LastIndex(tail[:authorityEnd], "@")
-		if at < 0 {
-			return rawURL
-		}
-		return rawURL[:authorityStart] + "REDACTED@" + tail[at+1:]
-	})
+	return redact.Text(text)
 }
 
 // WithTimeout returns a derived context that times out.

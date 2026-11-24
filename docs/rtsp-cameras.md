@@ -58,7 +58,9 @@ With `--rtsp-client gortsplib`, snapshots use the first H.264 keyframe and the c
 camsnap doctor --probe --rtsp-transport udp
 ```
 
-Capture failures redact RTSP credentials before printing ffmpeg diagnostics.
+Capture failures redact RTSP credentials before printing diagnostics. This applies to both the ffmpeg and gortsplib clients across every stage (URL parsing, DESCRIBE, SETUP, PLAY and transcoding): the username and password are replaced with `REDACTED` while the scheme, host, port and path are kept so the failure can still be located. Error messages are therefore safe to paste into tickets.
+
+A timed-out or canceled grab tears the whole session down: the RTSP connection, its reader goroutine and the ffmpeg process are terminated and reaped, and any half-written output file is removed. The gortsplib client returns a recognizable error (`rtsp frame grab timed out`, which satisfies `errors.Is(err, context.DeadlineExceeded)`, or `rtsp frame grab canceled`), and consecutive grabs never share a session or output file, so one failed grab cannot affect the next.
 
 ## IPv6 hosts and discovery
 
