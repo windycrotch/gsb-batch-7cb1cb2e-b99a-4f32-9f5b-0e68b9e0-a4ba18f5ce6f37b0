@@ -1,0 +1,24 @@
+{
+    "name": "Golang",
+    "image": "recorder-dev",
+    "workspaceFolder": "/app",
+    "mounts": [
+        "source=${localWorkspaceFolder},target=/app,type=bind,consistency=cached"
+    ],
+    "customizations": {
+        "vscode": {
+            "settings": {
+                "terminal.integrated.shell.linux": "/bin/bash"
+            },
+            "extensions": [
+                "golang.go"
+            ]
+        }
+    },
+    "forwardPorts": [
+        4000,
+        3000
+    ],
+    "postCreateCommand": "./pulseaudio.sh",
+    "remoteUser": "root"
+}
