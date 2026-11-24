@@ -1,0 +1,52 @@
+version: 2
+
+builds:
+- goos:
+    - linux
+    - windows
+    - darwin
+  goarch:
+    - amd64
+    - arm64
+archives:
+  - name_template: >-
+      {{ .ProjectName }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else }}{{ .Arch }}{{ end }}
+      {{- if .Arm }}v{{ .Arm }}{{ end }}
+    format_overrides:
+    - goos: windows
+      formats: [zip]
+    files:
+      - README.md
+      - LICENSE
+
+homebrew_casks:
+  - name: ffmpegd
+    description: Websocket server that runs FFmpeg encodes for FFmpeg Commander
+    homepage: https://github.com/alfg/ffmpegd
+    license: MIT
+    dependencies:
+      - formula: ffmpeg
+    repository:
+      owner: alfg
+      name: homebrew-tap
+      branch: master
+      # goreleaser only accepts a bare {{ .Env.NAME }} here. The workflow always
+      # sets the variable, empty when the secret is missing.
+      token: '{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}'
+    # Skip the tap until the HOMEBREW_TAP_GITHUB_TOKEN secret is set, rather
+    # than failing the release.
+    skip_upload: '{{ if not (index .Env "HOMEBREW_TAP_GITHUB_TOKEN") }}true{{ end }}'
+    # The binary isn't signed, so clear the quarantine flag macOS sets on
+    # downloads; otherwise Gatekeeper refuses to run it. Written as a custom
+    # block because goreleaser's hooks only generate the `postflight` stanza,
+    # which Homebrew has deprecated in favour of `postflight_steps`. Paths in
+    # the steps are relative to the cask's staged path.
+    custom_block: |
+      postflight_steps do
+        on_macos do
+          run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "ffmpegd"], chdir: ".", must_succeed: false
+        end
+      end
