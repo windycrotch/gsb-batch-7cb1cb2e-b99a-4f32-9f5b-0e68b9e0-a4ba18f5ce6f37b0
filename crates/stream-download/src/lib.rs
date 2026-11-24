@@ -65,6 +65,7 @@ pub struct StreamDownload<P: StorageProvider> {
     output_reader: P::Reader,
     handle: SourceHandle,
     download_task_cancellation_token: CancellationToken,
+    finished_token: CancellationToken,
     cancel_on_drop: bool,
     content_length: Option<u64>,
     storage_capacity: Option<usize>,
@@ -358,8 +359,14 @@ impl<P: StorageProvider> StreamDownload<P> {
     }
 
     /// Cancels the background task that's downloading the stream content.
-    /// This has no effect if the download is already completed.
+    ///
+    /// This is an observable terminal state: blocked reads and seeks wake immediately and return
+    /// an error if their requested range is not already available. Data that was fully downloaded
+    /// before cancellation can still be read through the normal hit paths.
+    ///
+    /// This has no effect if the download is already completed or failed.
     pub fn cancel_download(&self) {
+        self.handle.cancel();
         self.download_task_cancellation_token.cancel();
     }
 
@@ -373,7 +380,7 @@ impl<P: StorageProvider> StreamDownload<P> {
     /// the stream remotely.
     pub fn handle(&self) -> StreamHandle {
         StreamHandle {
-            finished: self.download_task_cancellation_token.clone(),
+            finished: self.finished_token.clone(),
         }
     }
 
@@ -401,13 +408,28 @@ impl<P: StorageProvider> StreamDownload<P> {
             .into_reader_writer(content_length)
             .map_err(StreamInitializationError::StorageCreationFailure)?;
         let cancellation_token = settings.cancellation_token.child_token();
+        let finished_token = CancellationToken::new();
         let cancel_on_drop = settings.cancel_on_drop;
         let mut source = Source::new(writer, content_length, settings, cancellation_token.clone());
         let handle = source.source_handle();
 
+        // Cancellation can also originate from a token supplied in [`Settings`]. Make that
+        // observable to blocking readers immediately, even if the download future takes a moment
+        // to reach its own cancellation point.
         tokio::spawn({
             let cancellation_token = cancellation_token.clone();
+            let handle = handle.clone();
             async move {
+                cancellation_token.cancelled().await;
+                handle.cancel();
+            }
+        });
+
+        tokio::spawn({
+            let cancellation_token = cancellation_token.clone();
+            let finished_token = finished_token.clone();
+            async move {
+                let _finished_guard = DownloadFinishedGuard(finished_token);
                 source.download(stream).await;
                 cancellation_token.cancel();
                 debug!("download task finished");
@@ -418,6 +440,7 @@ impl<P: StorageProvider> StreamDownload<P> {
             output_reader: reader,
             handle,
             download_task_cancellation_token: cancellation_token,
+            finished_token,
             cancel_on_drop,
             content_length,
             storage_capacity,
@@ -462,14 +485,6 @@ impl<P: StorageProvider> StreamDownload<P> {
             requested_position.min(content_length)
         } else {
             requested_position
-        }
-    }
-
-    fn check_for_failure(&self) -> io::Result<()> {
-        if self.handle.is_failed() {
-            Err(io::Error::other("stream failed to download"))
-        } else {
-            Ok(())
         }
     }
 
@@ -548,8 +563,10 @@ impl<P: StorageProvider> Drop for StreamDownload<P> {
 impl<P: StorageProvider> Read for StreamDownload<P> {
     #[instrument(skip_all, fields(len=buf.len()))]
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.check_for_failure()?;
         self.check_for_excessive_read(buf.len())?;
+        if buf.is_empty() {
+            return Ok(0);
+        }
 
         trace!(buffer_length = buf.len(), "read requested");
         let stream_position = self.output_reader.stream_position()?;
@@ -574,8 +591,34 @@ impl<P: StorageProvider> Read for StreamDownload<P> {
             debug!("stream position not yet downloaded");
         }
 
-        self.handle.wait_for_position(requested_position);
-        self.check_for_failure()?;
+        // This returns immediately for natural completion so the storage reader can report EOF.
+        // Failed/cancelled terminal states return a concrete error unless some prefix of the
+        // requested buffer was already downloaded; drain that data before surfacing the terminal
+        // result so successfully downloaded bytes are never discarded.
+        if let Err(wait_error) = self
+            .handle
+            .wait_for_range(stream_position, requested_position)
+        {
+            let available_len = self
+                .handle
+                .get_downloaded_at_position(stream_position)
+                .and_then(|range| usize::try_from(range.end.saturating_sub(stream_position)).ok())
+                .unwrap_or(0)
+                .min(buf.len());
+
+            if available_len == 0 {
+                return Err(wait_error);
+            }
+
+            // Cap the read to the range known to be complete. Storage implementations may not
+            // expose the exact contiguous high-water mark themselves, so asking for a larger
+            // buffer here could read uninitialized holes.
+            return match self.handle_read(&mut buf[..available_len]) {
+                Ok(0) => Err(wait_error),
+                Ok(read_len) => Ok(read_len),
+                Err(read_error) => Err(read_error),
+            };
+        }
         debug!(
             current_position = stream_position,
             requested_position = requested_position,
@@ -590,8 +633,6 @@ impl<P: StorageProvider> Read for StreamDownload<P> {
 impl<P: StorageProvider> Seek for StreamDownload<P> {
     #[instrument(skip(self))]
     fn seek(&mut self, relative_position: SeekFrom) -> io::Result<u64> {
-        self.check_for_failure()?;
-
         let absolute_seek_position = self.get_absolute_seek_position(relative_position)?;
         let absolute_seek_position = self.normalize_requested_position(absolute_seek_position);
         self.check_for_excessive_seek(absolute_seek_position)?;
@@ -611,8 +652,9 @@ impl<P: StorageProvider> Seek for StreamDownload<P> {
                 .inspect_err(|p| debug!(position = format!("{p:?}"), "returning seek position"));
         }
 
-        self.handle.seek(absolute_seek_position);
-        self.check_for_failure()?;
+        // A downloaded-range hit returns above even after cancellation/failure. Missing ranges
+        // receive the terminal error immediately instead of blocking forever.
+        self.handle.seek(absolute_seek_position)?;
         debug!("reached seek position");
 
         self.output_reader
@@ -632,5 +674,14 @@ impl<T> WrapIoResult for io::Result<T> {
         } else {
             self
         }
+    }
+}
+
+/// Cancels the public completion token when the download task exits, including if it panics.
+struct DownloadFinishedGuard(CancellationToken);
+
+impl Drop for DownloadFinishedGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
     }
 }

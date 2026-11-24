@@ -120,8 +120,8 @@ pub(crate) struct Source<S: SourceStream, W: StorageWriter> {
     position_reached: PositionReached,
     notify_read: NotifyRead,
     content_length: Option<u64>,
-    seek_tx: mpsc::Sender<u64>,
-    seek_rx: mpsc::Receiver<u64>,
+    seek_tx: mpsc::UnboundedSender<u64>,
+    seek_rx: mpsc::UnboundedReceiver<u64>,
     prefetch_bytes: u64,
     batch_write_size: usize,
     retry_timeout: Duration,
@@ -137,10 +137,11 @@ impl<S: SourceStream, W: StorageWriter> Drop for Source<S, W> {
     fn drop(&mut self) {
         // If the download task is dropped before it finishes (e.g. the runtime is shutting down),
         // any reader blocked waiting for data would otherwise wait forever.
-        if !self.position_reached.is_stream_done() {
+        if self.download_status.termination().is_none() {
             debug!("download task dropped before completion");
-            self.download_status.set_failed();
+            self.download_status.fail_if_active();
             self.position_reached.notify_stream_done();
+            self.notify_read.notify_cancelled();
         }
     }
 }
@@ -156,9 +157,10 @@ where
         settings: Settings<S>,
         cancellation_token: CancellationToken,
     ) -> Self {
-        // buffer size of 1 is fine here because we wait for the position to update after we send
-        // each request
-        let (seek_tx, seek_rx) = mpsc::channel(1);
+        // An unbounded channel means seek requests are never dropped because a one-slot channel
+        // is full. Requests are processed in order; the newest request is therefore always applied
+        // last and cannot be permanently overwritten by an older position.
+        let (seek_tx, seek_rx) = mpsc::unbounded_channel();
         Self {
             writer,
             downloaded: Downloaded::default(),
@@ -183,8 +185,23 @@ where
 
     #[instrument(skip_all)]
     pub(crate) async fn download(&mut self, mut stream: S) {
-        let res = self.download_inner(&mut stream).await;
-        let (res, stream_res) = match res {
+        // If cancellation arrives while `download_inner` is suspended inside a user-provided
+        // seek/reconnect/write future, dropping this future is what unblocks shutdown.
+        let cancellation_token = self.cancellation_token.clone();
+        let inner_result = {
+            let download_inner = self.download_inner(&mut stream);
+            tokio::pin!(download_inner);
+            tokio::select! {
+                biased;
+                result = download_inner.as_mut() => result,
+                () = cancellation_token.cancelled() => {
+                    debug!("cancellation observed while download operation was in progress");
+                    Ok(StreamOutcome::CancelledByUser)
+                }
+            }
+        };
+
+        let (res, stream_res) = match inner_result {
             Ok(StreamOutcome::Completed) => (Ok(()), StreamOutcome::Completed),
             Ok(StreamOutcome::CancelledByUser) => (
                 Err(io::Error::new(
@@ -195,12 +212,23 @@ where
             ),
             Err(e) => (Err(e), StreamOutcome::Completed),
         };
+
         let res = stream.on_finish(res, stream_res).await;
-        if let Err(e) = res {
-            if stream_res == StreamOutcome::Completed {
-                error!("download failed: {e:?}");
+        match stream_res {
+            StreamOutcome::Completed => {
+                if let Err(e) = res {
+                    error!("download failed: {e:?}");
+                    self.download_status.fail_if_active();
+                } else {
+                    self.download_status.complete();
+                }
             }
-            self.download_status.set_failed();
+            StreamOutcome::CancelledByUser => {
+                if let Err(e) = res {
+                    warn!("stream on_finish returned an error after cancellation: {e:?}");
+                }
+                self.download_status.cancel();
+            }
         }
         self.signal_download_complete();
     }
@@ -215,8 +243,15 @@ where
             let next_chunk = timeout(self.retry_timeout, stream.next());
             tokio::select! {
                 position = self.seek_rx.recv() => {
-                    // seek_tx can't be dropped here since we keep a reference in this struct
-                    self.handle_seek(stream, position.expect("seek_tx dropped")).await?;
+                    let Some(position) = position else {
+                        debug!("seek channel closed, stopping download");
+                        return Ok(StreamOutcome::CancelledByUser);
+                    };
+                    // Process requests in FIFO order. An unbounded channel guarantees a request is
+                    // never dropped because a one-slot queue is full. Processing an older request
+                    // before a newer one cannot let the old position win permanently: the newer
+                    // request is still queued and applied afterwards.
+                    self.handle_seek(stream, position).await?;
                 },
                 bytes = next_chunk => {
                     let Ok(bytes) = bytes else {
@@ -312,6 +347,7 @@ where
             self.writer.flush()?;
             let position = self.writer.stream_position()?;
             self.downloaded.add(start_position..position);
+            self.position_reached.notify_position_reached();
 
             return self.finish_or_find_next_gap(stream).await;
         };
@@ -334,6 +370,9 @@ where
             self.downloaded.add(start_position..stream_position);
             debug!("prefetch complete");
             self.prefetch_complete = true;
+            // Release readers whose requested position is inside the prefetched range even
+            // before the next network chunk arrives.
+            self.position_reached.notify_position_reached();
         }
 
         self.report_prefetch_progress(stream, stream_position, download_start, written);
@@ -432,6 +471,9 @@ where
             new_position = self.writer.stream_position()?;
             if new_position > position {
                 self.downloaded.add(position..new_position);
+                // Wake all waiters so each can recheck its own range predicate. This must not
+                // depend on one shared boolean that a single reader could consume/reset.
+                self.position_reached.notify_position_reached();
             }
 
             if let Some(requested) = self.requested_position.get() {
@@ -443,7 +485,9 @@ where
 
                 if new_position >= requested {
                     debug!("notifying position reached");
-                    self.requested_position.clear();
+                    // Only clear this exact request. If a concurrent reader installed a newer
+                    // value after `get`, clearing unconditionally would lose that request.
+                    self.requested_position.clear_if(requested);
                     self.position_reached.notify_position_reached();
                 }
             }
