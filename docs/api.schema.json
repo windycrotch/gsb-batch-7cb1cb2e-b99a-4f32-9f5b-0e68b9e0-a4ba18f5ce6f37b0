@@ -1,0 +1,5862 @@
+{
+  "$defs": {
+    "DELETE /api/camera 200": {
+      "$ref": "#/$defs/httpapi.CameraResponse"
+    },
+    "DELETE /api/camera/feed 200": {
+      "$ref": "#/$defs/httpapi.CameraResponse"
+    },
+    "DELETE /api/claims 409": {
+      "$ref": "#/$defs/httpapi.ErrorResponse"
+    },
+    "DELETE /api/devices 409": {
+      "$ref": "#/$defs/httpapi.ErrorResponse"
+    },
+    "DELETE /api/extensions": {
+      "$ref": "#/$defs/httpapi.OKResponse"
+    },
+    "DELETE /api/install 200": {
+      "$ref": "#/$defs/httpapi.UninstallResponse"
+    },
+    "DELETE /api/install 422": {
+      "$ref": "#/$defs/httpapi.UninstallResponse"
+    },
+    "DELETE /api/overlays": {
+      "$ref": "#/$defs/httpapi.OverlayDeleteResponse"
+    },
+    "DELETE /api/pairings/ 200": {
+      "$ref": "#/$defs/httpapi.OKResponse"
+    },
+    "DELETE /api/pairings/ 404": {
+      "$ref": "#/$defs/httpapi.ErrorResponse"
+    },
+    "DELETE /api/presets": {
+      "$ref": "#/$defs/httpapi.PresetsResponse"
+    },
+    "DELETE /api/remote": {
+      "$ref": "#/$defs/httpapi.RemoteListResponse"
+    },
+    "DELETE /api/remote/account": {
+      "$ref": "#/$defs/httpapi.RemoteAccountResponse"
+    },
+    "DELETE /api/revyl": {
+      "$ref": "#/$defs/httpapi.RevylListResponse"
+    },
+    "DELETE /api/revyl/account": {
+      "$ref": "#/$defs/httpapi.RevylAccountResponse"
+    },
+    "DELETE /api/servers 404": {
+      "$ref": "#/$defs/httpapi.ErrorResponse"
+    },
+    "DELETE /api/sessions": {
+      "$ref": "#/$defs/httpapi.RevokeResponse"
+    },
+    "DELETE /api/sessions/ 200": {
+      "$ref": "#/$defs/httpapi.RevokeResponse"
+    },
+    "DELETE /api/sessions/ 403": {
+      "$ref": "#/$defs/httpapi.ErrorResponse"
+    },
+    "DELETE /api/sessions/ 404": {
+      "$ref": "#/$defs/httpapi.ErrorResponse"
+    },
+    "ErrorResponse": {
+      "$ref": "#/$defs/httpapi.ErrorResponse"
+    },
+    "GET /api/android/cli": {
+      "$ref": "#/$defs/httpapi.AndroidCLIResponse"
+    },
+    "GET /api/app": {
+      "$ref": "#/$defs/target.App"
+    },
+    "GET /api/auth": {
+      "$ref": "#/$defs/httpapi.AuthResponse"
+    },
+    "GET /api/avds/profiles": {
+      "$ref": "#/$defs/httpapi.AVDProfilesResponse"
+    },
+    "GET /api/camera/sources": {
+      "$ref": "#/$defs/httpapi.CameraSourcesResponse"
+    },
+    "GET /api/claims": {
+      "items": {
+        "$ref": "#/$defs/httpapi.ClaimInfo"
+      },
+      "type": "array"
+    },
+    "GET /api/clipboard": {
+      "$ref": "#/$defs/httpapi.ClipboardResponse"
+    },
+    "GET /api/clipboard/shared": {
+      "$ref": "#/$defs/clipshare.Value"
+    },
+    "GET /api/clipboard/shared 409": {
+      "$ref": "#/$defs/httpapi.ErrorResponse"
+    },
+    "GET /api/config": {
+      "$ref": "#/$defs/httpapi.ConfigResponse"
+    },
+    "GET /api/crashes": {
+      "$ref": "#/$defs/httpapi.CrashList"
+    },
+    "GET /api/devices/boot": {
+      "$ref": "#/$defs/target.BootStatus"
+    },
+    "GET /api/devices/options": {
+      "$ref": "#/$defs/httpapi.DeviceOptionsResponse"
+    },
+    "GET /api/events": {
+      "$ref": "#/$defs/session.EventPage"
+    },
+    "GET /api/extensions": {
+      "$ref": "#/$defs/httpapi.ExtensionsResponse"
+    },
+    "GET /api/feedback": {
+      "$ref": "#/$defs/httpapi.FeedbackResponse"
+    },
+    "GET /api/feedback one": {
+      "$ref": "#/$defs/httpapi.Feedback"
+    },
+    "GET /api/flags": {
+      "$ref": "#/$defs/httpapi.FlagsResponse"
+    },
+    "GET /api/flags one": {
+      "$ref": "#/$defs/httpapi.Flag"
+    },
+    "GET /api/flags/destinations": {
+      "$ref": "#/$defs/httpapi.FlagDestinationsResponse"
+    },
+    "GET /api/flags/listeners": {
+      "$ref": "#/$defs/httpapi.FlagListenersResponse"
+    },
+    "GET /api/frame": {
+      "$ref": "#/$defs/target.DeviceFrame"
+    },
+    "GET /api/handoff": {
+      "$ref": "#/$defs/httpapi.HandoffResponse"
+    },
+    "GET /api/lan": {
+      "$ref": "#/$defs/httpapi.LANResponse"
+    },
+    "GET /api/overlays": {
+      "$ref": "#/$defs/httpapi.OverlaysResponse"
+    },
+    "GET /api/pairings": {
+      "items": {
+        "$ref": "#/$defs/httpapi.PairingInfo"
+      },
+      "type": "array"
+    },
+    "GET /api/presets": {
+      "$ref": "#/$defs/httpapi.PresetsResponse"
+    },
+    "GET /api/record": {
+      "items": {
+        "$ref": "#/$defs/record.Meta"
+      },
+      "type": "array"
+    },
+    "GET /api/remote": {
+      "$ref": "#/$defs/httpapi.RemoteListResponse"
+    },
+    "GET /api/remote/account": {
+      "$ref": "#/$defs/httpapi.RemoteAccountResponse"
+    },
+    "GET /api/remote/models": {
+      "$ref": "#/$defs/httpapi.RemoteModelsResponse"
+    },
+    "GET /api/remote/models 502": {
+      "$ref": "#/$defs/httpapi.RemoteModelsError"
+    },
+    "GET /api/revyl": {
+      "$ref": "#/$defs/httpapi.RevylListResponse"
+    },
+    "GET /api/revyl/account": {
+      "$ref": "#/$defs/httpapi.RevylAccountResponse"
+    },
+    "GET /api/revyl/billing": {
+      "$ref": "#/$defs/httpapi.RevylBillingResponse"
+    },
+    "GET /api/revyl/billing 409": {
+      "$ref": "#/$defs/httpapi.ErrorResponse"
+    },
+    "GET /api/revyl/billing 501": {
+      "$ref": "#/$defs/httpapi.ErrorResponse"
+    },
+    "GET /api/revyl/billing 502": {
+      "$ref": "#/$defs/httpapi.ErrorResponse"
+    },
+    "GET /api/revyl/targets": {
+      "$ref": "#/$defs/httpapi.RevylTargetsResponse"
+    },
+    "GET /api/servers": {
+      "items": {
+        "$ref": "#/$defs/httpapi.ServerInfo"
+      },
+      "type": "array"
+    },
+    "GET /api/sessions": {
+      "items": {
+        "$ref": "#/$defs/httpapi.SessionInfo"
+      },
+      "type": "array"
+    },
+    "GET /api/settings": {
+      "$ref": "#/$defs/httpapi.SettingsResponse"
+    },
+    "GET /api/targets": {
+      "items": {
+        "$ref": "#/$defs/httpapi.TargetInfo"
+      },
+      "type": "array"
+    },
+    "GET /api/ui": {
+      "$ref": "#/$defs/httpapi.UIResponse"
+    },
+    "GET /api/version": {
+      "$ref": "#/$defs/httpapi.VersionResponse"
+    },
+    "OKResponse": {
+      "$ref": "#/$defs/httpapi.OKResponse"
+    },
+    "POST /api/android/cli 200": {
+      "$ref": "#/$defs/httpapi.AndroidCLIResponse"
+    },
+    "POST /api/android/cli 202": {
+      "$ref": "#/$defs/httpapi.AndroidCLIResponse"
+    },
+    "POST /api/android/cli 409": {
+      "$ref": "#/$defs/httpapi.ErrorResponse"
+    },
+    "POST /api/avds 202": {
+      "$ref": "#/$defs/httpapi.CreateAVDResponse"
+    },
+    "POST /api/avds request": {
+      "$ref": "#/$defs/httpapi.CreateAVDRequest"
+    },
+    "POST /api/camera 200": {
+      "$ref": "#/$defs/httpapi.CameraResponse"
+    },
+    "POST /api/camera request": {
+      "$ref": "#/$defs/httpapi.CameraHostRequest"
+    },
+    "POST /api/claims 200": {
+      "$ref": "#/$defs/httpapi.ClaimInfo"
+    },
+    "POST /api/claims 409": {
+      "$ref": "#/$defs/httpapi.ErrorResponse"
+    },
+    "POST /api/claims request": {
+      "$ref": "#/$defs/httpapi.ClaimRequest"
+    },
+    "POST /api/clipboard 200": {
+      "$ref": "#/$defs/httpapi.OKResponse"
+    },
+    "POST /api/clipboard request": {
+      "$ref": "#/$defs/httpapi.ClipboardRequest"
+    },
+    "POST /api/clipboard/shared 409": {
+      "$ref": "#/$defs/httpapi.ErrorResponse"
+    },
+    "POST /api/clipboard/shared request": {
+      "$ref": "#/$defs/httpapi.SharedClipboardRequest"
+    },
+    "POST /api/control/release 200": {
+      "$ref": "#/$defs/session.ControlState"
+    },
+    "POST /api/devices 202": {
+      "$ref": "#/$defs/httpapi.CreateDeviceResponse"
+    },
+    "POST /api/devices request": {
+      "$ref": "#/$defs/httpapi.CreateDeviceRequest"
+    },
+    "POST /api/devices/boot 200": {
+      "$ref": "#/$defs/httpapi.TargetInfo"
+    },
+    "POST /api/devices/boot 202": {
+      "$ref": "#/$defs/target.BootStatus"
+    },
+    "POST /api/devices/boot 409": {
+      "$ref": "#/$defs/httpapi.ErrorResponse"
+    },
+    "POST /api/devices/handsoff 200": {
+      "$ref": "#/$defs/httpapi.HandsOffResponse"
+    },
+    "POST /api/devices/reset 200": {
+      "$ref": "#/$defs/httpapi.TargetInfo"
+    },
+    "POST /api/devices/reset 409": {
+      "$ref": "#/$defs/httpapi.ErrorResponse"
+    },
+    "POST /api/devices/shutdown 200": {
+      "$ref": "#/$defs/httpapi.TargetInfo"
+    },
+    "POST /api/devices/shutdown 409": {
+      "$ref": "#/$defs/httpapi.ErrorResponse"
+    },
+    "POST /api/drop 200": {
+      "$ref": "#/$defs/httpapi.DropResponse"
+    },
+    "POST /api/extensions 200": {
+      "$ref": "#/$defs/httpapi.Extension"
+    },
+    "POST /api/extensions request": {
+      "$ref": "#/$defs/httpapi.ExtensionRequest"
+    },
+    "POST /api/feedback 200": {
+      "$ref": "#/$defs/httpapi.Feedback"
+    },
+    "POST /api/feedback request": {
+      "$ref": "#/$defs/httpapi.FeedbackRequest"
+    },
+    "POST /api/flags 200": {
+      "$ref": "#/$defs/httpapi.Flag"
+    },
+    "POST /api/flags request": {
+      "$ref": "#/$defs/httpapi.FlagRequest"
+    },
+    "POST /api/flags/end 200": {
+      "$ref": "#/$defs/httpapi.Flag"
+    },
+    "POST /api/flags/end request": {
+      "$ref": "#/$defs/httpapi.FlagEndRequest"
+    },
+    "POST /api/input 200": {
+      "$ref": "#/$defs/httpapi.InputResponse"
+    },
+    "POST /api/input request": {
+      "$ref": "#/$defs/httpapi.InputRequest"
+    },
+    "POST /api/install 200": {
+      "$ref": "#/$defs/httpapi.InstallResponse"
+    },
+    "POST /api/install 422": {
+      "$ref": "#/$defs/httpapi.InstallResponse"
+    },
+    "POST /api/media 200": {
+      "$ref": "#/$defs/httpapi.MediaResponse"
+    },
+    "POST /api/overlays 200": {
+      "$ref": "#/$defs/httpapi.Overlay"
+    },
+    "POST /api/overlays 409": {
+      "$ref": "#/$defs/httpapi.ErrorResponse"
+    },
+    "POST /api/overlays request": {
+      "$ref": "#/$defs/httpapi.OverlayRequest"
+    },
+    "POST /api/pair 201": {
+      "$ref": "#/$defs/httpapi.PairResponse"
+    },
+    "POST /api/pair 401": {
+      "$ref": "#/$defs/httpapi.ErrorResponse"
+    },
+    "POST /api/pair 429": {
+      "$ref": "#/$defs/httpapi.ErrorResponse"
+    },
+    "POST /api/pair request": {
+      "$ref": "#/$defs/httpapi.PairRequest"
+    },
+    "POST /api/pairings 201": {
+      "$ref": "#/$defs/httpapi.PairingResponse"
+    },
+    "POST /api/pairings 403": {
+      "$ref": "#/$defs/httpapi.ErrorResponse"
+    },
+    "POST /api/pairings request": {
+      "$ref": "#/$defs/httpapi.PairingRequest"
+    },
+    "POST /api/presets/apply": {
+      "$ref": "#/$defs/httpapi.PresetApplyResponse"
+    },
+    "POST /api/presets/apply 409": {
+      "$ref": "#/$defs/httpapi.SettingsConflictResponse"
+    },
+    "POST /api/record 201": {
+      "$ref": "#/$defs/httpapi.RecordStartResponse"
+    },
+    "POST /api/record 409": {
+      "$ref": "#/$defs/httpapi.ErrorResponse"
+    },
+    "POST /api/remote 202": {
+      "$ref": "#/$defs/httpapi.ReserveRemoteResponse"
+    },
+    "POST /api/remote request": {
+      "$ref": "#/$defs/httpapi.ReserveRemoteRequest"
+    },
+    "POST /api/remote/account 202": {
+      "$ref": "#/$defs/httpapi.RemoteAccountResponse"
+    },
+    "POST /api/remote/cli 202": {
+      "$ref": "#/$defs/httpapi.RemoteAccountResponse"
+    },
+    "POST /api/remote/extend": {
+      "$ref": "#/$defs/httpapi.RemoteListResponse"
+    },
+    "POST /api/remote/extend request": {
+      "$ref": "#/$defs/httpapi.ExtendRemoteRequest"
+    },
+    "POST /api/revyl 202": {
+      "$ref": "#/$defs/httpapi.StartRevylResponse"
+    },
+    "POST /api/revyl request": {
+      "$ref": "#/$defs/httpapi.StartRevylRequest"
+    },
+    "POST /api/revyl/account 202": {
+      "$ref": "#/$defs/httpapi.RevylAccountResponse"
+    },
+    "POST /api/revyl/cli 202": {
+      "$ref": "#/$defs/httpapi.RevylAccountResponse"
+    },
+    "POST /api/sequence 200": {
+      "$ref": "#/$defs/httpapi.SequenceResponse"
+    },
+    "POST /api/sequence request": {
+      "$ref": "#/$defs/httpapi.SequenceRequest"
+    },
+    "POST /api/servers 201": {
+      "$ref": "#/$defs/httpapi.ServerInfo"
+    },
+    "POST /api/servers 409": {
+      "$ref": "#/$defs/httpapi.ErrorResponse"
+    },
+    "POST /api/servers 502": {
+      "$ref": "#/$defs/httpapi.ErrorResponse"
+    },
+    "POST /api/servers request": {
+      "$ref": "#/$defs/httpapi.ServerAddRequest"
+    },
+    "PUT /api/config": {
+      "$ref": "#/$defs/httpapi.PutResponse"
+    },
+    "PUT /api/config request": {
+      "additionalProperties": false,
+      "properties": {
+        "adaptiveBitRate": {
+          "type": "boolean"
+        },
+        "addr": {
+          "type": "string"
+        },
+        "bitRate": {
+          "type": "integer"
+        },
+        "emulatorKeepState": {
+          "type": "boolean"
+        },
+        "emulatorPauseSec": {
+          "type": "integer"
+        },
+        "emulatorShutdownSec": {
+          "type": "integer"
+        },
+        "emulatorWindow": {
+          "type": "boolean"
+        },
+        "feedbackRelay": {
+          "type": "boolean"
+        },
+        "humanHoldMs": {
+          "type": "integer"
+        },
+        "keyframeIntervalSec": {
+          "type": "integer"
+        },
+        "maxBufferMs": {
+          "type": "integer"
+        },
+        "maxFps": {
+          "type": "integer"
+        },
+        "maxSize": {
+          "type": "integer"
+        },
+        "sharedClipboard": {
+          "type": "boolean"
+        },
+        "simulatorSlim": {
+          "type": "boolean"
+        },
+        "t3Projects": {
+          "type": "string"
+        },
+        "tlsCert": {
+          "type": "string"
+        },
+        "tlsKey": {
+          "type": "string"
+        },
+        "tracePath": {
+          "type": "string"
+        },
+        "videoCodec": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "PUT /api/presets": {
+      "$ref": "#/$defs/httpapi.PresetsResponse"
+    },
+    "PUT /api/presets request": {
+      "$ref": "#/$defs/httpapi.Preset"
+    },
+    "PUT /api/settings 200": {
+      "$ref": "#/$defs/httpapi.SettingsResponse"
+    },
+    "PUT /api/settings 409": {
+      "$ref": "#/$defs/httpapi.SettingsConflictResponse"
+    },
+    "PUT /api/settings request": {
+      "$ref": "#/$defs/httpapi.SettingsPutRequest"
+    },
+    "clipshare.Value": {
+      "properties": {
+        "at": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "origin": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "seq",
+        "id",
+        "text",
+        "origin",
+        "at"
+      ],
+      "type": "object"
+    },
+    "composetree.Composable": {
+      "properties": {
+        "bounds": {
+          "items": {
+            "type": "integer"
+          },
+          "maxItems": 4,
+          "minItems": 4,
+          "type": "array"
+        },
+        "children": {
+          "items": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/composetree.Composable"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "type": "array"
+        },
+        "file": {
+          "type": "string"
+        },
+        "line": {
+          "type": "integer"
+        },
+        "name": {
+          "type": "string"
+        },
+        "semantics": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "bounds"
+      ],
+      "type": "object"
+    },
+    "firebase.Model": {
+      "properties": {
+        "apis": {
+          "items": {
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "codename": {
+          "type": "string"
+        },
+        "manufacturer": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "manufacturer",
+        "model",
+        "codename",
+        "apis"
+      ],
+      "type": "object"
+    },
+    "httpapi.AVDProfile": {
+      "properties": {
+        "exists": {
+          "type": "boolean"
+        },
+        "label": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "label",
+        "exists"
+      ],
+      "type": "object"
+    },
+    "httpapi.AVDProfilesResponse": {
+      "properties": {
+        "creating": {
+          "type": "string"
+        },
+        "profiles": {
+          "items": {
+            "$ref": "#/$defs/httpapi.AVDProfile"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "profiles"
+      ],
+      "type": "object"
+    },
+    "httpapi.AndroidCLIResponse": {
+      "properties": {
+        "adbInstalled": {
+          "type": "boolean"
+        },
+        "adbPath": {
+          "type": "string"
+        },
+        "canInstall": {
+          "type": "boolean"
+        },
+        "error": {
+          "type": "string"
+        },
+        "installed": {
+          "type": "boolean"
+        },
+        "installing": {
+          "type": "boolean"
+        },
+        "path": {
+          "type": "string"
+        },
+        "step": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "installed",
+        "canInstall",
+        "installing",
+        "adbInstalled"
+      ],
+      "type": "object"
+    },
+    "httpapi.AuthResponse": {
+      "properties": {
+        "canPair": {
+          "type": "boolean"
+        },
+        "method": {
+          "type": "string"
+        },
+        "pairing": {
+          "type": "boolean"
+        },
+        "session": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/httpapi.SessionInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "method",
+        "pairing",
+        "canPair"
+      ],
+      "type": "object"
+    },
+    "httpapi.CameraHostRequest": {
+      "properties": {
+        "hostCamera": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "hostCamera"
+      ],
+      "type": "object"
+    },
+    "httpapi.CameraResponse": {
+      "properties": {
+        "applies": {
+          "type": "string"
+        },
+        "height": {
+          "type": "integer"
+        },
+        "hostCamera": {
+          "type": "string"
+        },
+        "live": {
+          "type": "boolean"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "target": {
+          "type": "string"
+        },
+        "tookMs": {
+          "type": "integer"
+        },
+        "width": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "target",
+        "ok",
+        "applies",
+        "tookMs"
+      ],
+      "type": "object"
+    },
+    "httpapi.CameraSourcesResponse": {
+      "properties": {
+        "cameras": {
+          "items": {
+            "$ref": "#/$defs/target.HostCamera"
+          },
+          "type": "array"
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "target",
+        "cameras"
+      ],
+      "type": "object"
+    },
+    "httpapi.ClaimInfo": {
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "idleMs": {
+          "type": "integer"
+        },
+        "link": {
+          "type": "string"
+        },
+        "recentHumanInputMs": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session": {
+          "type": "string"
+        },
+        "since": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "target",
+        "since",
+        "idleMs"
+      ],
+      "type": "object"
+    },
+    "httpapi.ClaimRequest": {
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "link": {
+          "type": "string"
+        },
+        "session": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "httpapi.ClipboardRequest": {
+      "properties": {
+        "paste": {
+          "type": "boolean"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    },
+    "httpapi.ClipboardResponse": {
+      "properties": {
+        "target": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "target",
+        "text"
+      ],
+      "type": "object"
+    },
+    "httpapi.ConfigResponse": {
+      "properties": {
+        "fields": {
+          "items": {
+            "$ref": "#/$defs/httpapi.configField"
+          },
+          "type": "array"
+        },
+        "hostModel": {
+          "type": "string"
+        },
+        "hostPasteboard": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "fields"
+      ],
+      "type": "object"
+    },
+    "httpapi.CrashList": {
+      "properties": {
+        "crashes": {
+          "items": {
+            "$ref": "#/$defs/target.CrashReport"
+          },
+          "type": "array"
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "target",
+        "crashes"
+      ],
+      "type": "object"
+    },
+    "httpapi.CreateAVDRequest": {
+      "properties": {
+        "profile": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "profile"
+      ],
+      "type": "object"
+    },
+    "httpapi.CreateAVDResponse": {
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "httpapi.CreateDeviceRequest": {
+      "properties": {
+        "device": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "os": {
+          "type": "string"
+        },
+        "platform": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "platform",
+        "os",
+        "device",
+        "name"
+      ],
+      "type": "object"
+    },
+    "httpapi.CreateDeviceResponse": {
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "httpapi.DeviceJob": {
+      "properties": {
+        "createdId": {
+          "type": "string"
+        },
+        "error": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "platform": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "warning": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "platform",
+        "name",
+        "state"
+      ],
+      "type": "object"
+    },
+    "httpapi.DeviceModel": {
+      "properties": {
+        "group": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "size": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "group"
+      ],
+      "type": "object"
+    },
+    "httpapi.DeviceOS": {
+      "properties": {
+        "detail": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "label"
+      ],
+      "type": "object"
+    },
+    "httpapi.DeviceOptionsResponse": {
+      "properties": {
+        "existingNames": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "type": "object"
+        },
+        "job": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/httpapi.DeviceJob"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "platforms": {
+          "items": {
+            "$ref": "#/$defs/httpapi.DevicePlatform"
+          },
+          "type": "array"
+        },
+        "profilesFallback": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "platforms",
+        "existingNames",
+        "profilesFallback"
+      ],
+      "type": "object"
+    },
+    "httpapi.DevicePlatform": {
+      "properties": {
+        "devices": {
+          "items": {
+            "$ref": "#/$defs/httpapi.DeviceModel"
+          },
+          "type": "array"
+        },
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "nameRule": {
+          "type": "string"
+        },
+        "os": {
+          "items": {
+            "$ref": "#/$defs/httpapi.DeviceOS"
+          },
+          "type": "array"
+        },
+        "pairs": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "os",
+        "devices",
+        "pairs",
+        "nameRule"
+      ],
+      "type": "object"
+    },
+    "httpapi.DropResponse": {
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "target": {
+          "type": "string"
+        },
+        "tookMs": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "target",
+        "ok",
+        "tookMs"
+      ],
+      "type": "object"
+    },
+    "httpapi.ErrorResponse": {
+      "properties": {
+        "candidates": {
+          "items": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/target.Node"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "type": "array"
+        },
+        "claim": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/httpapi.ClaimInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "code": {
+          "type": "string"
+        },
+        "error": {
+          "type": "string"
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "retryAfterMs": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "error"
+      ],
+      "type": "object"
+    },
+    "httpapi.ExtendRemoteRequest": {
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "minutes": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "key",
+        "minutes"
+      ],
+      "type": "object"
+    },
+    "httpapi.Extension": {
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "page": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "label",
+        "path"
+      ],
+      "type": "object"
+    },
+    "httpapi.ExtensionRequest": {
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "page": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "url"
+      ],
+      "type": "object"
+    },
+    "httpapi.ExtensionsResponse": {
+      "properties": {
+        "extensions": {
+          "items": {
+            "$ref": "#/$defs/httpapi.Extension"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "extensions"
+      ],
+      "type": "object"
+    },
+    "httpapi.Feedback": {
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "delivery": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/httpapi.FlagDelivery"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "dir": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "problem": {
+          "type": "string"
+        },
+        "proposedFix": {
+          "type": "string"
+        },
+        "repro": {
+          "type": "string"
+        },
+        "session": {
+          "type": "string"
+        },
+        "t": {
+          "type": "integer"
+        },
+        "target": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "tool": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "problem",
+        "proposedFix",
+        "id",
+        "t"
+      ],
+      "type": "object"
+    },
+    "httpapi.FeedbackRequest": {
+      "properties": {
+        "problem": {
+          "type": "string"
+        },
+        "proposedFix": {
+          "type": "string"
+        },
+        "repro": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "tool": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "problem",
+        "proposedFix"
+      ],
+      "type": "object"
+    },
+    "httpapi.FeedbackResponse": {
+      "properties": {
+        "feedback": {
+          "items": {
+            "$ref": "#/$defs/httpapi.Feedback"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "feedback"
+      ],
+      "type": "object"
+    },
+    "httpapi.Flag": {
+      "properties": {
+        "claimedBy": {
+          "type": "string"
+        },
+        "delivery": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/httpapi.FlagDelivery"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "end": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/httpapi.FlagSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "events": {
+          "items": {
+            "$ref": "#/$defs/httpapi.FlagEvent"
+          },
+          "type": "array"
+        },
+        "eventsTruncated": {
+          "type": "boolean"
+        },
+        "height": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "integer"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "note": {
+          "type": "string"
+        },
+        "region": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/httpapi.FlagRect"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rev": {
+          "type": "integer"
+        },
+        "start": {
+          "$ref": "#/$defs/httpapi.FlagSnapshot"
+        },
+        "target": {
+          "type": "string"
+        },
+        "to": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/httpapi.FlagRecipient"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "watching": {
+          "type": "boolean"
+        },
+        "width": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "target",
+        "rev",
+        "watching",
+        "start"
+      ],
+      "type": "object"
+    },
+    "httpapi.FlagDelivery": {
+      "properties": {
+        "dir": {
+          "type": "string"
+        },
+        "error": {
+          "type": "string"
+        },
+        "output": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "thread": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "state"
+      ],
+      "type": "object"
+    },
+    "httpapi.FlagDestinationsResponse": {
+      "properties": {
+        "commands": {
+          "items": {
+            "$ref": "#/$defs/httpapi.NamedDestination"
+          },
+          "type": "array"
+        },
+        "error": {
+          "type": "string"
+        },
+        "t3": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/httpapi.T3Destinations"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "webhooks": {
+          "items": {
+            "$ref": "#/$defs/httpapi.NamedDestination"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "httpapi.FlagEndRequest": {
+      "properties": {
+        "note": {
+          "type": "string"
+        },
+        "region": {
+          "items": {
+            "type": "number"
+          },
+          "type": "array"
+        },
+        "to": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/httpapi.FlagRecipient"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "httpapi.FlagEvent": {
+      "properties": {
+        "button": {
+          "type": "string"
+        },
+        "from": {
+          "items": {
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "keycode": {
+          "type": "integer"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "t": {
+          "type": "integer"
+        },
+        "text": {
+          "type": "string"
+        },
+        "to": {
+          "items": {
+            "type": "integer"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "t",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "httpapi.FlagListener": {
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "holds": {
+          "type": "boolean"
+        },
+        "idleMs": {
+          "type": "integer"
+        },
+        "session": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "httpapi.FlagListenersResponse": {
+      "properties": {
+        "active": {
+          "items": {
+            "$ref": "#/$defs/httpapi.FlagListener"
+          },
+          "type": "array"
+        },
+        "claimedBy": {
+          "type": "string"
+        },
+        "holder": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/httpapi.FlagRecipient"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "listeners": {
+          "items": {
+            "$ref": "#/$defs/httpapi.FlagListener"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "listeners",
+        "active"
+      ],
+      "type": "object"
+    },
+    "httpapi.FlagRecipient": {
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "command": {
+          "type": "string"
+        },
+        "session": {
+          "type": "string"
+        },
+        "t3Project": {
+          "type": "string"
+        },
+        "t3Thread": {
+          "type": "string"
+        },
+        "webhook": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "httpapi.FlagRect": {
+      "properties": {
+        "height": {
+          "type": "integer"
+        },
+        "width": {
+          "type": "integer"
+        },
+        "x": {
+          "type": "integer"
+        },
+        "y": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "x",
+        "y",
+        "width",
+        "height"
+      ],
+      "type": "object"
+    },
+    "httpapi.FlagRequest": {
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "note": {
+          "type": "string"
+        },
+        "region": {
+          "items": {
+            "type": "number"
+          },
+          "type": "array"
+        },
+        "to": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/httpapi.FlagRecipient"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "watch": {
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "httpapi.FlagSnapshot": {
+      "properties": {
+        "screenshot": {
+          "type": "string"
+        },
+        "screenshotError": {
+          "type": "string"
+        },
+        "t": {
+          "type": "integer"
+        },
+        "ui": {
+          "items": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/target.Node"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "type": "array"
+        },
+        "uiError": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "t"
+      ],
+      "type": "object"
+    },
+    "httpapi.FlagsResponse": {
+      "properties": {
+        "flags": {
+          "items": {
+            "$ref": "#/$defs/httpapi.Flag"
+          },
+          "type": "array"
+        },
+        "rev": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "rev",
+        "flags"
+      ],
+      "type": "object"
+    },
+    "httpapi.HandoffResponse": {
+      "properties": {
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "type": "object"
+    },
+    "httpapi.HandsOffResponse": {
+      "properties": {
+        "handsOff": {
+          "type": "boolean"
+        },
+        "target": {
+          "type": "string"
+        },
+        "warning": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "target",
+        "handsOff"
+      ],
+      "type": "object"
+    },
+    "httpapi.InputRequest": {
+      "oneOf": [
+        {
+          "additionalProperties": true,
+          "properties": {
+            "action": {
+              "const": "tap"
+            },
+            "activity": {
+              "type": "string"
+            },
+            "button": {
+              "enum": [
+                "back",
+                "home",
+                "lock",
+                "recents"
+              ],
+              "type": "string"
+            },
+            "direction": {
+              "type": "string"
+            },
+            "find": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "keycode": {
+              "type": "integer"
+            },
+            "match": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "max": {
+              "type": "integer"
+            },
+            "ms": {
+              "type": "integer"
+            },
+            "on": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "package": {
+              "type": "string"
+            },
+            "scale": {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            "text": {
+              "type": "string"
+            },
+            "to": {
+              "anyOf": [
+                {
+                  "maximum": 3,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "until": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            },
+            "x": {
+              "type": "integer"
+            },
+            "x2": {
+              "type": "integer"
+            },
+            "y": {
+              "type": "integer"
+            },
+            "y2": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "action",
+            "x",
+            "y"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": true,
+          "properties": {
+            "action": {
+              "const": "tap"
+            },
+            "activity": {
+              "type": "string"
+            },
+            "button": {
+              "enum": [
+                "back",
+                "home",
+                "lock",
+                "recents"
+              ],
+              "type": "string"
+            },
+            "direction": {
+              "type": "string"
+            },
+            "find": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "keycode": {
+              "type": "integer"
+            },
+            "match": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "max": {
+              "type": "integer"
+            },
+            "ms": {
+              "type": "integer"
+            },
+            "on": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "package": {
+              "type": "string"
+            },
+            "scale": {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            "text": {
+              "type": "string"
+            },
+            "to": {
+              "anyOf": [
+                {
+                  "maximum": 3,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "until": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            },
+            "x": {
+              "type": "integer"
+            },
+            "x2": {
+              "type": "integer"
+            },
+            "y": {
+              "type": "integer"
+            },
+            "y2": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "action",
+            "match"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": true,
+          "properties": {
+            "action": {
+              "const": "swipe"
+            },
+            "activity": {
+              "type": "string"
+            },
+            "button": {
+              "enum": [
+                "back",
+                "home",
+                "lock",
+                "recents"
+              ],
+              "type": "string"
+            },
+            "direction": {
+              "type": "string"
+            },
+            "find": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "keycode": {
+              "type": "integer"
+            },
+            "match": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "max": {
+              "type": "integer"
+            },
+            "ms": {
+              "type": "integer"
+            },
+            "on": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "package": {
+              "type": "string"
+            },
+            "scale": {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            "text": {
+              "type": "string"
+            },
+            "to": {
+              "anyOf": [
+                {
+                  "maximum": 3,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "until": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            },
+            "x": {
+              "type": "integer"
+            },
+            "x2": {
+              "type": "integer"
+            },
+            "y": {
+              "type": "integer"
+            },
+            "y2": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "action",
+            "x",
+            "y",
+            "x2",
+            "y2"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": true,
+          "properties": {
+            "action": {
+              "const": "pinch"
+            },
+            "activity": {
+              "type": "string"
+            },
+            "button": {
+              "enum": [
+                "back",
+                "home",
+                "lock",
+                "recents"
+              ],
+              "type": "string"
+            },
+            "direction": {
+              "type": "string"
+            },
+            "find": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "keycode": {
+              "type": "integer"
+            },
+            "match": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "max": {
+              "type": "integer"
+            },
+            "ms": {
+              "type": "integer"
+            },
+            "on": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "package": {
+              "type": "string"
+            },
+            "scale": {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            "text": {
+              "type": "string"
+            },
+            "to": {
+              "anyOf": [
+                {
+                  "maximum": 3,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "until": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            },
+            "x": {
+              "type": "integer"
+            },
+            "x2": {
+              "type": "integer"
+            },
+            "y": {
+              "type": "integer"
+            },
+            "y2": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "action",
+            "x",
+            "y",
+            "scale"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": true,
+          "properties": {
+            "action": {
+              "const": "text"
+            },
+            "activity": {
+              "type": "string"
+            },
+            "button": {
+              "enum": [
+                "back",
+                "home",
+                "lock",
+                "recents"
+              ],
+              "type": "string"
+            },
+            "direction": {
+              "type": "string"
+            },
+            "find": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "keycode": {
+              "type": "integer"
+            },
+            "match": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "max": {
+              "type": "integer"
+            },
+            "ms": {
+              "type": "integer"
+            },
+            "on": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "package": {
+              "type": "string"
+            },
+            "scale": {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            "text": {
+              "type": "string"
+            },
+            "to": {
+              "anyOf": [
+                {
+                  "maximum": 3,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "until": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            },
+            "x": {
+              "type": "integer"
+            },
+            "x2": {
+              "type": "integer"
+            },
+            "y": {
+              "type": "integer"
+            },
+            "y2": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "action",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": true,
+          "properties": {
+            "action": {
+              "const": "key"
+            },
+            "activity": {
+              "type": "string"
+            },
+            "button": {
+              "enum": [
+                "back",
+                "home",
+                "lock",
+                "recents"
+              ],
+              "type": "string"
+            },
+            "direction": {
+              "type": "string"
+            },
+            "find": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "keycode": {
+              "type": "integer"
+            },
+            "match": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "max": {
+              "type": "integer"
+            },
+            "ms": {
+              "type": "integer"
+            },
+            "on": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "package": {
+              "type": "string"
+            },
+            "scale": {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            "text": {
+              "type": "string"
+            },
+            "to": {
+              "anyOf": [
+                {
+                  "maximum": 3,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "until": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            },
+            "x": {
+              "type": "integer"
+            },
+            "x2": {
+              "type": "integer"
+            },
+            "y": {
+              "type": "integer"
+            },
+            "y2": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "action",
+            "keycode"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": true,
+          "properties": {
+            "action": {
+              "const": "button"
+            },
+            "activity": {
+              "type": "string"
+            },
+            "button": {
+              "enum": [
+                "back",
+                "home",
+                "lock",
+                "recents"
+              ],
+              "type": "string"
+            },
+            "direction": {
+              "type": "string"
+            },
+            "find": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "keycode": {
+              "type": "integer"
+            },
+            "match": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "max": {
+              "type": "integer"
+            },
+            "ms": {
+              "type": "integer"
+            },
+            "on": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "package": {
+              "type": "string"
+            },
+            "scale": {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            "text": {
+              "type": "string"
+            },
+            "to": {
+              "anyOf": [
+                {
+                  "maximum": 3,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "until": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            },
+            "x": {
+              "type": "integer"
+            },
+            "x2": {
+              "type": "integer"
+            },
+            "y": {
+              "type": "integer"
+            },
+            "y2": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "action",
+            "button"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": true,
+          "properties": {
+            "action": {
+              "const": "rotate"
+            },
+            "activity": {
+              "type": "string"
+            },
+            "button": {
+              "enum": [
+                "back",
+                "home",
+                "lock",
+                "recents"
+              ],
+              "type": "string"
+            },
+            "direction": {
+              "type": "string"
+            },
+            "find": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "keycode": {
+              "type": "integer"
+            },
+            "match": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "max": {
+              "type": "integer"
+            },
+            "ms": {
+              "type": "integer"
+            },
+            "on": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "package": {
+              "type": "string"
+            },
+            "scale": {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            "text": {
+              "type": "string"
+            },
+            "to": {
+              "anyOf": [
+                {
+                  "maximum": 3,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "until": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            },
+            "x": {
+              "type": "integer"
+            },
+            "x2": {
+              "type": "integer"
+            },
+            "y": {
+              "type": "integer"
+            },
+            "y2": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "action"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": true,
+          "properties": {
+            "action": {
+              "const": "reclaim"
+            },
+            "activity": {
+              "type": "string"
+            },
+            "button": {
+              "enum": [
+                "back",
+                "home",
+                "lock",
+                "recents"
+              ],
+              "type": "string"
+            },
+            "direction": {
+              "type": "string"
+            },
+            "find": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "keycode": {
+              "type": "integer"
+            },
+            "match": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "max": {
+              "type": "integer"
+            },
+            "ms": {
+              "type": "integer"
+            },
+            "on": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "package": {
+              "type": "string"
+            },
+            "scale": {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            "text": {
+              "type": "string"
+            },
+            "to": {
+              "anyOf": [
+                {
+                  "maximum": 3,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "until": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            },
+            "x": {
+              "type": "integer"
+            },
+            "x2": {
+              "type": "integer"
+            },
+            "y": {
+              "type": "integer"
+            },
+            "y2": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "action"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": true,
+          "properties": {
+            "action": {
+              "const": "hardwareKeyboard"
+            },
+            "activity": {
+              "type": "string"
+            },
+            "button": {
+              "enum": [
+                "back",
+                "home",
+                "lock",
+                "recents"
+              ],
+              "type": "string"
+            },
+            "direction": {
+              "type": "string"
+            },
+            "find": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "keycode": {
+              "type": "integer"
+            },
+            "match": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "max": {
+              "type": "integer"
+            },
+            "ms": {
+              "type": "integer"
+            },
+            "on": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "package": {
+              "type": "string"
+            },
+            "scale": {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            "text": {
+              "type": "string"
+            },
+            "to": {
+              "anyOf": [
+                {
+                  "maximum": 3,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "until": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            },
+            "x": {
+              "type": "integer"
+            },
+            "x2": {
+              "type": "integer"
+            },
+            "y": {
+              "type": "integer"
+            },
+            "y2": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "action",
+            "on"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": true,
+          "properties": {
+            "action": {
+              "const": "launch"
+            },
+            "activity": {
+              "type": "string"
+            },
+            "button": {
+              "enum": [
+                "back",
+                "home",
+                "lock",
+                "recents"
+              ],
+              "type": "string"
+            },
+            "direction": {
+              "type": "string"
+            },
+            "find": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "keycode": {
+              "type": "integer"
+            },
+            "match": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "max": {
+              "type": "integer"
+            },
+            "ms": {
+              "type": "integer"
+            },
+            "on": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "package": {
+              "type": "string"
+            },
+            "scale": {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            "text": {
+              "type": "string"
+            },
+            "to": {
+              "anyOf": [
+                {
+                  "maximum": 3,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "until": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            },
+            "x": {
+              "type": "integer"
+            },
+            "x2": {
+              "type": "integer"
+            },
+            "y": {
+              "type": "integer"
+            },
+            "y2": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "action",
+            "package"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": true,
+          "properties": {
+            "action": {
+              "const": "openURL"
+            },
+            "activity": {
+              "type": "string"
+            },
+            "button": {
+              "enum": [
+                "back",
+                "home",
+                "lock",
+                "recents"
+              ],
+              "type": "string"
+            },
+            "direction": {
+              "type": "string"
+            },
+            "find": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "keycode": {
+              "type": "integer"
+            },
+            "match": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "max": {
+              "type": "integer"
+            },
+            "ms": {
+              "type": "integer"
+            },
+            "on": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "package": {
+              "type": "string"
+            },
+            "scale": {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            "text": {
+              "type": "string"
+            },
+            "to": {
+              "anyOf": [
+                {
+                  "maximum": 3,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "until": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            },
+            "x": {
+              "type": "integer"
+            },
+            "x2": {
+              "type": "integer"
+            },
+            "y": {
+              "type": "integer"
+            },
+            "y2": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "action",
+            "url"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": true,
+          "properties": {
+            "action": {
+              "const": "move"
+            },
+            "activity": {
+              "type": "string"
+            },
+            "button": {
+              "enum": [
+                "back",
+                "home",
+                "lock",
+                "recents"
+              ],
+              "type": "string"
+            },
+            "direction": {
+              "type": "string"
+            },
+            "find": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "keycode": {
+              "type": "integer"
+            },
+            "match": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "max": {
+              "type": "integer"
+            },
+            "ms": {
+              "type": "integer"
+            },
+            "on": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "package": {
+              "type": "string"
+            },
+            "scale": {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            "text": {
+              "type": "string"
+            },
+            "to": {
+              "anyOf": [
+                {
+                  "maximum": 3,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "until": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            },
+            "x": {
+              "type": "integer"
+            },
+            "x2": {
+              "type": "integer"
+            },
+            "y": {
+              "type": "integer"
+            },
+            "y2": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "action",
+            "x",
+            "y"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": true,
+          "properties": {
+            "action": {
+              "const": "wait"
+            },
+            "activity": {
+              "type": "string"
+            },
+            "button": {
+              "enum": [
+                "back",
+                "home",
+                "lock",
+                "recents"
+              ],
+              "type": "string"
+            },
+            "direction": {
+              "type": "string"
+            },
+            "find": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "keycode": {
+              "type": "integer"
+            },
+            "match": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "max": {
+              "type": "integer"
+            },
+            "ms": {
+              "type": "integer"
+            },
+            "on": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "package": {
+              "type": "string"
+            },
+            "scale": {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            "text": {
+              "type": "string"
+            },
+            "to": {
+              "anyOf": [
+                {
+                  "maximum": 3,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "until": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            },
+            "x": {
+              "type": "integer"
+            },
+            "x2": {
+              "type": "integer"
+            },
+            "y": {
+              "type": "integer"
+            },
+            "y2": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "action",
+            "ms"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": true,
+          "properties": {
+            "action": {
+              "const": "wait"
+            },
+            "activity": {
+              "type": "string"
+            },
+            "button": {
+              "enum": [
+                "back",
+                "home",
+                "lock",
+                "recents"
+              ],
+              "type": "string"
+            },
+            "direction": {
+              "type": "string"
+            },
+            "find": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "keycode": {
+              "type": "integer"
+            },
+            "match": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "max": {
+              "type": "integer"
+            },
+            "ms": {
+              "type": "integer"
+            },
+            "on": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "package": {
+              "type": "string"
+            },
+            "scale": {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            "text": {
+              "type": "string"
+            },
+            "to": {
+              "anyOf": [
+                {
+                  "maximum": 3,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "until": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            },
+            "x": {
+              "type": "integer"
+            },
+            "x2": {
+              "type": "integer"
+            },
+            "y": {
+              "type": "integer"
+            },
+            "y2": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "action",
+            "match"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": true,
+          "properties": {
+            "action": {
+              "const": "scroll"
+            },
+            "activity": {
+              "type": "string"
+            },
+            "button": {
+              "enum": [
+                "back",
+                "home",
+                "lock",
+                "recents"
+              ],
+              "type": "string"
+            },
+            "direction": {
+              "type": "string"
+            },
+            "find": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "keycode": {
+              "type": "integer"
+            },
+            "match": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/target.Match"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "max": {
+              "type": "integer"
+            },
+            "ms": {
+              "type": "integer"
+            },
+            "on": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "package": {
+              "type": "string"
+            },
+            "scale": {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            "text": {
+              "type": "string"
+            },
+            "to": {
+              "anyOf": [
+                {
+                  "maximum": 3,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "until": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            },
+            "x": {
+              "type": "integer"
+            },
+            "x2": {
+              "type": "integer"
+            },
+            "y": {
+              "type": "integer"
+            },
+            "y2": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "action",
+            "direction"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "httpapi.InputResponse": {
+      "properties": {
+        "atEdge": {
+          "type": "boolean"
+        },
+        "matched": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/target.Node"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "region": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "integer"
+              },
+              "maxItems": 4,
+              "minItems": 4,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "swipes": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "ok"
+      ],
+      "type": "object"
+    },
+    "httpapi.InstallResponse": {
+      "properties": {
+        "bytes": {
+          "type": "integer"
+        },
+        "code": {
+          "type": "string"
+        },
+        "hint": {
+          "type": "string"
+        },
+        "launch": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/httpapi.LaunchResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "output": {
+          "type": "string"
+        },
+        "package": {
+          "type": "string"
+        },
+        "packageError": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        },
+        "tookMs": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "target",
+        "ok",
+        "output",
+        "bytes",
+        "tookMs"
+      ],
+      "type": "object"
+    },
+    "httpapi.LANResponse": {
+      "properties": {
+        "spki": {
+          "type": "string"
+        },
+        "urls": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "urls"
+      ],
+      "type": "object"
+    },
+    "httpapi.LaunchResponse": {
+      "properties": {
+        "activity": {
+          "type": "string"
+        },
+        "code": {
+          "type": "string"
+        },
+        "error": {
+          "type": "string"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "retryAfterMs": {
+          "type": "integer"
+        },
+        "tookMs": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "ok",
+        "tookMs"
+      ],
+      "type": "object"
+    },
+    "httpapi.MediaResponse": {
+      "properties": {
+        "bytes": {
+          "type": "integer"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "target": {
+          "type": "string"
+        },
+        "tookMs": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "target",
+        "ok",
+        "name",
+        "kind",
+        "bytes",
+        "tookMs"
+      ],
+      "type": "object"
+    },
+    "httpapi.NamedDestination": {
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "label"
+      ],
+      "type": "object"
+    },
+    "httpapi.OKResponse": {
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "ok"
+      ],
+      "type": "object"
+    },
+    "httpapi.Overlay": {
+      "properties": {
+        "boxes": {
+          "items": {
+            "$ref": "#/$defs/httpapi.OverlayBox"
+          },
+          "type": "array"
+        },
+        "height": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "image": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "opacity": {
+          "type": "number"
+        },
+        "rect": {
+          "items": {
+            "type": "number"
+          },
+          "maxItems": 4,
+          "minItems": 4,
+          "type": "array"
+        },
+        "source": {
+          "type": "string"
+        },
+        "width": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "source",
+        "rect",
+        "opacity"
+      ],
+      "type": "object"
+    },
+    "httpapi.OverlayBox": {
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "rect": {
+          "items": {
+            "type": "number"
+          },
+          "maxItems": 4,
+          "minItems": 4,
+          "type": "array"
+        }
+      },
+      "required": [
+        "rect"
+      ],
+      "type": "object"
+    },
+    "httpapi.OverlayBoxRequest": {
+      "properties": {
+        "bounds": {
+          "items": {
+            "type": "integer"
+          },
+          "maxItems": 4,
+          "minItems": 4,
+          "type": "array"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "bounds"
+      ],
+      "type": "object"
+    },
+    "httpapi.OverlayDeleteResponse": {
+      "properties": {
+        "removed": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "removed"
+      ],
+      "type": "object"
+    },
+    "httpapi.OverlayRequest": {
+      "properties": {
+        "bounds": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "integer"
+              },
+              "maxItems": 4,
+              "minItems": 4,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "boxes": {
+          "items": {
+            "$ref": "#/$defs/httpapi.OverlayBoxRequest"
+          },
+          "type": "array"
+        },
+        "id": {
+          "type": "string"
+        },
+        "image": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "opacity": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "screen": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "integer"
+              },
+              "maxItems": 2,
+              "minItems": 2,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "source"
+      ],
+      "type": "object"
+    },
+    "httpapi.OverlaysResponse": {
+      "properties": {
+        "overlays": {
+          "items": {
+            "$ref": "#/$defs/httpapi.Overlay"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "overlays"
+      ],
+      "type": "object"
+    },
+    "httpapi.PairRequest": {
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "httpapi.PairResponse": {
+      "properties": {
+        "expiresAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "token": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "token",
+        "expiresAt"
+      ],
+      "type": "object"
+    },
+    "httpapi.PairingInfo": {
+      "properties": {
+        "agent": {
+          "type": "boolean"
+        },
+        "canPair": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "expiresAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "parent": {
+          "type": "string"
+        },
+        "target": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "parent",
+        "createdAt",
+        "expiresAt"
+      ],
+      "type": "object"
+    },
+    "httpapi.PairingRequest": {
+      "properties": {
+        "agent": {
+          "type": "boolean"
+        },
+        "canPair": {
+          "type": "boolean"
+        },
+        "label": {
+          "type": "string"
+        },
+        "target": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "httpapi.PairingResponse": {
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "expiresAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "code",
+        "expiresAt"
+      ],
+      "type": "object"
+    },
+    "httpapi.Preset": {
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "settings": {
+          "additionalProperties": {},
+          "type": "object"
+        }
+      },
+      "required": [
+        "name",
+        "settings"
+      ],
+      "type": "object"
+    },
+    "httpapi.PresetApplyResponse": {
+      "properties": {
+        "settings": {
+          "items": {
+            "$ref": "#/$defs/target.Setting"
+          },
+          "type": "array"
+        },
+        "skipped": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "settings",
+        "skipped"
+      ],
+      "type": "object"
+    },
+    "httpapi.PresetsResponse": {
+      "properties": {
+        "presets": {
+          "items": {
+            "$ref": "#/$defs/httpapi.Preset"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "presets"
+      ],
+      "type": "object"
+    },
+    "httpapi.PutResponse": {
+      "properties": {
+        "changed": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "fields": {
+          "items": {
+            "$ref": "#/$defs/httpapi.configField"
+          },
+          "type": "array"
+        },
+        "pinned": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "restartRequired": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "changed",
+        "restartRequired",
+        "pinned",
+        "fields"
+      ],
+      "type": "object"
+    },
+    "httpapi.RecordStartResponse": {
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "httpapi.RefusedInfo": {
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "code": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent",
+        "code",
+        "at"
+      ],
+      "type": "object"
+    },
+    "httpapi.RemoteAccountResponse": {
+      "properties": {
+        "account": {
+          "type": "string"
+        },
+        "canInstallCLI": {
+          "type": "boolean"
+        },
+        "cliInstallError": {
+          "type": "string"
+        },
+        "cliInstalled": {
+          "type": "boolean"
+        },
+        "cliInstalling": {
+          "type": "boolean"
+        },
+        "projects": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "signedIn": {
+          "type": "boolean"
+        },
+        "signingIn": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "cliInstalled",
+        "signedIn",
+        "projects"
+      ],
+      "type": "object"
+    },
+    "httpapi.RemoteInfo": {
+      "properties": {
+        "expiresAt": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "project": {
+          "type": "string"
+        },
+        "reservation": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "project"
+      ],
+      "type": "object"
+    },
+    "httpapi.RemoteListResponse": {
+      "properties": {
+        "reservations": {
+          "items": {
+            "$ref": "#/$defs/httpapi.RemoteReservation"
+          },
+          "type": "array"
+        },
+        "usageMinutes": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "reservations",
+        "usageMinutes"
+      ],
+      "type": "object"
+    },
+    "httpapi.RemoteModelsError": {
+      "properties": {
+        "apiDisabled": {
+          "type": "boolean"
+        },
+        "error": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "error"
+      ],
+      "type": "object"
+    },
+    "httpapi.RemoteModelsResponse": {
+      "properties": {
+        "models": {
+          "items": {
+            "$ref": "#/$defs/firebase.Model"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "models"
+      ],
+      "type": "object"
+    },
+    "httpapi.RemoteReservation": {
+      "properties": {
+        "activeAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "api": {
+          "type": "integer"
+        },
+        "apiDisabled": {
+          "type": "boolean"
+        },
+        "before": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "codename": {
+          "type": "string"
+        },
+        "endedAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "error": {
+          "type": "string"
+        },
+        "expiresAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "project": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "releaseError": {
+          "type": "string"
+        },
+        "reservation": {
+          "type": "string"
+        },
+        "startedAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "project",
+        "codename",
+        "api",
+        "state",
+        "startedAt",
+        "activeAt",
+        "expiresAt",
+        "endedAt"
+      ],
+      "type": "object"
+    },
+    "httpapi.ReserveRemoteRequest": {
+      "properties": {
+        "api": {
+          "type": "integer"
+        },
+        "codename": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "project": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project",
+        "codename",
+        "api"
+      ],
+      "type": "object"
+    },
+    "httpapi.ReserveRemoteResponse": {
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "id"
+      ],
+      "type": "object"
+    },
+    "httpapi.RevokeResponse": {
+      "properties": {
+        "revoked": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "revoked"
+      ],
+      "type": "object"
+    },
+    "httpapi.RevylAccountResponse": {
+      "properties": {
+        "authMethod": {
+          "type": "string"
+        },
+        "canInstallCLI": {
+          "type": "boolean"
+        },
+        "cliInstallError": {
+          "type": "string"
+        },
+        "cliInstalled": {
+          "type": "boolean"
+        },
+        "cliInstalling": {
+          "type": "boolean"
+        },
+        "email": {
+          "type": "string"
+        },
+        "loginCode": {
+          "type": "string"
+        },
+        "loginError": {
+          "type": "string"
+        },
+        "loginURL": {
+          "type": "string"
+        },
+        "org": {
+          "type": "string"
+        },
+        "signedIn": {
+          "type": "boolean"
+        },
+        "signingIn": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "cliInstalled",
+        "signedIn"
+      ],
+      "type": "object"
+    },
+    "httpapi.RevylBillingResponse": {
+      "properties": {
+        "billingURL": {
+          "type": "string"
+        },
+        "freeMinutes": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/httpapi.RevylFreeMinutes"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "periodEnd": {
+          "type": "string"
+        },
+        "plan": {
+          "type": "string"
+        },
+        "planName": {
+          "type": "string"
+        },
+        "usdPerMinute": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/httpapi.RevylRates"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "httpapi.RevylDevice": {
+      "properties": {
+        "adopted": {
+          "type": "boolean"
+        },
+        "error": {
+          "type": "string"
+        },
+        "idleTimeoutSec": {
+          "type": "integer"
+        },
+        "key": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "osVersion": {
+          "type": "string"
+        },
+        "platform": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "startedAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "stopError": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "platform",
+        "state",
+        "startedAt"
+      ],
+      "type": "object"
+    },
+    "httpapi.RevylFreeMinutes": {
+      "properties": {
+        "android": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/httpapi.RevylMinutes"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ios": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/httpapi.RevylMinutes"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "httpapi.RevylListResponse": {
+      "properties": {
+        "devices": {
+          "items": {
+            "$ref": "#/$defs/httpapi.RevylDevice"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "devices"
+      ],
+      "type": "object"
+    },
+    "httpapi.RevylMinutes": {
+      "properties": {
+        "left": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "total": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "httpapi.RevylModel": {
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "runtime": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "model",
+        "runtime"
+      ],
+      "type": "object"
+    },
+    "httpapi.RevylRates": {
+      "properties": {
+        "android": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ios": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "httpapi.RevylTargetsResponse": {
+      "properties": {
+        "platforms": {
+          "additionalProperties": {
+            "items": {
+              "$ref": "#/$defs/httpapi.RevylModel"
+            },
+            "type": "array"
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "platforms"
+      ],
+      "type": "object"
+    },
+    "httpapi.SequenceRequest": {
+      "properties": {
+        "steps": {
+          "items": {
+            "$ref": "#/$defs/httpapi.InputRequest"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "steps"
+      ],
+      "type": "object"
+    },
+    "httpapi.SequenceResponse": {
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "error": {
+          "type": "string"
+        },
+        "failed": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "steps": {
+          "items": {
+            "$ref": "#/$defs/httpapi.SequenceStep"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "ok",
+        "steps"
+      ],
+      "type": "object"
+    },
+    "httpapi.SequenceStep": {
+      "properties": {
+        "body": {},
+        "status": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    },
+    "httpapi.ServerAddRequest": {
+      "properties": {
+        "fingerprint": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "token": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "url",
+        "token"
+      ],
+      "type": "object"
+    },
+    "httpapi.ServerInfo": {
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "rttMs": {
+          "type": "integer"
+        },
+        "state": {
+          "type": "string"
+        },
+        "targets": {
+          "type": "integer"
+        },
+        "url": {
+          "type": "string"
+        },
+        "warning": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "url",
+        "state",
+        "targets",
+        "rttMs"
+      ],
+      "type": "object"
+    },
+    "httpapi.SessionInfo": {
+      "properties": {
+        "agent": {
+          "type": "boolean"
+        },
+        "canPair": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "current": {
+          "type": "boolean"
+        },
+        "expiresAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "lastUsedAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "parent": {
+          "type": "string"
+        },
+        "remoteAddr": {
+          "type": "string"
+        },
+        "revokedAt": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "userAgent": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "parent",
+        "createdAt",
+        "lastUsedAt",
+        "expiresAt"
+      ],
+      "type": "object"
+    },
+    "httpapi.SettingsConflictResponse": {
+      "properties": {
+        "error": {
+          "type": "string"
+        },
+        "failed": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "notRestored": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "settings": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/target.Setting"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "error",
+        "failed"
+      ],
+      "type": "object"
+    },
+    "httpapi.SettingsPutRequest": {
+      "properties": {
+        "changes": {
+          "additionalProperties": {},
+          "minProperties": 1,
+          "type": "object"
+        }
+      },
+      "required": [
+        "changes"
+      ],
+      "type": "object"
+    },
+    "httpapi.SettingsResponse": {
+      "properties": {
+        "settings": {
+          "items": {
+            "$ref": "#/$defs/target.Setting"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "settings"
+      ],
+      "type": "object"
+    },
+    "httpapi.SharedClipboardRequest": {
+      "properties": {
+        "at": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    },
+    "httpapi.StartRevylRequest": {
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "osVersion": {
+          "type": "string"
+        },
+        "platform": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "platform"
+      ],
+      "type": "object"
+    },
+    "httpapi.StartRevylResponse": {
+      "properties": {
+        "key": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "type": "object"
+    },
+    "httpapi.T3Destinations": {
+      "properties": {
+        "error": {
+          "type": "string"
+        },
+        "projects": {
+          "items": {
+            "$ref": "#/$defs/httpapi.T3ProjectInfo"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "projects"
+      ],
+      "type": "object"
+    },
+    "httpapi.T3ProjectInfo": {
+      "properties": {
+        "error": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "threads": {
+          "items": {
+            "$ref": "#/$defs/httpapi.T3ThreadInfo"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "path",
+        "name",
+        "threads"
+      ],
+      "type": "object"
+    },
+    "httpapi.T3ThreadInfo": {
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "updatedAt": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "status",
+        "updatedAt"
+      ],
+      "type": "object"
+    },
+    "httpapi.TargetInfo": {
+      "properties": {
+        "active": {
+          "type": "boolean"
+        },
+        "apiLevel": {
+          "type": "integer"
+        },
+        "available": {
+          "type": "boolean"
+        },
+        "bootsOnOpen": {
+          "type": "boolean"
+        },
+        "claim": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/httpapi.ClaimInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "drivenBy": {
+          "type": "string"
+        },
+        "form": {
+          "type": "string"
+        },
+        "handsOff": {
+          "type": "boolean"
+        },
+        "headless": {
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "lastError": {
+          "type": "string"
+        },
+        "os": {
+          "type": "string"
+        },
+        "osVersion": {
+          "type": "string"
+        },
+        "paused": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "refused": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/httpapi.RefusedInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "remote": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/httpapi.RemoteInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "serial": {
+          "type": "string"
+        },
+        "server": {
+          "type": "string"
+        },
+        "startSavedAt": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "transport": {
+          "type": "string"
+        },
+        "waiting": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/httpapi.WaitingInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "label",
+        "active",
+        "available"
+      ],
+      "type": "object"
+    },
+    "httpapi.UIResponse": {
+      "properties": {
+        "composables": {
+          "items": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/composetree.Composable"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "type": "array"
+        },
+        "composeError": {
+          "type": "string"
+        },
+        "height": {
+          "type": "integer"
+        },
+        "nodes": {
+          "items": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/target.Node"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "type": "array"
+        },
+        "rotation": {
+          "type": "integer"
+        },
+        "target": {
+          "type": "string"
+        },
+        "width": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "target",
+        "width",
+        "height",
+        "rotation",
+        "nodes"
+      ],
+      "type": "object"
+    },
+    "httpapi.UninstallResponse": {
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "output": {
+          "type": "string"
+        },
+        "package": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        },
+        "tookMs": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "target",
+        "ok",
+        "package",
+        "tookMs"
+      ],
+      "type": "object"
+    },
+    "httpapi.VersionResponse": {
+      "properties": {
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "version"
+      ],
+      "type": "object"
+    },
+    "httpapi.WaitingInfo": {
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "session": {
+          "type": "string"
+        },
+        "since": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent",
+        "since"
+      ],
+      "type": "object"
+    },
+    "httpapi.configField": {
+      "properties": {
+        "applies": {
+          "type": "string"
+        },
+        "doc": {
+          "type": "string"
+        },
+        "fileValue": {},
+        "name": {
+          "type": "string"
+        },
+        "pinned": {
+          "type": "boolean"
+        },
+        "source": {
+          "type": "string"
+        },
+        "value": {}
+      },
+      "required": [
+        "name",
+        "value",
+        "fileValue",
+        "applies",
+        "doc",
+        "source",
+        "pinned"
+      ],
+      "type": "object"
+    },
+    "record.BitrateChange": {
+      "properties": {
+        "atMs": {
+          "type": "integer"
+        },
+        "from": {
+          "type": "integer"
+        },
+        "to": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "atMs",
+        "from",
+        "to"
+      ],
+      "type": "object"
+    },
+    "record.Meta": {
+      "properties": {
+        "bitrateChanges": {
+          "items": {
+            "$ref": "#/$defs/record.BitrateChange"
+          },
+          "type": "array"
+        },
+        "bytes": {
+          "type": "integer"
+        },
+        "durationMs": {
+          "type": "integer"
+        },
+        "ended": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "error": {
+          "type": "string"
+        },
+        "firstKeyMs": {
+          "type": "integer"
+        },
+        "frames": {
+          "type": "integer"
+        },
+        "height": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "inProgress": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "started": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        },
+        "width": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "target",
+        "started",
+        "frames",
+        "bytes",
+        "durationMs",
+        "firstKeyMs",
+        "bitrateChanges",
+        "inProgress"
+      ],
+      "type": "object"
+    },
+    "session.ControlState": {
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "agentName": {
+          "type": "string"
+        },
+        "held": {
+          "type": "boolean"
+        },
+        "holdMs": {
+          "type": "integer"
+        },
+        "holder": {
+          "type": "integer"
+        },
+        "pinnedUntil": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "held",
+        "agent"
+      ],
+      "type": "object"
+    },
+    "session.Event": {
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "agent": {
+          "type": "string"
+        },
+        "button": {
+          "type": "string"
+        },
+        "err": {
+          "type": "string"
+        },
+        "from": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "number"
+              },
+              "maxItems": 2,
+              "minItems": 2,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "keycode": {
+          "type": "integer"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "ms": {
+          "type": "integer"
+        },
+        "pointers": {
+          "type": "integer"
+        },
+        "redacted": {
+          "type": "boolean"
+        },
+        "rotation": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "scale": {
+          "type": "number"
+        },
+        "scroll": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "number"
+              },
+              "maxItems": 2,
+              "minItems": 2,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "seq": {
+          "type": "integer"
+        },
+        "source": {
+          "type": "string"
+        },
+        "t": {
+          "type": "integer"
+        },
+        "text": {
+          "type": "string"
+        },
+        "textLen": {
+          "type": "integer"
+        },
+        "to": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "number"
+              },
+              "maxItems": 2,
+              "minItems": 2,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "viewer": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "seq",
+        "t",
+        "source",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "session.EventPage": {
+      "properties": {
+        "events": {
+          "items": {
+            "$ref": "#/$defs/session.Event"
+          },
+          "type": "array"
+        },
+        "latest": {
+          "type": "integer"
+        },
+        "oldest": {
+          "type": "integer"
+        },
+        "session": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session",
+        "oldest",
+        "latest",
+        "events"
+      ],
+      "type": "object"
+    },
+    "target.App": {
+      "properties": {
+        "activity": {
+          "type": "string"
+        },
+        "apkPath": {
+          "type": "string"
+        },
+        "package": {
+          "type": "string"
+        },
+        "pid": {
+          "type": "integer"
+        },
+        "versionCode": {
+          "type": "integer"
+        },
+        "versionName": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "package",
+        "activity"
+      ],
+      "type": "object"
+    },
+    "target.BootStatus": {
+      "properties": {
+        "adbState": {
+          "type": "string"
+        },
+        "avd": {
+          "type": "string"
+        },
+        "bootCompleted": {
+          "type": "boolean"
+        },
+        "elapsedMs": {
+          "type": "integer"
+        },
+        "logPath": {
+          "type": "string"
+        },
+        "pid": {
+          "type": "integer"
+        },
+        "processAlive": {
+          "type": "boolean"
+        },
+        "serial": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "avd",
+        "state",
+        "processAlive",
+        "bootCompleted"
+      ],
+      "type": "object"
+    },
+    "target.CrashReport": {
+      "properties": {
+        "build": {
+          "type": "string"
+        },
+        "bundleID": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "pid": {
+          "type": "integer"
+        },
+        "process": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "time": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "time",
+        "process",
+        "summary"
+      ],
+      "type": "object"
+    },
+    "target.DeviceFrame": {
+      "properties": {
+        "background": {
+          "type": "string"
+        },
+        "contentRotation": {
+          "type": "integer"
+        },
+        "cornerRadius": {
+          "type": "integer"
+        },
+        "cutout": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/target.FrameCutout"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "display": {
+          "$ref": "#/$defs/target.FrameRect"
+        },
+        "displayRotation": {
+          "type": "integer"
+        },
+        "height": {
+          "type": "integer"
+        },
+        "mask": {
+          "type": "string"
+        },
+        "rotation": {
+          "type": "integer"
+        },
+        "source": {
+          "type": "string"
+        },
+        "width": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "source",
+        "width",
+        "height",
+        "display",
+        "cornerRadius"
+      ],
+      "type": "object"
+    },
+    "target.FrameCutout": {
+      "properties": {
+        "dx": {
+          "type": "integer"
+        },
+        "path": {
+          "type": "string"
+        },
+        "scale": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "path",
+        "scale",
+        "dx"
+      ],
+      "type": "object"
+    },
+    "target.FrameRect": {
+      "properties": {
+        "height": {
+          "type": "integer"
+        },
+        "width": {
+          "type": "integer"
+        },
+        "x": {
+          "type": "integer"
+        },
+        "y": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "x",
+        "y",
+        "width",
+        "height"
+      ],
+      "type": "object"
+    },
+    "target.HostCamera": {
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "label"
+      ],
+      "type": "object"
+    },
+    "target.Match": {
+      "properties": {
+        "contains": {
+          "type": "boolean"
+        },
+        "desc": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "index": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "text": {
+          "type": "string"
+        },
+        "waitMs": {
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "target.Node": {
+      "properties": {
+        "bounds": {
+          "items": {
+            "type": "integer"
+          },
+          "maxItems": 4,
+          "minItems": 4,
+          "type": "array"
+        },
+        "center": {
+          "items": {
+            "type": "integer"
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array"
+        },
+        "checkable": {
+          "type": "boolean"
+        },
+        "checked": {
+          "type": "boolean"
+        },
+        "children": {
+          "items": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/target.Node"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "type": "array"
+        },
+        "class": {
+          "type": "string"
+        },
+        "clickable": {
+          "type": "boolean"
+        },
+        "composable": {
+          "type": "string"
+        },
+        "desc": {
+          "type": "string"
+        },
+        "disabled": {
+          "type": "boolean"
+        },
+        "focused": {
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string"
+        },
+        "occluded": {
+          "type": "boolean"
+        },
+        "password": {
+          "type": "boolean"
+        },
+        "scrollBackward": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "scrollForward": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "scrollable": {
+          "type": "boolean"
+        },
+        "selected": {
+          "type": "boolean"
+        },
+        "source": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "bounds",
+        "center"
+      ],
+      "type": "object"
+    },
+    "target.Setting": {
+      "properties": {
+        "applies": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "max": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "min": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "options": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "package": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "step": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "supported": {
+          "type": "boolean"
+        },
+        "type": {
+          "type": "string"
+        },
+        "value": {}
+      },
+      "required": [
+        "id",
+        "type",
+        "value",
+        "supported",
+        "applies"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

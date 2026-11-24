@@ -1,0 +1,97 @@
+package httpapi
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/bmcreations/loupe/internal/target/ios"
+
+	"github.com/bmcreations/loupe/internal/target/android"
+
+	"github.com/bmcreations/loupe/internal/target"
+)
+
+var (
+	simProbe = ios.SimInfo{UDID: "98F85F5F-A448-4F5A-A511-45529A267273", Name: "loupe-probe", State: "Shutdown", OSVersion: "27.0", Form: "phone"}
+	simPro   = ios.SimInfo{UDID: "1651B3AF-0FCC-4297-A849-F78349FC26F3", Name: "iPhone 18 Pro", State: "Shutdown", OSVersion: "27.0", Form: "phone"}
+)
+
+func TestASimulatorIsListedAndFollowsItsBootState(t *testing.T) {
+	m := NewManager(target.Options{})
+	m.SyncSimulators([]ios.SimInfo{simProbe}, "/nonexistent/simcap")
+
+	id := ios.SimulatorID(simProbe.UDID)
+	got := infoFor(t, m, id)
+	if got.Kind != "simulator" || got.Label != "loupe-probe" || !got.Available || !got.BootsOnOpen {
+		t.Fatalf("listed as %+v", got)
+	}
+	if got.OS != "ios" || got.OSVersion != "27.0" {
+		t.Errorf("described as os=%q version=%q", got.OS, got.OSVersion)
+	}
+
+	booted := simProbe
+	booted.State = "Booted"
+	m.SyncSimulators([]ios.SimInfo{booted}, "/nonexistent/simcap")
+	if infoFor(t, m, id).BootsOnOpen {
+		t.Error("a simulator booted from Xcode still reads as booting on open")
+	}
+}
+
+// A deleted simulator that is still being watched stays, so its viewer can
+// say where it went, until the first listing after its session ends.
+func TestADeletedSimulatorIsKeptAndSaysWhy(t *testing.T) {
+	m := NewManager(target.Options{})
+	m.SyncSimulators([]ios.SimInfo{simProbe, simPro}, "")
+	probe := ios.SimulatorID(simProbe.UDID)
+	m.sessions[probe] = nil // watched
+	m.SyncSimulators([]ios.SimInfo{simPro}, "")
+
+	got := infoFor(t, m, ios.SimulatorID(simProbe.UDID))
+	if got.Available || got.State != "missing" {
+		t.Fatalf("after deleting: available=%v state=%q", got.Available, got.State)
+	}
+	if !strings.Contains(got.Reason, "simctl") || strings.Contains(got.Reason, "adb") {
+		t.Errorf("reason %q blames the wrong tool", got.Reason)
+	}
+	if !infoFor(t, m, ios.SimulatorID(simPro.UDID)).Available {
+		t.Error("the simulator still listed became unavailable")
+	}
+
+	delete(m.sessions, probe)
+	m.SyncSimulators([]ios.SimInfo{simPro}, "")
+	if _, ok := m.Target(probe); ok {
+		t.Error("the deleted simulator stayed after its session ended")
+	}
+}
+
+// adb never lists a simulator, so an adb sync must leave them alone.
+func TestAnAdbSyncDoesNotMarkSimulatorsMissing(t *testing.T) {
+	m := NewManager(target.Options{})
+	m.SyncSimulators([]ios.SimInfo{simProbe}, "")
+	m.SyncDevices([]android.DeviceInfo{acmeReady}, buildADB)
+	m.SyncDevices(nil, buildADB)
+
+	if !infoFor(t, m, ios.SimulatorID(simProbe.UDID)).Available {
+		t.Error("an adb sync marked a simulator missing")
+	}
+}
+
+// Ids are UDIDs, so sorting by id alone scatters simulators at random.
+func TestSimulatorsListAfterDevicesRunningFirstThenByName(t *testing.T) {
+	m := NewManager(target.Options{})
+	booted := simPro
+	booted.State = "Booted"
+	other := ios.SimInfo{UDID: "00000000-0000-0000-0000-000000000000", Name: "iPhone 17", State: "Shutdown"}
+	m.SyncSimulators([]ios.SimInfo{simProbe, other, booted}, "")
+	m.SyncDevices([]android.DeviceInfo{acmeReady}, buildADB)
+
+	var ids []string
+	for _, ti := range m.Targets(context.Background()) {
+		ids = append(ids, ti.Label)
+	}
+	want := []string{"Acme One (ACME00000000001)", "iPhone 18 Pro", "iPhone 17", "loupe-probe"}
+	if strings.Join(ids, ",") != strings.Join(want, ",") {
+		t.Errorf("order %v, want %v", ids, want)
+	}
+}

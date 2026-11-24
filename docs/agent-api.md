@@ -1,0 +1,1082 @@
+# Agent API
+
+The `/api/*` routes an agent drives, and how claims and the human hold share
+a device between agents and a person. Request and response shapes are in
+`docs/api.schema.json`; the session wire protocol the viewers speak is in
+`docs/protocol.md`. Command-line and MCP wrappers are in [cli.md](cli.md) and
+[mcp.md](mcp.md).
+
+## Conventions
+
+- Every request needs the shared token (`Authorization: Bearer`, cookie or
+  `?token=`).
+- A route that touches a device takes `?target=<id>`. A process can drive
+  a target while a person watches the same session.
+- Coordinates are device pixels, as `/api/ui` reports them.
+- An agent names itself with `X-Loupe-Agent: <name>` (64 printable bytes at
+  most) and, to tell two sessions of one agent apart, `X-Loupe-Session: <id>`.
+  Both show in the trace and on the viewer's banner. The viewer sends
+  `X-Loupe-Viewer`; agents never should (see Claims and the human hold).
+- A target that cannot do something answers 501. A target that is shut down
+  answers 502 "open it in the viewer to boot it" to routes that need it
+  running, except where a route says otherwise.
+- Errors are JSON with `error` and, where a caller can branch on it, `code`.
+
+Common refusals on routes that change a device:
+
+| Status | `code` | Meaning |
+|---|---|---|
+| 409 | `humanHeld` | A person is touching the target. Has `retryAfterMs` and a `Retry-After` header. |
+| 409 | `claimedBy` | Another agent holds a claim. The holder is in `claim`. |
+| 409 | `claimLapsed` | The caller's own claim ran out (no call for 10 minutes) and nobody has claimed since. Claim again. |
+| 409 | `handsOff` | The target is marked off limits. No retry time. |
+| 409 | `interrupted` | A person sent an interrupt flag the agent has not read ([flags.md](flags.md)). |
+
+## Routes
+
+| Route | Purpose |
+|---|---|
+| `GET /api/ui` | View hierarchy |
+| `GET /api/screenshot` | One PNG |
+| `POST /api/input` | Tap, swipe, text, keys, buttons, launch, open URL, wait |
+| `POST /api/sequence` | Several input steps in one request |
+| `POST /api/drop` | Paste an image into a simulator text field |
+| `POST /api/install` | Install an APK or split set, or an iOS app |
+| `DELETE /api/install` | Uninstall an Android app |
+| `POST /api/media` | Add a photo or video to the device library |
+| `POST`, `DELETE /api/camera` | Feed the back camera an image, or an AVD one of the Mac's cameras |
+| `GET /api/camera/sources` | The Mac cameras an AVD can use as its back camera |
+| `DELETE /api/camera/feed` | Blank Handset Camera's live feed and keep it as the AVD's camera |
+| `POST /api/devices/boot`, `shutdown`, `reset`, `DELETE /api/devices` | Device lifecycle |
+| `GET`, `POST /api/android/cli` | Install the android CLI and adb on a Mac with no SDK ([targets](targets.md#without-an-sdk)) |
+| `GET`, `POST`, `DELETE /api/revyl`, `/api/revyl/account`, `GET /api/revyl/targets`, `GET /api/revyl/billing`, `POST /api/revyl/cli` | Revyl cloud devices on the user's account |
+| `GET /api/logcat` | Device log |
+| `GET /api/crashes` | Crash reports |
+| `GET`, `PUT /api/settings` | Device settings: dark mode, text size, reduce motion, posture, hinge angle, app language, location |
+| `GET`, `PUT`, `DELETE /api/presets`, `POST /api/presets/apply` | Named groups of device settings |
+| `GET`, `POST /api/clipboard` | Device clipboard |
+| `GET`, `POST /api/clipboard/shared` | Shared clipboard |
+| `GET /api/handoff` | Link that moves a session to another browser |
+| `GET /api/lan` | Addresses on the local network, and the key to check there |
+| `GET /api/version` | The running server's version |
+| `GET`, `POST /api/feedback` | An agent's report on loupe itself |
+| `GET`, `POST`, `DELETE /api/overlays` | Images and boxes over the video |
+| `GET`, `POST /api/extensions` | Extension registry and proxy |
+| `GET`, `POST`, `DELETE /api/claims` | Claims |
+| `POST /api/devices/handsoff` | Hands-off marker |
+| `POST /api/control/release` | A viewer hands the target back before its hold runs out |
+
+## Read the screen
+
+### `GET /api/ui?target=<id>`
+
+Returns the view hierarchy. Each node has a `center`, so a caller taps a node
+without computing it.
+
+On Android a scrollable node also has `scrollBackward` and `scrollForward`:
+whether the list can still move toward its start (up, or left) and toward its
+end. A list at its top has `"scrollBackward": false`, so there is no need to
+swipe to find out. When lists are nested, read the outermost scrollable under
+the point: an inner RecyclerView can offer an action its parent ScrollView is
+the one to carry out. iOS trees carry neither field; its accessibility tree
+has no scroll state.
+
+| Param | Effect |
+|---|---|
+| `interactive=1` | Prunes layout containers. |
+| `compose=1` | Names nodes after the composables that drew them. |
+
+An Android dump takes about 250ms. It comes from loupe's own reader
+(`internal/a11ydump`), which writes `uiautomator dump`'s XML from the same
+accessibility tree, leaving out the status bar and keyboard windows as
+uiautomator does. If that reader fails, loupe falls back to `uiautomator dump`
+(about 2 seconds, and no scroll fields). `LOUPE_A11Y_DUMP=0` in the server's
+environment makes it always use `uiautomator dump`. Android allows one
+UiAutomation client at a time, so while Maestro or an instrumentation test
+holds it the dump answers 409 either way. The tree is not cached.
+
+`compose=1` works on a debuggable Android app only. Nodes inside a
+`ComposeView` gain `composable` (`MessageRow`) and `source`
+(`MessageList.kt:661`), and the response adds `composables`, the full
+composable tree with bounds, including wrappers that have no node. A node is
+named only when a composable's bounds equal its own, so empty full-screen
+overlays and nodes clipped by another stay unnamed. The first call per app
+version downloads the Compose inspector for that version from Google's Maven
+into `~/Library/Caches/loupe/compose-inspector/<version>/`. A failure never
+fails the request: the plain tree comes back with `composeError` saying why
+(`app is not debuggable`). It combines with `interactive=1`.
+
+### `GET /api/screenshot?target=<id>`
+
+Returns one PNG of the framebuffer at the device's own resolution. It needs no
+open session. A target with no screenshot support (synthetic) answers 501.
+
+## Input
+
+### `POST /api/input?target=<id>`
+
+Body: `{"action": "...", ...}`. Field shapes are in `docs/api.schema.json`.
+
+| Action | Fields | Notes |
+|---|---|---|
+| `tap` | `x`, `y` or `match` | See Tap by selector. |
+| `swipe` | `x`, `y`, `x2`, `y2`, `ms` | |
+| `scroll` | `direction`, `until?`, `find?`, `x?`, `y?`, `max?`, `ms?` | See Scroll. |
+| `text` | `text` | |
+| `key` | `keycode` | |
+| `button` | `button` | `back`, `home`, `lock` or `recents`. |
+| `pinch`, `rotate`, `reclaim`, `hardwareKeyboard` | see schema | |
+| `launch` | `package`, `activity?` | See Launch. |
+| `openURL` | `url` | See Open a URL. |
+| `move` | `x`, `y` | Touches nothing. |
+| `wait` | `ms` or `match` | Touches nothing. |
+
+An action a person's hold, a claim or hands-off refuses answers 409 as in
+Conventions. `move`, `wait`, `hardwareKeyboard` and reads are never refused by
+the human hold.
+
+An Android `tap` or `swipe` the input dispatcher threw away answers 409
+`code: "touchRejected"` with its reason, because `input` itself exits 0 either
+way.
+
+A `key` or `button` the target has no way to press, such as `recents` on a
+Revyl device, answers 501 with the reason, as an action the target lacks
+entirely does.
+
+#### Cursor
+
+`move` (`{"x": ..., "y": ...}`) sends the agent's cursor to a point on every
+viewer, so a person sees where the agent is about to act. It is live only: not
+in the event log or `/api/events`, it passes the human hold and leaves the
+banner alone. Another agent's claim still refuses it. `loupe mcp`'s `tap` and
+`swipe` send one first. After 2.5 seconds without input the cursor dims and
+pulses where it last acted for 20 seconds more, then fades.
+
+#### Tap by selector
+
+`{"action":"tap","match":{"text":"Sign in"}}` taps a node instead of a point.
+
+| `match` field | Meaning |
+|---|---|
+| `id` | Resource id on Android, accessibility identifier on iOS. A bare Android name (`send`) matches any package's `:id/send`. |
+| `text` | The node's text. On a simulator a button's label is its `text`. |
+| `desc` | The content description. |
+| `contains` | `true` makes `text` and `desc` case-insensitive substring matches. Otherwise they match exactly. |
+
+A node has to satisfy every field given. Other body fields:
+
+| Field | Effect |
+|---|---|
+| `index` | Picks the nth match in tree order. |
+| `waitMs` | Dumps again every 50ms, up to this many ms (at most 20000), until the node appears. Replaces a sleep-and-retry after a navigation. |
+
+The server taps the node's `center`, moves the cursor there first, and answers
+`{"ok":true,"matched":{...}}` with the node (no children). Nodes with no area
+and nodes a simulator marks `occluded` never match. Matches with identical
+bounds count once.
+
+| Status | `code` | Meaning |
+|---|---|---|
+| 404 | `noMatch` | No node matched. |
+| 409 | `ambiguous` | More than one matched. `candidates` lists them and nothing was touched. Add `index`. |
+| 400 | | A body with both `match` and `x`/`y`. |
+
+The lookup runs before arbitration, so a missing node is a 404 even while a
+person holds the target. Each match tap costs a full dump.
+
+A match that acts (any action but `wait`) first waits for the screen to hold
+still when the target took input in the last 1s, or a `wait` before it, or its
+own first dump, had to wait for the node to appear. It dumps until the tree has
+not changed for 150ms, at most 1.5s, and taps where the node ends up. A tap
+sent while a push or pop is still animating answers 200 and does nothing, and
+the node is already in the tree at its final place, so nothing else catches it.
+Right after a push, a tap takes about 0.7s on a simulator and 1s on an
+emulator instead of being lost. On a screen that is not moving, the wait adds
+about 0.2s on a simulator and 0.25s on an emulator.
+
+#### Scroll
+
+`{"action":"scroll","direction":"up","until":"edge"}` scrolls a list to its
+top and says when it got there. `direction` is the way to go, as a person says
+it: `down` shows what is below, so the finger moves up.
+
+The server dumps the tree, picks the list, and swipes inside it. After each
+stroke it dumps again and compares what the list shows (every node centred in
+it, with its labels and bounds). A stroke that changed nothing means the list
+was already at its edge, and the scroll stops there.
+
+| Field | Effect |
+|---|---|
+| `until` | `edge` keeps going until a stroke moves nothing. On a simulator strokes are flings (120ms) unless `ms` says otherwise; on Android they stay at 300ms, because a short `input swipe` moved the list no further and can land as a tap. |
+| `find` | A `match` (see Tap by selector). Keeps going until the node is on screen and answers with it in `matched`. Already on screen: no stroke at all. Strokes are the 300ms swipe default, so a fling cannot carry the node past unseen. |
+| `x`, `y` | A point in the list to scroll: the innermost scrollable node under it. Without one, the largest scrollable node on screen. A screen that marks nothing scrollable (many iOS views) uses the screen less its top and bottom tenth. |
+| `max` | At most this many strokes, up to 30. Default 1, or 20 with `until` or `find`. |
+
+Each stroke covers 60% of the list on its centre line, kept out of the outer
+8% of the screen, where a drag opens the notification shade, goes back or
+goes home. On a simulator the tree is dumped until two dumps agree before
+comparing, because a list still coasts or bounces after the stroke;
+uiautomator already waits for the window to go idle.
+
+It answers `{"ok":true,"swipes":N,"atEdge":true,"region":[x1,y1,x2,y2]}`.
+`atEdge` is absent when the last stroke still moved the list. A `find` that
+reaches the edge or `max` first answers 404 `noMatch`.
+
+Each stroke is a `swipe` sent through `/api/input` with a `move` first: it is
+arbitrated, logged and shown on viewers like one sent alone, so a person who
+takes the device back stops the scroll at the next stroke with that stroke's
+409. Rows identical in every label that land exactly one row apart would read
+as no movement.
+
+#### Wait
+
+`{"action":"wait","ms":1500}` pauses (at most 20000).
+`{"action":"wait","match":{"text":"Inbox"}}` dumps until the node appears and
+answers with it, for 10 seconds unless the match sets `waitMs`. It is not
+arbitrated and not logged, so a held target does not refuse it. In a sequence
+it holds the next step until a screen has loaded.
+
+#### Launch
+
+`{"action":"launch","package":"com.android.settings"}` opens an installed app.
+`activity` names a specific one (qualified, or starting with `.`); otherwise
+the launcher activity is used. On a simulator `package` is the bundle ID and
+`activity` is a 400. An app already in front is a success.
+
+| Status | `code` | Meaning |
+|---|---|---|
+| 400 | | Package or activity name fails the pattern check. Checked before arbitration, so it is a 400 even under a hold. |
+| 404 | `notInstalled` | The package is not on the device. |
+| 422 | `noLaunchActivity` | Installed, with no launcher activity. |
+| 404 | `noSuchActivity` | The named activity does not exist. |
+| 422 | `noCameraShim` | A camera image is staged and the app could not load the camera shim (see Camera). |
+| 502 | | Any other failure. A shim that could not be built or signed has an error starting "camera shim:". |
+
+The trace record has `package`, `tookMs`, `activity` when named, and `started`,
+the component the device reports. For a trampoline that is not the one asked
+for.
+
+#### Open a URL
+
+`{"action":"openURL","url":"https://example.com/x"}` hands a URL to whatever the
+device registered for it: a deep link, a universal link or a web page.
+
+- The URL needs a scheme and a host (`mailto:` has none), no whitespace or
+  control bytes, and at most 2048 bytes. Otherwise 400, checked before
+  arbitration.
+- Nothing handles it: 422 `noHandler`.
+- On a simulator, an http or https URL an installed app claims opens in that
+  app, and `started` is its bundle ID (see "Universal links on a simulator" in
+  `docs/ios.md`). Any other URL goes to `simctl openurl`.
+- A physical iPhone opens http and https URLs in Safari, and `started` is
+  `com.apple.mobilesafari`. devicectl opens a URL only as the payload of
+  launching a named app, so a universal link opens as a page in Safari rather
+  than in the app that claims it, and any other scheme is a 400.
+- A timeout waiting for the handler to draw still counts as success when the
+  device named an activity. The trace carries `timedOut`.
+
+The URL's path and query never reach the trace or an error, because a deep
+link can carry a token. The trace has `scheme`, `host` and `urlLen`, and errors
+name the URL as `scheme://host/…`.
+
+### `POST /api/sequence?target=<id>`
+
+Runs 1 to 50 `/api/input` bodies in order:
+
+```json
+{"steps":[
+  {"action":"tap","match":{"text":"Email"}},
+  {"action":"text","text":"a@b.co"},
+  {"action":"tap","match":{"text":"Sign in"}},
+  {"action":"wait","match":{"text":"Inbox"}}
+]}
+```
+
+One round trip replaces one model turn per step, and the cursor moves from step
+to step without a pause. Each step is validated, arbitrated, logged and traced
+as if sent alone, so a person who takes the device back stops the sequence at
+the next step. A coordinate `tap` or `swipe` is preceded by a `move`.
+
+If every step answers 200, the response is `{"ok":true,"steps":[...]}`. The first
+step that answers anything else stops the rest. The response then carries that
+step's status, `"failed": <index>`, its `error` (prefixed `step N:`) and `code`
+at the top level, where a single input would put them, and `steps` with each
+step's `status` and `body` up to and including it.
+
+A step that depends on an earlier step's screen should look for its node with
+a `wait`, or with `waitMs` on its own `match`.
+
+### `POST /api/drop?target=<id>&x=<px>&y=<px>`
+
+Pastes the request body, an image, into the text field at x, y. iOS simulators
+only. Answers 200 `{target, ok, tookMs}`. MCP tool `drop` takes a path on
+disk. Timing and limits are under Clipboard in `docs/targets.md`.
+
+| Status | `code` | Meaning |
+|---|---|---|
+| 400 | | Not PNG, JPEG, GIF, WebP or HEIC (a video included), or `x`/`y` missing or not integers. |
+| 413 | | Over 50 MiB. |
+| 422 | `noPaste` | No Paste appeared at the point. It is not a field that takes an image. Fall back to `/api/media`. |
+| 422 | `pasteFailed` | Paste was tapped, then tried once more, and the field's value still did not change. A field that exposes no value is taken on trust. |
+| 501 | `unsupported` | Not an iOS simulator. |
+| 501 | `simcapOutdated` | The simcap helper predates image paste. Run `make simcap`. |
+
+It is input: claims, hands-off and the human hold apply as to a tap, and
+`X-Loupe-Viewer` makes it a person's. Viewers see the cursor move to x, y and
+a `tap` event there. The image is never traced.
+
+## Apps and files
+
+### `POST /api/install?target=<id>`
+
+Installs the request body as an APK. A `multipart/form-data` body installs a
+base and its splits together:
+
+```sh
+curl -F apk=@base.apk -F apk=@split.apk "$URL/api/install?target=$ID"
+```
+
+Up to 64 file parts, any field name. **Splits are the normal case**: anything
+built from an App Bundle is a base plus config splits, and the base alone is
+refused with `INSTALL_FAILED_MISSING_SPLIT`.
+
+| Param | Effect |
+|---|---|
+| `allowTest=1` | Allows `android:testOnly` APKs, which is what Android Studio's Run produces. Without it: `INSTALL_FAILED_TEST_ONLY`. |
+| `downgrade=1` | Passes `-d`, so an APK with a lower `versionCode` replaces the installed one. The package manager allows it only for a debuggable app; a release build is still refused, and the 422 `hint` says to uninstall first. Android only. |
+| `launch=1` | Launches the installed package afterwards. |
+| `package=` | Names the package when `aapt2` is not available. |
+
+| Status | Meaning |
+|---|---|
+| 400 | A part is not a zip (the error names it). |
+| 413 | Upload over 1 GiB. |
+| 422 | The package manager refused. The response has adb's output and the `INSTALL_FAILED_*` code split out. `INSTALL_FAILED_VERSION_DOWNGRADE` adds a `hint`: retry with `downgrade=1` (debuggable app) or uninstall first. |
+
+Any `Failure [...]` line fails the install whatever adb's exit status, and so
+does a zero exit with no `Success` line.
+
+A successful install names its `package`, read from the APK. If `aapt2` is
+missing, `?package=` stands in. If `aapt2` reads a different name than
+`?package=`, the response carries `packageError` and nothing is launched.
+
+`launch=1` arbitrates like `/api/input` (a held target is
+`launch.code: "humanHeld"`). The outcome is a nested `launch` object (`ok`,
+`activity`, `error`, `code`, `retryAfterMs`, `tookMs`). **The response status
+stays the install's**: the APK is on the device whatever the launch says.
+
+**On an iPhone or a simulator** the body is one `.ipa`, or a zipped `.app`
+(Finder's Compress, or `ditto -c -k --keepParent Name.app Name.zip`). Two file
+parts are a 400. `package` is the bundle ID from the app's `Info.plist`, so
+`launch=1` works the same way; `allowTest` and `package=` do nothing, and
+`downgrade=1` is a 400 `code: "unsupported"`, answered before the body is read.
+
+```sh
+curl --data-binary @Name.ipa "$URL/api/install?target=ios:$UDID&launch=1"
+```
+
+- A phone installs through `devicectl device install app`, over a cable or
+  Wi-Fi. The app must be signed for that phone. A refusal is a 422 whose
+  `code` is CoreDevice's innermost error, such as
+  `com.apple.dt.CoreDeviceError 3000` for a bundle that is not valid, with
+  each level's description in `reason`. A 22 MB debug build took 8s on an
+  iPhone 16 Pro on iOS 27.
+- A simulator installs through `simctl install` and takes a simulator build.
+  A phone's `.ipa` is refused with "Needs to Be Updated"; a simulator that is
+  not booted, with "Unable to lookup in current state: Shutdown". Both are a
+  422 with `code: "simctlInstall"`.
+- An archive with no `.app`, two of them, or an entry or link that leaves the
+  bundle is a 400.
+
+### `DELETE /api/install?target=<id>&package=<name>`
+
+Removes an Android app and its data (`pm uninstall`). This is the way past an
+`INSTALL_FAILED_VERSION_DOWNGRADE` that `downgrade=1` cannot fix. It reuses
+`/api/install` rather than adding `/api/uninstall`: one resource, and the
+install route's package and target parameters already mean the same thing.
+
+Unlike an install it destroys state, so it is claimed and held like `/api/input`: another
+agent's claim, hands off and a person using the device are each a 409 before
+anything reaches the device. It is recorded in the event trace as
+`action: "uninstall"` with the package and outcome.
+
+| Status | Meaning |
+|---|---|
+| 200 | `{target, ok, package, output, tookMs}` |
+| 400 | `package` is not a package name, or the target is an iOS simulator or iPhone (`code: "unsupported"`; remove the app on the device). |
+| 404 | `code: "notInstalled"`. |
+| 409 | Claimed by another agent, hands off, or held by a person. |
+| 422 | The package manager refused (a device-policy app, say). `code` is the `DELETE_FAILED_*` reason. |
+
+### `POST /api/media?target=<id>`
+
+Adds the request body, a photo or a video, to the device's library so it shows
+in Photos or Google Photos. Answers 200 `{target, ok, name, kind, bytes, tookMs}`.
+
+- The type comes from the file's leading bytes: PNG, JPEG, GIF, WebP, HEIC,
+  MP4 or MOV. Anything else is 400, before anything is pushed.
+- Over 1 GiB is 413.
+- Android and iOS simulators only (a simulator must be booted). Physical iOS
+  devices and synthetic answer 501.
+- Not arbitrated, because it changes no screen.
+
+Dropping a file on the viewer page routes it by type (`web/drop.js`). A picture
+goes into a simulator text field through `/api/drop`, not here.
+
+### `POST /api/camera?target=<id>`, `DELETE /api/camera?target=<id>`
+
+`POST` points the device's back camera at the request body, a PNG or JPEG sent
+raw. `DELETE` gives the camera back. Both answer 200 `{target, ok, applies,
+tookMs}`; `POST` adds the image's `width` and `height`. When an AVD is running
+on Handset Camera the frame goes to that live feed instead of being staged, and
+the answer adds `live: true` — so a client streaming frames can tell a fed frame
+from a staged still, which both otherwise report as `applies: boot`. A fed
+frame gives way to the camera's placeholder once no frame has come for a
+minute; add `hold=1` to keep a still image up until the next frame or
+`DELETE /api/camera/feed`.
+
+An AVD can instead use one of the Mac's cameras: `POST` with
+`Content-Type: application/json` and `{"hostCamera": "<name>"}`, a name from
+`GET /api/camera/sources` (answers 200 `{target, ok, applies, hostCamera,
+tookMs}`). Anything else is read as an image. Staging an image drops a staged
+Mac camera and the reverse, and `DELETE` clears either. Simulators and
+physical iPhones answer 501 to `hostCamera`.
+
+Supported on AVDs, iOS simulators and physical iPhones. Physical Android
+devices, `emulator-` serials and synthetic answer 501. Not arbitrated.
+
+| Status | Meaning |
+|---|---|
+| 400 | Not a PNG or JPEG, or over 8192px a side. |
+| 400 | A JSON body without `hostCamera`. |
+| 404 | `hostCamera` names a camera the emulator does not list. |
+| 413 | Over 32 MiB. |
+| 501 | `hostCamera` on anything but an AVD. |
+| 503 | Handset Camera's live feed is set up but unreachable: not installed on the Mac, its helper is missing, or another feeder on the Mac holds it. |
+
+`applies` says when an app sees the image:
+
+| Value | Meaning |
+|---|---|
+| `cameraOpen` | AVD booted with the camera flag. The next time an app opens the camera. A preview already showing keeps the old image until the app closes and reopens the camera. |
+| `boot` | AVD running without the flag, or not running. Shut it down and boot it through loupe. |
+| `live` | iOS: an app with the shim is running and follows swaps. AVD with a Mac camera: the emulator already runs with `-camera-back` for that camera, so there is nothing to do. |
+| `launch` | iOS: no such app is running. The next launch picks the image up. |
+
+**AVDs.** The emulator takes an image only as a boot flag, so loupe passes it
+on any boot it starts while an image is staged. Turning the image on or off
+therefore costs one cold boot (about 14 to 15 seconds against 3.4 from the
+snapshot, measured on one AVD). A new image at the same path loads warm.
+`DELETE` on an AVD running with the flag stages black. The image is fitted
+whole and centered so the app sees all of it.
+
+A Mac camera is staged by name and looked up on each boot loupe starts:
+loupe runs `emulator -webcam-list` and passes `-camera-back webcamN` with the
+camera's current label, since labels shift as cameras come and go and the
+emulator takes no device id. If the camera is not connected at that boot, the
+AVD boots with its own camera and the reason goes to the server log; the name
+stays staged. Switching the camera source (none, an image, a Mac camera,
+another Mac camera) changes the boot config, and the emulator refuses a
+snapshot saved under another camera, so that boot cannot load `loupe-warm` and
+is a cold one.
+
+### `DELETE /api/camera/feed?target=<id>`
+
+Stops the live feed of an AVD on Handset Camera. The camera shows its
+placeholder at once instead of repeating the last frame for up to a minute,
+and stays staged, so the next frame posted plays with no restart. The feed is
+the Mac's, so every AVD on Handset Camera goes blank. Answers 200 `{target,
+ok, applies: "live", live: true, hostCamera}`; 409 when the AVD is not on
+Handset Camera; 501 on other targets.
+
+### `GET /api/camera/sources?target=<id>`
+
+The Mac's cameras as the AVD's emulator lists them:
+`{target, cameras: [{name, label}]}`. `name` is what `hostCamera` takes;
+`label` is the emulator's current `webcamN`, which changes between boots.
+Other targets answer 501.
+
+**iOS simulators.** The simulator has no camera, so loupe builds a shim on the
+first `POST` (about 4 seconds) and `launch` (the `/api/input` action and the
+MCP tool) starts the app with it, **relaunching it** if it is running without
+the shim. An app that already has the shim is only brought to the front.
+
+While an image is staged, loupe also sets the shim in the simulator's launchd
+environment, so an app started any other way, from its icon or by
+`simctl launch`, gets it too. An app started with its own
+`DYLD_INSERT_LIBRARIES`, as Xcode's Run does with Main Thread Checker on,
+replaces that value and has no camera until loupe's `launch` relaunches it.
+The shim does nothing in a process that is not an installed app, or when no
+image is staged.
+
+The shim supplies one back camera, 1920x1080 frames at 30 per second, QR
+metadata detection and a preview layer. It differs from a phone in these
+ways: `videoRotationAngle` is kept but not applied, QR bounds are in the
+landscape frame's coordinates, metadata is QR only (asking for another type
+throws), and there is no photo or movie output. `DELETE` makes apps with the
+shim see black, clears the simulator's environment, and makes later launches plain.
+
+**Physical iPhones.** The same shim, for **development-signed** apps only:
+dyld ignores the launch environment in an App Store, TestFlight or enterprise
+build. The app must be signed by a team this Mac has an Apple Development
+identity for, which holds when it was built and installed from this Mac. The
+phone must be unlocked. Otherwise `launch` answers 422 `noCameraShim`. Each
+devicectl call takes 1 to 5 seconds, and a launch has a 2 minute budget while
+an image is staged.
+
+An app that needs something the shim does not fake can read the staged image
+itself in a debug build. `LOUPE_CAMERA_FILE` names the file (relative to the
+app's home on a phone). Feed the scanner from it, skip `AVCaptureDevice`, and
+re-read it when its modification date changes:
+
+```swift
+#if DEBUG
+/// Frames from the image loupe stages, for a build loupe launched.
+final class LoupeCameraFrames {
+    let url: URL
+    init?() {
+        guard let path = ProcessInfo.processInfo.environment["LOUPE_CAMERA_FILE"] else { return nil }
+        url = URL(fileURLWithPath: path, relativeTo: URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true))
+    }
+    /// The current image, or nil when it is cleared: treat as a covered lens.
+    func image() -> CGImage? {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        return CGImageSourceCreateImageAtIndex(src, 0, nil)
+    }
+}
+#endif
+```
+
+This is a sketch and has not been exercised in an app.
+
+## Device lifecycle
+
+These routes take an `avd:` or `sim:` target that is available and not
+`creating`. Anything else (a `device`, `iosDevice`, `revyl`, `synthetic`,
+`sim-new:` or bare `emulator-NNNN` row, or an unknown id) is 422 `notSupported` with the
+reason. They are arbitrated like `launch`, so `humanHeld`, `claimedBy` and
+`handsOff` apply.
+
+| Route | Effect | Answer |
+|---|---|---|
+| `POST /api/devices/boot?target=[&wait=]` | Boots without opening a stream. A running target answers 200 at once. `wait` is how long to hold the request: a duration (`90s`, `10m`) or seconds, default 4 minutes, at most 15 minutes. `wait=0` starts the boot in the background and answers at once. | 200 `TargetInfo` once up; 202 `BootStatus` for `wait=0`; 504 when `wait` ran out first |
+| `GET /api/devices/boot?target=avd:<name>` | How an AVD's boot is going, without waking or arbitrating anything. | 200 `BootStatus` |
+| `POST /api/devices/shutdown?target=[&save=1]` | Stops the target. Refused if it is already `bootsOnOpen`, unless an emulator process for the AVD is still booting; stopping a boot that never came up saves no snapshot. `save=1` (an AVD only) first saves its state over `loupe-warm`, even with `emulatorKeepState` off, so every later boot starts from it, and the listing then carries `startSavedAt`. With `save=1`, a stream that has not let go is 409 `busy`, a failed save is 502 and the AVD stays up, and a simulator or an AVD still booting is 422 `notSupported`. | 200 `TargetInfo` |
+| `DELETE /api/devices?target=` | Stops it if running, then deletes it. | 204 |
+| `POST /api/devices/reset?target=avd:<name>` | Stops the AVD without saving, discards `loupe-warm` and any saved start state, and wipes its data on the next boot. Works on a stopped AVD. A simulator is 422 `notSupported`. | 200 `TargetInfo` |
+
+Other errors:
+
+| Status | `code` | Meaning |
+|---|---|---|
+| 409 | `busy` | A shutdown or delete of that target is already running. |
+| 409 | `recording` | A recording is in progress (response has its `id`). It is never ended as a side effect. |
+| 400 | | `wait` is not a duration or is out of range. |
+| 502 | | The boot, stop or delete failed. |
+| 504 | | The boot outran `wait`; the emulator is still tracked (see below). |
+
+`BootStatus` has `state` (`up`, `booting`, `stopped`), `processAlive` and `pid`
+(an emulator process for that AVD, whoever started it), `serial`, `adbState`
+(adb's word, such as `offline`, or `absent`), `bootCompleted`
+(`sys.boot_completed`, read only while adb says `device` and the VM is not
+paused), `elapsedMs` and `logPath`, the file the emulator's stdout and stderr go
+to (`~/Library/Caches/loupe/emulator-<name>.log`). A target that is not an AVD
+answers 422 `notSupported`.
+
+A boot that runs past `wait` (or past the emulator's own 3-minute budget when
+no `wait` bounds it) does not kill the emulator. loupe keeps tracking the
+process: the 504 or 502 error names its pid, the log path and the log's last
+lines, a later `boot` waits on the same process, and `POST
+/api/devices/shutdown` stops it. A boot that leaves adb showing `offline` with
+the process alive is a hung emulator, not a slow one; read `logPath`, then shut
+it down. `wait` bounds only the HTTP call. After a server restart the emulator is found
+by name, as for any AVD loupe did not start.
+
+A boot holds its caller's claim on the target until the boot ends, `wait=0`'s
+background boot included, so a `wait` longer than the 10-minute lease does not
+lose the device to another agent. `idleMs` reads 0 while it holds, and the
+lease starts again when the boot returns. A boot from an agent with no claim
+holds nothing.
+
+Viewers get `MsgEnded` before the session closes. An AVD booted this way is
+paused and shut down by the idle clock like any other. With
+`emulatorKeepState` on, shutdown saves the AVD's state first. A boot lifts the
+reopen guard that a shutdown set, as `start=1` does.
+
+## Revyl cloud devices
+
+Starts and stops Revyl devices on the user's own account through the `revyl`
+CLI. How they behave as targets is in [targets.md](targets.md#revyl-cloud-devices).
+Not yet run against a live account. Without `SetRevylDevices` every route
+answers 404; with no CLI found, the routes that run it answer 503, except
+`/api/revyl/billing`, which answers 409.
+
+| Route | Effect | Answer |
+|---|---|---|
+| `GET /api/revyl[?sync=1]` | The devices loupe started or adopted. `sync=1` first reads the account's sessions with `revyl device list`. | 200 `{"devices":[RevylDevice]}` |
+| `POST /api/revyl {"platform","model","osVersion"}` | Starts a device in the background. `platform` is `android` or `ios`; `model` and `osVersion` are optional names from `/api/revyl/targets`. | 202 `{"key"}`; 409 while another starts; 400 for a bad body |
+| `DELETE /api/revyl?key=` or `?target=revyl:<id>` | Runs `revyl device stop`; the device shows as `stopping` until it answers, then its target and sessions end. A failed row is forgotten. | 200 `{"devices":[…]}`; 409 while it is still starting or already stopping; 404 unknown (until loupe has read the account once, it runs `revyl device list` first, and answers 502 if that fails, or 409 while a start runs); 502 when Revyl did not confirm, leaving it `active` with `stopError` |
+| `GET /api/revyl/targets` | Models and OS versions per platform, from `revyl device targets`. | 200 `{"platforms":{"android":[{"model","runtime"}]}}` |
+| `GET /api/revyl/billing[?fresh=1]` | The plan, the free minutes left and the price of a minute, from `revyl billing status --json`. One read answers for 30 s; `fresh=1` reads again, and a device starting or stopping, or a sign-in or sign-out through loupe, drops it. Nothing goes to the trace. | 200 `RevylBillingResponse`; 409 `{"error"}` with no CLI or signed out; 501 `{"error":"unsupported"}` from a CLI without `billing status`; 502 `{"error"}` when it fails |
+| `GET /api/revyl/account` | Whether the CLI is installed and signed in, and how. | 200 `RevylAccountResponse` |
+| `POST /api/revyl/account` | Runs `revyl auth login` and answers once it prints the approval URL and code (at most 15 s). Open `loginURL`, check `loginCode`, then poll `GET` until `signedIn`. The login waits up to 15 minutes. | 202 with `signingIn`, `loginURL`, `loginCode`, or `loginError` when the CLI exited first; 200 when already signed in; 502 when it could not run |
+| `DELETE /api/revyl/account` | Cancels a login, then runs `revyl auth logout`. | 200; 409 while a device loupe started is running or starting |
+| `POST /api/revyl/cli` | Downloads the pinned CLI when none is found. | 202 `RevylAccountResponse` with `cliInstalling`; 501 when the server cannot install |
+
+`RevylDevice` has `key`, `sessionId` and `target` once started, `platform`,
+`model`, `osVersion`, `state` (`starting`, `active`, `stopping`, `failed`),
+`error`, `stopError` (why the last stop failed; still billing),
+`adopted` (found on the account; left running at exit), `startedAt` and
+`idleTimeoutSec`. `RevylAccountResponse` has `cliInstalled`, `canInstallCLI`,
+`cliInstalling`, `cliInstallError`, `signedIn`, `email`, `org`, `authMethod`,
+`signingIn`, `loginURL`, `loginCode` and `loginError`. Neither carries the API
+key or the session's WHEP URL.
+
+`RevylBillingResponse` has `plan` (such as `free`), `planName`, `periodEnd`
+(RFC 3339, when the free minutes reset), `freeMinutes`
+(`{"android":{"left","total"},"ios":{…}}`; `left` is 0 once they are used up),
+`usdPerMinute` (`{"android","ios"}`, the Android emulator and iOS simulator
+rates) and `billingURL`. Any of them can be absent, so check for
+`freeMinutes` itself rather than `plan`. It carries nothing about the card,
+payments, prepaid balance, spending or the organization.
+
+```json
+{"plan":"free","planName":"Free","periodEnd":"2026-12-18T21:29:52Z",
+ "freeMinutes":{"android":{"left":1191,"total":1200},"ios":{"left":1191,"total":1200}},
+ "usdPerMinute":{"android":0.075,"ios":0.075},
+ "billingURL":"https://app.revyl.ai/settings/billing"}
+```
+
+A Revyl target takes `/api/input` and `/api/sequence` while it has an open
+session, and answers 409 without one. `tap`, `swipe` (without its `ms`),
+`text` after a tap, `key` 3, 4, 66 and 67, `button` `home` and `back`, `move`
+and `wait` with `ms` work; `back` only on Android. Other keycodes, the
+`recents` and `lock` buttons, the other actions and anything by `match` answer
+501, as do `/api/ui` and `/api/screenshot`. See
+[targets.md](targets.md#agent-input).
+
+## Logs and crashes
+
+### `GET /api/logcat?target=<id>`
+
+Returns the device log as plain text.
+
+| Param | Effect |
+|---|---|
+| `lines` | Last N lines. Default 500. |
+| `since` | Everything since a duration back from now (`5m`) or an RFC 3339 time, trimmed to `lines`. |
+| `pid`, `package`, `foreground=1` | At most one of these narrows the log to a process. `foreground` uses the foreground app. |
+| `follow=1` | Keeps the response open and flushes each read. |
+| `format=ndjson` | Simulators only. One JSON object per entry (`application/x-ndjson`). |
+
+The pid used and the package, when there is one, come back in `X-Loupe-Pid`
+and `X-Loupe-Package`. A package with no process is 409. A follow fixes the pid
+when it opens, so it keeps reading the old process after an app restart.
+
+Per platform:
+
+| Target | Source | Limits |
+|---|---|---|
+| Android | `logcat -v threadtime` | `format=ndjson` is 422. |
+| iOS simulator | Unified log. `package` is a bundle ID. | `since` with `follow` is 422 `notSupported`. |
+| Physical iPhone | The device's syslog relay, over USB or Wi-Fi | Text only. `format=ndjson`, `since`, `package` and `foreground` are 422 `notSupported`. A dump waits for the backlog to go quiet, up to 3 seconds. An unlisted phone is 502. |
+| Synthetic | | 501 |
+
+A shut-down AVD answers 502 "open it in the viewer to boot it".
+
+### `GET /api/crashes?target=<id>`
+
+Lists crash reports, newest first, on iOS simulators, physical iPhones and
+Android.
+
+| Param | Effect |
+|---|---|
+| `limit` | Last N reports. Default 20. |
+| `since` | Reports since then. Takes what logcat's `since` does. |
+
+Each row has `id`, `kind`, `time`, `process`, `bundleID` (empty for a daemon),
+`version`, `build`, `pid` and `summary` (`EXC_CRASH (SIGABRT), Abort trap: 6`).
+
+`GET /api/crashes/<id>?target=<id>` returns one report as `text/plain`. An id
+that belongs to another target, or does not exist, is 404. On iOS the id is a
+UUID.
+
+| Platform | Reports | `kind` |
+|---|---|---|
+| iOS simulator | Host crash reports for that simulator. Works on a shut-down simulator. | `crash` |
+| Physical iPhone | Copied off the device and cached under `~/Library/Caches/loupe/ios-crashes/<udid>`. Analytics, Jetsam and spindump files are skipped. | `crash` |
+| Android | The device's dropbox: app and system crashes, native crashes and ANRs. | `crash`, `nativeCrash`, `anr` |
+
+A report appears well after the crash, tens of seconds on a simulator.
+SIGKILL leaves none. On Android, `time` is the entry's epoch time, `bundleID`
+is the package, and `build` and `version` are its versionCode and versionName.
+A call resumes a paused emulator. Dropbox lives under `/data`, so without
+`emulatorKeepState` a boot from `loupe-warm` discards every report since it
+was saved. Synthetic answers 501.
+
+## Device settings and presets
+
+### `GET /api/settings?target=<id>`, `PUT /api/settings?target=<id>`
+
+`GET` answers `{"settings": [...]}`, one row per setting: `id`, `type`
+(`bool`, `range`, `enum` or `point`), `value`, `supported`, `applies`, and `min`, `max`
+and `step` on a `range` or `options` on an `enum`. A client should draw only
+the rows it is given. `PUT {"changes": {"<id>": <value>, ...}}` applies them and
+answers the same shape as `GET`, read again after the write. A bad value is
+400 and nothing is applied. A write the device refuses is 409
+`{"error","failed","notRestored","settings"}`: the writes already made are
+rolled back, `notRestored` names any that could not be, and `settings` is read
+again after. That 409 has no `code`; it is told apart from a `humanHeld`,
+`claimedBy`, `handsOff` or `interrupted` 409 by having one. A target with no settings is 501.
+A `posture` or `hingeAngle` write the request stopped waiting on is 504: it
+runs on and may still land, nothing is rolled back, and a `GET` says where the
+hinge ended. For a superseded `PUT` only the newer write sent in its place can
+land; its own value never goes to the device.
+
+- `appLanguage` is the language of the app in front, named in `package`
+  (Android 13 and later). `""` puts the app back on the system language. The
+  system language itself can't be changed without a reboot, so it isn't
+  offered. With no app in front it reports `supported: false`.
+- `location` (emulators only) is a `point`, `{"lat": 37.42, "lng": -122.08}`,
+  sent as the emulator's GPS fix. Android can't read the fix back, so
+  `value` is the last one loupe set, or `null` before the first.
+
+#### Posture and hinge angle
+
+A foldable emulator (one whose `cmd device_state print-states` lists two or
+more of closed, half-opened and opened) and the iPhone Duo simulator have two rows that move the same hinge:
+
+| `id` | Type | Values |
+|---|---|---|
+| `posture` | `enum` | `closed`, `halfOpened`, `opened` |
+| `hingeAngle` | `range` | `0` (shut) to `180` (flat), `step` 1 |
+
+- A `hingeAngle` write must be a whole number of degrees in range. 90.5 and
+  `"90"` are 400, not rounded.
+- A `PUT` that sets both `posture` and `hingeAngle` is 400: whichever ran
+  second would win.
+- A write to one shows on a read of the other. A `posture` write moves the
+  hinge to that posture's angle (emulator: closed 0, halfOpened 90, opened
+  180; Duo: closed 0, halfOpened 120, opened 180).
+- A Duo reads its posture from the lit panel and the last angle this server
+  sent: the inner panel lit below 160 degrees is `halfOpened`. Until this
+  server has sent an angle, a half-open Duo reads `opened`.
+- A `hingeAngle` write does not wait for the posture to follow, so a slider can
+  send one per tick. Writes to one target are coalesced: while one is going to
+  the device, only the newest write queued behind it is sent. A superseded
+  `PUT`, `posture` included, waits for the write sent in its place and
+  answers with it: 200 once it reached the device, or that write's error.
+  Its full body is read after that write, so it can show a newer angle than
+  the `PUT`'s own. A client should keep its own value rather than move its
+  slider to that one.
+- The server keeps the newest `PUT` to arrive, not the newest sent. A client
+  should keep one `PUT` in flight and send only its latest angle when that one
+  returns. Parallel `PUT`s on separate connections can arrive out of order and
+  leave an older angle applied.
+- A hinge-only `PUT` with `Prefer: return=minimal` answers
+  `{"settings": [<hingeAngle row>]}` and skips reading every setting back,
+  with `Preference-Applied: return=minimal`. The row's `value` is the angle
+  that went to the device: the `PUT`'s own, or, for a superseded `PUT`, the
+  angle of the write sent in its place.
+  `posture` is not in it; `GET` for that. Without the
+  header, or with any other setting in the `PUT`, the answer is the whole
+  list. A client that replaces its list with the response, as the browser
+  does, should not send it. Errors answer as any `PUT`'s do.
+
+On an emulator, `hingeAngle` is the console's `sensor set hinge-angle0`, and a
+`GET` reads it back with `sensor get hinge-angle0`, one console round trip
+on top of the shell read every `GET` makes. Android's device state
+follows the sensor: `posture` on the next `GET` is the band the angle falls in,
+though at the edge of a band it can lag about half a second. A `PUT` takes
+about 130 ms, most of it the read after the write, which
+`Prefer: return=minimal` skips.
+
+On a Duo, `hingeAngle` is simcap's `hinge <deg>`. simcap has no way to read the
+hinge back, so a `GET` reports the last angle this server sent. Before any
+angle is sent, or when the lit panel contradicts the last one (the panel reads
+`closed` at 135 or more, or `opened` at 5 or less, 4 s after the write), it
+reports the posture's angle instead. `posture` is the lit panel, so it only
+reads `closed` or `opened`, and which one an angle between 5 and 135 gives
+depends on the path the hinge took.
+
+### `/api/presets`
+
+A preset is a name and a `settings` object in the shape of `changes`. Presets
+belong to the server, not to a device, and are kept in `presets.json` beside
+the config.
+
+- `GET /api/presets` lists them, sorted by name.
+- `PUT /api/presets` with `{"name":"Large text","settings":{"fontScale":1.3}}`
+  saves one, replacing a preset with the same name.
+- `DELETE /api/presets?name=<name>` removes one.
+- `POST /api/presets/apply?name=<name>&target=<id>` applies one the way
+  `PUT /api/settings` does. Settings the device doesn't have or can't change
+  are left out and named in `skipped`, so a preset with `posture` still
+  applies its other settings on a phone. If nothing is left, the answer is 409.
+
+The MCP tool is `apply_preset`.
+
+## Clipboard
+
+### `GET /api/clipboard?target=<id>`, `POST /api/clipboard?target=<id>`
+
+`GET` answers `{"target","text"}`. `POST` with `{"text": ..., "paste": true}`
+sets the clipboard, and `paste` (optional) also puts the text into whatever has
+focus. Text must be UTF-8 and at most 64 KiB: just over is 413, and a body more
+than 1 KiB past the cap is 400.
+
+| Target | Needs | Failure |
+|---|---|---|
+| Android | An open session (viewer, recording or other holder). | 409 with none. 502 if the device does not answer in 2 seconds. |
+| iOS simulator | Booted. No session needed. | 502 if shut down. |
+| Physical iPhone, synthetic | | 501 |
+
+- A peer target's call goes to its owner, and the owner's refusal comes back
+  unchanged.
+- A set changes that target only, even with `sharedClipboard` on
+  (`docs/targets.md`, Clipboard).
+- A simulator's paste is typed, because iOS asks before an app reads what
+  another process set.
+- Neither claims nor the human hold gate this route, so an agent can set or
+  paste while a person is driving.
+- The text is never traced.
+
+### `GET /api/clipboard/shared`, `POST /api/clipboard/shared`
+
+The shared clipboard (`sharedClipboard`, `docs/targets.md`, Clipboard).
+
+`GET ?after=<seq>&waitMs=<ms>` long-polls. It answers
+`200 {"seq","id","text","origin","at"}` once a value with a `seq` past `after`
+exists (at once if one already does), and 204 if none arrives within `waitMs`
+(default 25000, at most 30000). `after` absent or 0 returns the current value.
+
+| Field | Meaning |
+|---|---|
+| `seq` | Counts values on this server only. |
+| `id` | `<instance>-<n>`. The value's identity across servers. |
+| `origin` | `target:<id>`, `mac`, `participant` or `peer:<name>`. |
+| `at` | When this server accepted the value, in its clock's Unix ms. |
+
+`POST {"text", "id", "at"}` offers text and answers 204. `id` and `at` are
+optional. The server stamps its own `at`, and every POST is stored with origin
+`participant`. A value whose `id` or text matches the current one is dropped,
+still with 204. Empty or non-UTF-8 text is 400, over 64 KiB is 413.
+
+With `sharedClipboard` off, both answer 409 `code: "disabled"`, and a GET already
+waiting gets that 409 too. A server without the service answers 404.
+
+A hub bridges the shared clipboard to each of its peers; two servers that hold
+each other as peers settle without looping.
+
+## Viewers and extensions
+
+### `GET /api/handoff?target=<id>&target=<id>`
+
+Returns `{"url"}`: the web client's link for up to four targets, the first one
+focused, on the certificate's host and with the token. The Mac app's Continue
+in Browser opens it, copies it or shows it as a QR code. A server with no
+address another device can open (no TLS certificate) answers 404, and a fifth
+target is 400.
+
+### `GET /api/lan`
+
+Returns `{"urls", "spki"}`: `https://<address>:<port>` for each private IPv4
+address the server has now (10/8, 172.16/12, 192.168/16; not Tailscale's
+100.64/10), and the hex SHA-256 of its certificate's SubjectPublicKeyInfo.
+A native client on the same network connects to one of these URLs instead of
+the tunnel host. The certificate names the tunnel host, not the address, so the
+client checks the key against `spki`, which it read over a connection that
+verified. `urls` is empty when the server listens on loopback only, runs
+without TLS, or has no private address.
+
+### `GET /api/version`
+
+Returns `{"version"}`: what `loupe version` prints, the release tag or `dev`
+for a plain `go build`. A supervisor that ships loupe beside itself compares it
+with the binary it bundles, to tell an old server still running after an update
+from the new one.
+
+### `POST /api/feedback`, `GET /api/feedback`
+
+An agent reports a problem with loupe itself here, not with the app it is
+testing. The body is `{title, problem, repro, proposedFix, tool, target}`;
+`title`, `problem` and `proposedFix` are required, `title` is one line of at
+most 200 characters, and each field is at most 8000. `target` is a target id
+such as `avd:<name>`, `sim:<udid>` or an Android serial, not a description;
+anything else gets a 400 that says so. Unknown fields are refused.
+
+The server stamps the report with an `id`, the time `t`, `X-Loupe-Agent`,
+`X-Loupe-Session` and its own version, and writes `report.json` and
+`message.md` to `~/Library/Caches/loupe/feedback/<id>/`, keeping the newest
+64. It then goes to the first of these that applies, and `delivery` moves
+from `sending` to `sent` or `failed`:
+
+1. The `feedback` entry in `destinations.json`
+   ([flags.md](flags.md#sending-to-a-program-or-a-webhook)): a command, a
+   webhook, or a T3 Code thread (`delivery.thread`).
+2. With no entry and the `feedbackRelay` setting on, loupe's maintainer's
+   relay, which files it as a public issue on `bmcreations/loupe`
+   (`delivery.output` is the issue's URL).
+   It gets `{title, problem, repro, proposedFix, tool, version}` only.
+3. Neither: `delivery` is absent and the report stays on this Mac.
+
+`GET /api/feedback` lists the kept reports, oldest first; `?id=` reads one.
+The server itself acts on nothing a report says.
+
+### `/api/overlays?target=<id>`
+
+Puts an extension's output in front of everyone watching the target: an image
+over the video (a design to compare against), labelled boxes (where it
+differs), or both. loupe neither makes nor reads them. It keeps the latest set
+per target and sends it to every viewer. The web client and the Mac app compare
+by fade, swipe or difference.
+
+`POST` body, in device pixels:
+
+```json
+{"id": "...", "source": "...", "label": "?", "image": "base64 PNG or JPEG ?",
+ "screen": [w, h], "bounds": [x1, y1, x2, y2], "opacity": 1,
+ "boxes": [{"bounds": [x1, y1, x2, y2], "label": "?", "kind": "?"}]}
+```
+
+Posting an id again replaces it. Limits: 8 overlays per target, 200 boxes each,
+12 MiB per post. `GET` lists them, `GET /api/overlays/image?target=&id=&v=`
+serves an image, and `DELETE ?id=` or `?source=` removes some (neither
+removes all).
+
+### `/api/extensions`
+
+`POST {name, url, label?, page?}` registers an extension that has something for
+viewers to read. `url` must be http or https on `127.0.0.1`, `::1` or
+`localhost`, otherwise 400. `page` is a path under `url`, such as `/`, that the
+web client opens from its picker; the listed entry gives it as a loupe path,
+`/api/ext/{name}/`. A registration lasts 90 seconds, so an extension
+re-registers on a timer. `GET` lists them.
+
+`/api/ext/{name}/...` passes through to the extension with the prefix, loupe's
+`Authorization` and `Cookie` headers and the `token` query parameter removed,
+so a client reads it with loupe's token alone. An extension that does not answer gets 502
+and drops out of the list. [extensions.md](extensions.md) is the contract for
+writing one.
+
+## Claims and the human hold
+
+### The human hold
+
+A person at a viewer holds the target against agents. Any viewer input (a
+finger down, a key, text, a scroll, or the viewer's own `/api/input`) holds it
+while a finger is down and for `humanHoldMs` (5000 by default, in the config
+file) after the last input.
+
+While held, an agent's `tap`, `swipe`, `pinch`, `text`, `key`, `button`,
+`rotate`, `reclaim`, `launch` or `openURL` answers 409 `code: "humanHeld"` with
+`retryAfterMs` and a `Retry-After` header, and nothing reaches the device.
+There is no override. Reads, `hardwareKeyboard` and `move` are never refused,
+and with no session open there is no hold.
+
+An interrupt flag holds the target until the person sends it, then refuses the
+interrupted agent with `code: "interrupted"` until it reads the flag
+([flags.md](flags.md)).
+
+The shared token cannot tell callers apart, so they say who they are. The
+viewer sends `X-Loupe-Viewer` with its viewer id from init; a live id makes the
+request the person's, and anything else is an agent's.
+
+Viewers show a banner: "claude is driving" while an agent's input landed in the
+last 10 seconds, and "claude is waiting for you" while one was refused and no
+action of its has settled since.
+
+A viewer done with the target can hand it back without waiting out the hold:
+`POST /api/control/release?target=<id>` with its `X-Loupe-Viewer` frees the
+target at once, an interrupt's pin included, and answers the control state. A
+waiting agent's next action then lands. A viewer that does not hold the target
+gets the state unchanged; a missing viewer id is 400, and one not attached to
+the target's session is 409. Agents have no use for it.
+
+The control state, here and in the stream's control message, has `held`,
+`holder`, `agent` and `agentName`, and while held, `holdMs` (the window each
+input restarts, not what is left of it) and `pinnedUntil` (Unix milliseconds,
+while an interrupt pins the hold).
+
+### Claims
+
+The hold keeps agents off a device a person is touching. A claim keeps two
+agent sessions off one device. It is a lease:
+
+| Route | Effect |
+|---|---|
+| `POST /api/claims?target=` | Claims the target for the caller (`X-Loupe-Agent`, `X-Loupe-Session`). A body `{"agent","session","link"}` may say the same. `link` is an https URL of at most 512 bytes. |
+| `DELETE /api/claims?target=` | Releases it. Someone else's needs `?force=1`, which is what the picker's Release sends. Works on a target that is no longer listed; `DELETE /api/devices` releases the device's claim itself. |
+| `GET /api/claims` | Lists claims. |
+
+A claim also keeps an emulator awake. The idle pause and idle shutdown skip a
+claimed AVD (a claim restarts its idle clock, so the pause comes one
+`emulatorPauseSec` after the claim lapses), and taking a claim resumes an
+emulator that is already paused. Raw `adb install` or `adb shell` against a
+claimed emulator therefore does not hang. The lease lapses 10 minutes after
+the holder's last call to loupe, so a longer raw-adb job should keep calling
+(`GET /api/claims` renews nothing; any `?target=` call does). A boot the
+holder is waiting on holds the claim until it ends (see Device lifecycle).
+`/api/targets` reports `paused: true` on a paused emulator.
+
+While a claim lasts, any other agent's input on the target answers 409
+`code: "claimedBy"` with the holder in `claim`, before anything reaches the
+device. Every call from the holder, `/api/ui` and `/api/screenshot` included,
+renews the lease, and it lapses 10 minutes after the last call. If nobody
+claims the target after a lapse, the former holder's input answers 409
+`code: "claimLapsed"` instead of passing through unclaimed, and nothing reaches
+the device. It repeats on every input until the holder claims the target again
+(`POST /api/claims`), or an hour after the lapse. Another caller is unaffected,
+and an agent that claims in between makes the former holder's input answer
+`claimedBy`. Releasing a claim yourself leaves no such marker, and the markers
+are not saved across a restart. Claims are
+saved to `claims.json` beside the config file and survive a restart, unless
+the lease ran out while the server was down. A renewal is saved at most once a
+minute, so a restored lease can be up to a minute short. Claims are kept out of
+`handsoff.json`, which holds only what the person marked.
+
+### Hands off
+
+`POST /api/devices/handsoff?target=&on=1|0` marks a target off limits to every
+agent, a claim's holder included. Input answers 409 `code: "handsOff"` with no
+retry time. The mark is saved to `handsoff.json` beside the config file and
+survives a restart.
+
+The shutdown, delete, uninstall and install `?launch=1` routes go through the same check
+as `/api/input`. Reads are never refused.
+
+When more than one applies, an agent is told hands off first, then another
+agent's claim, then the human hold. None of them refuses a person: a live
+`X-Loupe-Viewer` id for any session is the picker acting for them.
+
+### In the picker
+
+`/api/targets` carries `claim`, `handsOff` and `drivenBy` (the agent whose
+input went through in the last 10 seconds, with or without an open session).
+Two more fields come from refusals, also with or without an open session:
+
+- `waiting {agent, session, since}`: an agent a person's hold is refusing.
+  `since` is its first refusal in the run. It clears when the agent's next
+  action goes through, or 20 seconds after its last refusal.
+- `refused {agent, code, at}`: the last refusal on the target, any code, for
+  a minute.
+
+With a session open, each refusal is also an `/api/events` record with
+`kind:"refused"`, the refused `action` and the code in `err`.
+
+A claim's 200 carries `recentHumanInputMs`, how long ago a person last used
+the device through a viewer. It is a warning, not a refusal: a few seconds
+means someone is probably at the device, so check with them before acting.
+It is missing when nobody has the device open or nobody has touched it since
+it was opened, because only an open session sees a person's input.
+The picker shows them under the row's detail (hands off outranks a claim, a
+claim outranks driving) and draws the claim's `link` as Open session when it
+is https.
+
+## See also
+
+- [mcp.md](mcp.md): `loupe mcp`, its tools, and pushing flags over channels.
+- [cli.md](cli.md): the same tools as shell commands.
+- [flags.md](flags.md): flags, watches and interrupts, and where they can be sent.
+- [security.md](security.md): pairing a device with its own session, and revoking it.
+- [recording.md](recording.md): recording a target to MP4.

@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.bmcreations.loupe</string>
+
+  <!-- launchd runs the supervisor, not the server. The supervisor runs a copy
+       of ./loupe so the binary stays replaceable while the server is up. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__ROOT__/loupe-supervisor.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__ROOT__</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- The supervisor already restarts the server itself. This is the backstop
+       for the supervisor process going away. -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <!-- How long launchd waits after SIGTERM before SIGKILL. The default is
+       5 s, and loupe's exit stops cloud devices (Revyl, Firebase) on a 10 s
+       budget, then closes sessions and recordings. -->
+  <key>ExitTimeOut</key>
+  <integer>30</integer>
+
+  <!-- Files the supervisor and the server create are the owner's alone:
+       rotated traces, the .run copy, sessions and peers. launchd opens
+       StandardOutPath itself and ignores this for it, so the supervisor
+       chmods loupe-run.log at start. A string, so it reads as octal. -->
+  <key>Umask</key>
+  <string>077</string>
+
+  <key>StandardOutPath</key>
+  <string>__ROOT__/loupe-run.log</string>
+  <key>StandardErrorPath</key>
+  <string>__ROOT__/loupe-run.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/local/go/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>ProcessType</key>
+  <string>Interactive</string>
+</dict>
+</plist>

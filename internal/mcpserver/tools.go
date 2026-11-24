@@ -1,0 +1,642 @@
+package mcpserver
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+
+	"github.com/bmcreations/loupe/internal/target/android"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/bmcreations/loupe/internal/httpapi"
+	"github.com/bmcreations/loupe/internal/target"
+)
+
+// toolRoute is the HTTP route a tool calls, which TestEveryToolNamesARoute
+// checks against httpapi.Routes so a renamed route cannot leave a tool
+// calling nothing.
+type toolRoute struct {
+	Tool, Method, Path string
+}
+
+// toolRoutes lists every tool and the route behind it. The input tools all
+// go to POST /api/input, each with its action fixed: one tool per action
+// gives the model a schema with only that action's fields, where the route's
+// own schema is a oneOf over all of them.
+var toolRoutes = []toolRoute{
+	{"targets", http.MethodGet, "/api/targets"},
+	{"ui", http.MethodGet, "/api/ui"},
+	{"screenshot", http.MethodGet, "/api/screenshot"},
+	{"point", http.MethodPost, "/api/input"},
+	{"tap", http.MethodPost, "/api/input"},
+	{"swipe", http.MethodPost, "/api/input"},
+	{"scroll", http.MethodPost, "/api/input"},
+	{"type_text", http.MethodPost, "/api/input"},
+	{"key", http.MethodPost, "/api/input"},
+	{"button", http.MethodPost, "/api/input"},
+	{"launch", http.MethodPost, "/api/input"},
+	{"open_url", http.MethodPost, "/api/input"},
+	{"sequence", http.MethodPost, "/api/sequence"},
+	{"logcat", http.MethodGet, "/api/logcat"},
+	{"crashes", http.MethodGet, "/api/crashes"},
+	{"crash", http.MethodGet, "/api/crashes/"},
+	{"install", http.MethodPost, "/api/install"},
+	{"uninstall", http.MethodDelete, "/api/install"},
+	{"camera", http.MethodPost, "/api/camera"},
+	{"drop", http.MethodPost, "/api/drop"},
+	{"boot", http.MethodPost, "/api/devices/boot"},
+	{"boot_status", http.MethodGet, "/api/devices/boot"},
+	{"apply_preset", http.MethodPost, "/api/presets/apply"},
+	{"release", http.MethodDelete, "/api/claims"},
+	{"flags", http.MethodGet, "/api/flags"},
+	{"flag", http.MethodGet, "/api/flags"},
+	{"submit_feedback", http.MethodPost, "/api/feedback"},
+}
+
+// Targeted is the one field every device tool takes.
+type Targeted struct {
+	Target string `json:"target,omitempty" jsonschema:"the target id from the targets tool, e.g. avd:Pixel_10, emulator-5554 or sim:<udid>. Leave it out to drive loupe mcp's -target, or the one running device; the call says so if there are several"`
+}
+
+type uiIn struct {
+	Targeted
+	Interactive bool `json:"interactive,omitempty" jsonschema:"drop layout containers and nodes covered by something else"`
+	JSON        bool `json:"json,omitempty" jsonschema:"answer with /api/ui's full JSON (bounds, every container) instead of one line per node"`
+}
+
+type pointIn struct {
+	Targeted
+	X int `json:"x" jsonschema:"device pixels, as /api/ui's center reports them"`
+	Y int `json:"y" jsonschema:"device pixels"`
+}
+
+// tapIn takes a point, or a node named by its id, text or desc.
+type tapIn struct {
+	Targeted
+	X        *int   `json:"x,omitempty" jsonschema:"device pixels, as /api/ui's center reports them; leave out when naming a node"`
+	Y        *int   `json:"y,omitempty" jsonschema:"device pixels"`
+	Text     string `json:"text,omitempty" jsonschema:"tap the node with this text (a button's label on Android and iOS)"`
+	ID       string `json:"id,omitempty" jsonschema:"tap the node with this resource-id or accessibility identifier; a bare Android name matches any package"`
+	Desc     string `json:"desc,omitempty" jsonschema:"tap the node with this content description, often an icon button's only label"`
+	Contains bool   `json:"contains,omitempty" jsonschema:"match text and desc as case-insensitive substrings"`
+	Index    *int   `json:"index,omitempty" jsonschema:"which of several matches, in tree order from 0; without it more than one match is an error listing them"`
+	WaitMs   int    `json:"waitMs,omitempty" jsonschema:"keep looking for the node this long, up to 20000"`
+}
+
+func (in tapIn) request() httpapi.InputRequest {
+	if in.Text != "" || in.ID != "" || in.Desc != "" {
+		return httpapi.InputRequest{Action: "tap", Match: &target.Match{
+			ID: in.ID, Text: in.Text, Desc: in.Desc, Contains: in.Contains, Index: in.Index, WaitMs: in.WaitMs,
+		}}
+	}
+	req := httpapi.InputRequest{Action: "tap"}
+	if in.X != nil {
+		req.X = *in.X
+	}
+	if in.Y != nil {
+		req.Y = *in.Y
+	}
+	return req
+}
+
+// stepIn is one step of a sequence: a POST /api/input body. Its numbers are
+// pointers so a 0 is sent rather than dropped, which the server would read
+// as a missing field.
+type stepIn struct {
+	Action   string        `json:"action" jsonschema:"tap, swipe, scroll, text, key, button, launch, openURL, move or wait"`
+	X        *int          `json:"x,omitempty" jsonschema:"device pixels: tap, swipe start, move"`
+	Y        *int          `json:"y,omitempty" jsonschema:"device pixels"`
+	X2       *int          `json:"x2,omitempty" jsonschema:"swipe end, device pixels"`
+	Y2       *int          `json:"y2,omitempty" jsonschema:"swipe end, device pixels"`
+	Ms       *int          `json:"ms,omitempty" jsonschema:"swipe duration, or how long a wait without a match pauses (up to 20000)"`
+	Text     string        `json:"text,omitempty" jsonschema:"text to type"`
+	Keycode  *int          `json:"keycode,omitempty" jsonschema:"an Android KeyEvent keycode"`
+	Button   string        `json:"button,omitempty"`
+	Package  string        `json:"package,omitempty" jsonschema:"launch: Android package or iOS bundle ID"`
+	Activity string        `json:"activity,omitempty"`
+	URL      string        `json:"url,omitempty" jsonschema:"openURL: the URL"`
+	Match    *target.Match `json:"match,omitempty" jsonschema:"tap or wait: the node by id, text or desc instead of x and y; a wait with a match waits for the node to appear, 10s unless waitMs says otherwise"`
+	// The scroll fields; see scrollIn.
+	Direction string        `json:"direction,omitempty" jsonschema:"scroll: up, down, left or right, toward the content to reveal"`
+	Until     string        `json:"until,omitempty" jsonschema:"scroll: edge to keep going to the top, bottom or end"`
+	Find      *target.Match `json:"find,omitempty" jsonschema:"scroll: keep going until this node is on screen"`
+	Max       *int          `json:"max,omitempty" jsonschema:"scroll: at most this many strokes"`
+}
+
+type sequenceIn struct {
+	Targeted
+	Steps    []stepIn `json:"steps" jsonschema:"up to 50 steps, run in order; the first that fails stops the rest"`
+	NoScreen bool     `json:"noScreen,omitempty" jsonschema:"leave out the interactive tree of the screen the sequence ends on"`
+}
+
+type swipeIn struct {
+	Targeted
+	X  int `json:"x" jsonschema:"start, device pixels"`
+	Y  int `json:"y" jsonschema:"start, device pixels"`
+	X2 int `json:"x2" jsonschema:"end, device pixels"`
+	Y2 int `json:"y2" jsonschema:"end, device pixels"`
+	Ms int `json:"ms,omitempty" jsonschema:"duration; a short one is a fling and scrolls further than asked"`
+}
+
+type scrollIn struct {
+	Targeted
+	Direction string        `json:"direction" jsonschema:"up, down, left or right: the way you want to go, as a person says it; down shows what is below"`
+	Until     string        `json:"until,omitempty" jsonschema:"edge: keep scrolling until the list stops moving, which takes you to its top, bottom or end in one call"`
+	Find      *target.Match `json:"find,omitempty" jsonschema:"keep scrolling until this node (by id, text or desc) is on screen, and answer with it; a 404 noMatch means the list ended first"`
+	X         int           `json:"x,omitempty" jsonschema:"a point inside the list to scroll, device pixels; omit for the largest scrollable on screen"`
+	Y         int           `json:"y,omitempty" jsonschema:"device pixels"`
+	Max       int           `json:"max,omitempty" jsonschema:"at most this many strokes, up to 30; default 1, or 20 with until or find"`
+	Ms        int           `json:"ms,omitempty" jsonschema:"stroke duration; the default suits the mode"`
+}
+
+type textIn struct {
+	Targeted
+	Text string `json:"text" jsonschema:"typed into whatever has focus"`
+}
+
+type keyIn struct {
+	Targeted
+	Keycode int `json:"keycode" jsonschema:"an Android KeyEvent keycode, e.g. 66 Enter, 67 Backspace"`
+}
+
+type buttonIn struct {
+	Targeted
+	Button string `json:"button"`
+}
+
+type launchIn struct {
+	Targeted
+	Package  string `json:"package" jsonschema:"Android package name, or an iOS simulator's bundle ID"`
+	Activity string `json:"activity,omitempty" jsonschema:"Android only: an activity, qualified or starting with '.'; empty opens the launcher activity"`
+}
+
+type urlIn struct {
+	Targeted
+	URL string `json:"url" jsonschema:"a deep link, universal link or https URL, handed to whatever the device has registered for it"`
+}
+
+type bootIn struct {
+	Targeted
+	Wait string `json:"wait,omitempty" jsonschema:"how long to wait for the device to come up: a duration (90s, 10m) or seconds, at most 15m; the server defaults to 4m. 0 starts the boot and returns at once, to poll with boot_status"`
+}
+
+type logcatIn struct {
+	Targeted
+	Lines      int    `json:"lines,omitempty" jsonschema:"how many lines at most; the server defaults to 500"`
+	Since      string `json:"since,omitempty" jsonschema:"a duration back from now (5m) or an RFC 3339 time"`
+	Package    string `json:"package,omitempty" jsonschema:"only this app's process"`
+	Foreground bool   `json:"foreground,omitempty" jsonschema:"only the app in front"`
+	Format     string `json:"format,omitempty" jsonschema:"simulators only: ndjson for one JSON object per line; text by default"`
+}
+
+type crashesIn struct {
+	Targeted
+	Limit int    `json:"limit,omitempty" jsonschema:"how many of the newest reports at most; the server defaults to 20"`
+	Since string `json:"since,omitempty" jsonschema:"a duration back from now (5m) or an RFC 3339 time"`
+}
+
+type crashIn struct {
+	Targeted
+	ID string `json:"id" jsonschema:"a report id from the crashes tool"`
+}
+
+type applyPresetIn struct {
+	Targeted
+	Name string `json:"name" jsonschema:"the preset's name, as a person saved it in Handset or with PUT /api/presets"`
+}
+
+type installIn struct {
+	Targeted
+	Paths     []string `json:"paths" jsonschema:"APK files on the Mac running loupe mcp: one APK, or a base and its splits"`
+	AllowTest bool     `json:"allowTest,omitempty" jsonschema:"allow an APK marked testOnly, as Android Studio's Run builds are"`
+	Launch    bool     `json:"launch,omitempty" jsonschema:"open the app once it is installed"`
+	Downgrade bool     `json:"downgrade,omitempty" jsonschema:"allow a lower versionCode than the installed one (adb install -d). Works only for a debuggable app; a 422 hint says to uninstall first otherwise"`
+}
+
+type uninstallIn struct {
+	Targeted
+	Package string `json:"package" jsonschema:"the Android package name to remove, e.g. com.example.app"`
+}
+
+type cameraIn struct {
+	Targeted
+	Path       string `json:"path,omitempty" jsonschema:"a PNG or JPEG on the Mac running loupe mcp"`
+	Clear      bool   `json:"clear,omitempty" jsonschema:"give the camera back instead of setting an image"`
+	HostCamera string `json:"hostCamera,omitempty" jsonschema:"AVD only: use this Mac camera, by name as GET /api/camera/sources lists it, instead of an image"`
+}
+
+type dropIn struct {
+	Targeted
+	X    int    `json:"x" jsonschema:"device pixels, as /api/ui's center reports them"`
+	Y    int    `json:"y" jsonschema:"device pixels, as /api/ui's center reports them"`
+	Path string `json:"path" jsonschema:"a PNG, JPEG, GIF, WebP or HEIC on the Mac running loupe mcp"`
+}
+
+// addTools registers every tool in toolRoutes on s.
+func addTools(s *mcp.Server, c *Client) {
+	targetsDesc := "List every device loupe can stream or drive: Android devices and emulators, AVDs that are shut down, iOS simulators and phones. Each row has its id, state, and who holds it (claim, handsOff, drivenBy). A call that names no target drives the one running device, so skip this when only one is running; otherwise start here to pick a target."
+	if c.defaultTarget != "" {
+		targetsDesc = "List every device loupe can stream or drive, with its id, state, and who holds it. This server already drives " + c.defaultTarget + " when a call names no target, so skip this and start with ui or sequence unless you need another device."
+	}
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "targets",
+		Description: targetsDesc,
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
+		return jsonResult(c.getJSON(ctx, "/api/targets", nil))
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "ui",
+		Description: "Read the target's view hierarchy, one line per node: its class, text, desc and id, which go into a match verbatim, and its @x,y center in device pixels, which goes straight into tap. Pass interactive: true. Prefer this to a screenshot for finding or checking anything on screen. sequence and scroll already end their answers with this tree, so do not call ui after them.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in uiIn) (*mcp.CallToolResult, any, error) {
+		q := url.Values{"target": {in.Target}}
+		if in.Interactive {
+			q.Set("interactive", "1")
+		}
+		b, err := c.getJSON(ctx, "/api/ui", q)
+		if err != nil || in.JSON {
+			return jsonResult(b, err)
+		}
+		return textResult(compactScreen(b)), nil, nil
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "screenshot",
+		Description: "A PNG of the target's screen at its own resolution. An image costs far more to read than ui's tree and names nothing you can match, so take one only to judge how something looks, not to find, tap or check text.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in Targeted) (*mcp.CallToolResult, any, error) {
+		b, _, err := c.do(ctx, http.MethodGet, "/api/screenshot", url.Values{"target": {in.Target}}, "", nil)
+		if err != nil {
+			return errResult(err), nil, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.ImageContent{Data: b, MIMEType: "image/png"}}}, nil, nil
+	})
+
+	const driving = " Claims the target for this session first, so another agent cannot drive it at the same time; refused while a person is using it."
+
+	addInput(s, c, "point", "Move this agent's cursor to a point in device pixels, without touching the device, so a person watching sees what you are about to act on. tap and swipe already point first; call this to show a target while you work something out. Claims the target like the other input tools, but is not refused while a person is using it.",
+		func(in pointIn) (string, httpapi.InputRequest) {
+			return in.Target, httpapi.InputRequest{Action: "move", X: in.X, Y: in.Y}
+		})
+	addInput(s, c, "tap", "Tap a point in device pixels, or a node named by text, id or desc: the server finds it in the view hierarchy, taps its center and answers with the node it hit. A name that matches several nodes is an error listing them; pass index to pick one."+driving,
+		func(in tapIn) (string, httpapi.InputRequest) {
+			return in.Target, in.request()
+		})
+	addInput(s, c, "swipe", "Drag from one point to another, in device pixels."+driving,
+		func(in swipeIn) (string, httpapi.InputRequest) {
+			return in.Target, httpapi.InputRequest{Action: "swipe", X: in.X, Y: in.Y, X2: in.X2, Y2: in.Y2, Ms: in.Ms}
+		})
+	addInput(s, c, "scroll", "Scroll a list the way a person does, and know when it has stopped. The server swipes inside the list, reads the screen again, and answers swipes and atEdge: atEdge true means the last stroke moved nothing, so the list is already at its top, bottom or end -- do not scroll that way again. until=edge goes straight to the top or bottom in one call; find scrolls until a node is on screen and answers with it. The answer ends with the interactive tree of the screen it stopped on, as ui reports it. Use this instead of swipe and a screenshot to page through anything."+driving,
+		func(in scrollIn) (string, httpapi.InputRequest) {
+			return in.Target, httpapi.InputRequest{Action: "scroll", Direction: in.Direction, Until: in.Until, Find: in.Find, X: in.X, Y: in.Y, Max: in.Max, Ms: in.Ms}
+		})
+	addInput(s, c, "type_text", "Type text into the focused field."+driving,
+		func(in textIn) (string, httpapi.InputRequest) {
+			return in.Target, httpapi.InputRequest{Action: "text", Text: in.Text}
+		})
+	addInput(s, c, "key", "Press one key by keycode."+driving,
+		func(in keyIn) (string, httpapi.InputRequest) {
+			return in.Target, httpapi.InputRequest{Action: "key", Keycode: in.Keycode}
+		})
+	addInput(s, c, "button", "Press a device button by name: "+strings.Join(android.ButtonNames(), ", ")+"."+driving,
+		func(in buttonIn) (string, httpapi.InputRequest) {
+			return in.Target, httpapi.InputRequest{Action: "button", Button: in.Button}
+		})
+	addInput(s, c, "launch", "Open an installed app."+driving,
+		func(in launchIn) (string, httpapi.InputRequest) {
+			return in.Target, httpapi.InputRequest{Action: "launch", Package: in.Package, Activity: in.Activity}
+		})
+	addInput(s, c, "open_url", "Open a URL on the device."+driving,
+		func(in urlIn) (string, httpapi.InputRequest) {
+			return in.Target, httpapi.InputRequest{Action: "openURL", URL: in.URL}
+		})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "logcat",
+		Description: "Recent log lines, optionally narrowed to one app's process: logcat's threadtime format on Android, the unified log's compact style on an iOS simulator. package is an Android package or an iOS bundle ID. At most one of package and foreground.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in logcatIn) (*mcp.CallToolResult, any, error) {
+		q := url.Values{"target": {in.Target}}
+		if in.Lines > 0 {
+			q.Set("lines", strconv.Itoa(in.Lines))
+		}
+		if in.Since != "" {
+			q.Set("since", in.Since)
+		}
+		if in.Package != "" {
+			q.Set("package", in.Package)
+		}
+		if in.Foreground {
+			q.Set("foreground", "1")
+		}
+		if in.Format != "" {
+			q.Set("format", in.Format)
+		}
+		b, _, err := c.do(ctx, http.MethodGet, "/api/logcat", q, "", nil)
+		if err != nil {
+			return errResult(err), nil, nil
+		}
+		return textResult(string(b)), nil, nil
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "crashes",
+		Description: "The target's crash reports, newest first, one summary row each: a simulator's or a physical iPhone's .ips reports, or an Android device's dropbox crashes, native crashes and ANRs. A simulator report can take 40s after the crash to appear.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in crashesIn) (*mcp.CallToolResult, any, error) {
+		q := url.Values{"target": {in.Target}}
+		if in.Limit > 0 {
+			q.Set("limit", strconv.Itoa(in.Limit))
+		}
+		if in.Since != "" {
+			q.Set("since", in.Since)
+		}
+		return jsonResult(c.getJSON(ctx, "/api/crashes", q))
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "crash",
+		Description: "One crash report as written. On a simulator an .ips: a JSON header line, then the JSON body with the exception, the termination reason and every thread's backtrace. On Android the dropbox entry: a header line, then the process, package and stack trace or ANR traces.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in crashIn) (*mcp.CallToolResult, any, error) {
+		b, _, err := c.do(ctx, http.MethodGet, "/api/crashes/"+url.PathEscape(in.ID), url.Values{"target": {in.Target}}, "", nil)
+		if err != nil {
+			return errResult(err), nil, nil
+		}
+		return textResult(string(b)), nil, nil
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "install",
+		Description: "Android only: install APKs read from this Mac's disk, where loupe mcp runs, not the agent's. Pass a base and its splits together for an App Bundle build. A lower versionCode than the installed one is refused (INSTALL_FAILED_VERSION_DOWNGRADE): retry with downgrade for a debuggable app, or uninstall first. With launch, opening the app is claimed and arbitrated like the input tools.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in installIn) (*mcp.CallToolResult, any, error) {
+		if len(in.Paths) == 0 {
+			return errResult(fmt.Errorf("paths: at least one APK")), nil, nil
+		}
+		body, ct, err := multipartAPKs(in.Paths)
+		if err != nil {
+			return errResult(err), nil, nil
+		}
+		q := url.Values{"target": {in.Target}}
+		if in.AllowTest {
+			q.Set("allowTest", "1")
+		}
+		if in.Downgrade {
+			q.Set("downgrade", "1")
+		}
+		send := func() (json.RawMessage, error) {
+			b, _, err := c.do(ctx, http.MethodPost, "/api/install", q, ct, bytes.NewReader(body))
+			return b, err
+		}
+		if !in.Launch {
+			return jsonResult(send())
+		}
+		q.Set("launch", "1")
+		return jsonResult(c.drive(ctx, in.Target, send))
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "uninstall",
+		Description: "Android only: remove an installed app and its data, which is the way past a downgrade a release build refuses. Claimed and arbitrated like the input tools. 404 notInstalled when the package is not on the device.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in uninstallIn) (*mcp.CallToolResult, any, error) {
+		q := url.Values{"target": {in.Target}, "package": {in.Package}}
+		return jsonResult(c.drive(ctx, in.Target, func() (json.RawMessage, error) {
+			b, _, err := c.do(ctx, http.MethodDelete, "/api/install", q, "", nil)
+			return b, err
+		}))
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "camera",
+		Description: "Point an AVD's, iOS simulator's or physical iPhone's back camera at a PNG or JPEG read from this Mac's disk, or, on an AVD, at one of this Mac's cameras (hostCamera, a name from GET /api/camera/sources), or give the camera back with clear. Switching an AVD's camera source takes a cold boot. On an iPhone only development-signed apps signed by a team this Mac has an Apple Development identity for can take it. The answer's applies says when an app sees it: cameraOpen (AVD, next time an app opens the camera), boot (AVD, after it is booted again through loupe), live (iOS app already running with loupe's camera shim), launch (iOS, after the app is launched through loupe, which relaunches it).",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in cameraIn) (*mcp.CallToolResult, any, error) {
+		q := url.Values{"target": {in.Target}}
+		if in.Clear {
+			b, _, err := c.do(ctx, http.MethodDelete, "/api/camera", q, "", nil)
+			return jsonResult(b, err)
+		}
+		if in.HostCamera != "" {
+			body, _ := json.Marshal(httpapi.CameraHostRequest{HostCamera: in.HostCamera})
+			b, _, err := c.do(ctx, http.MethodPost, "/api/camera", q, "application/json", bytes.NewReader(body))
+			return jsonResult(b, err)
+		}
+		if in.Path == "" {
+			return errResult(fmt.Errorf("path: an image, hostCamera, or clear")), nil, nil
+		}
+		body, err := os.ReadFile(in.Path)
+		if err != nil {
+			return errResult(err), nil, nil
+		}
+		b, _, err := c.do(ctx, http.MethodPost, "/api/camera", q, "application/octet-stream", bytes.NewReader(body))
+		return jsonResult(b, err)
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "drop",
+		Description: "Paste an image read from this Mac's disk into the text field at x, y on an iOS simulator, as dropping a picture onto it does: the field is tapped to raise the edit menu and its Paste tapped, and the field's value is read to confirm the image went in. A point with no Paste is an error with code noPaste; a Paste that left the field unchanged twice is pasteFailed; a simcap too old to set an image is simcapOutdated." + driving,
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in dropIn) (*mcp.CallToolResult, any, error) {
+		if in.Path == "" {
+			return errResult(fmt.Errorf("path: an image")), nil, nil
+		}
+		body, err := os.ReadFile(in.Path)
+		if err != nil {
+			return errResult(err), nil, nil
+		}
+		q := url.Values{"target": {in.Target}, "x": {strconv.Itoa(in.X)}, "y": {strconv.Itoa(in.Y)}}
+		return jsonResult(c.drive(ctx, in.Target, func() (json.RawMessage, error) {
+			b, _, err := c.do(ctx, http.MethodPost, "/api/drop", q, "application/octet-stream", bytes.NewReader(body))
+			return b, err
+		}))
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "sequence",
+		Description: "Run several inputs in one call, so a known flow (fill a form, tap through a dialog) costs one round trip instead of one per step. Each step is an input tool's body with its action named: tap (x,y or match), swipe, scroll (with find, to bring a node below the fold on screen), text, key, button, launch, openURL, move, and wait (ms, or match to wait for a node). Steps run in order and the cursor moves to each touch first; the first step that fails stops the rest, and the answer names it and holds every step's result. The answer ends with the interactive tree of the screen the sequence stopped on, as ui reports it, so plan the next call from it instead of reading the screen again; noScreen leaves it out. Every call is a round trip through you, so put every step you can predict into one sequence, through to the screen you need, and end it with a wait or scroll find for what that screen should show: they fail unless the node appears, so they are also the check. Asked to check that something works, prove it once on the shortest path, answer, and stop." + driving,
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in sequenceIn) (*mcp.CallToolResult, any, error) {
+		res, _, err := jsonResult(c.drive(ctx, in.Target, func() (json.RawMessage, error) {
+			return c.postJSON(ctx, "/api/sequence", url.Values{"target": {in.Target}}, struct {
+				Steps []stepIn `json:"steps"`
+			}{in.Steps})
+		}))
+		if !in.NoScreen {
+			c.appendScreen(ctx, in.Target, res)
+		}
+		return res, nil, err
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "boot",
+		Description: "Boot a shut-down AVD or iOS simulator without opening a stream, and return its row once it is up. Already running returns at once. A boot that outruns wait is an error, not a failed boot: the emulator keeps booting, and boot_status reports on it. The claim holds for as long as the boot runs.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in bootIn) (*mcp.CallToolResult, any, error) {
+		q := url.Values{"target": {in.Target}}
+		if in.Wait != "" {
+			q.Set("wait", in.Wait)
+		}
+		return jsonResult(c.drive(ctx, in.Target, func() (json.RawMessage, error) {
+			return c.postJSON(ctx, "/api/devices/boot", q, nil)
+		}))
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "boot_status",
+		Description: "How an AVD's boot is going: state (up, booting, stopped), whether the emulator process is alive, adb's state, sys.boot_completed and the boot log's path. For a boot started with wait 0 or one that outran its wait. Reads only; it claims nothing.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in Targeted) (*mcp.CallToolResult, any, error) {
+		return jsonResult(c.getJSON(ctx, "/api/devices/boot", url.Values{"target": {in.Target}}))
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "apply_preset",
+		Description: "Apply a saved preset of device settings (dark mode, text size, reduce motion, posture and so on) to a target. Settings the target doesn't have are skipped and listed in skipped; if one change fails, the ones before it are put back. Claimed like the input tools.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in applyPresetIn) (*mcp.CallToolResult, any, error) {
+		q := url.Values{"target": {in.Target}, "name": {in.Name}}
+		return jsonResult(c.drive(ctx, in.Target, func() (json.RawMessage, error) {
+			return c.postJSON(ctx, "/api/presets/apply", q, nil)
+		}))
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "release",
+		Description: "Give back this session's claim on a target, so another agent can drive it. Claims are also released when loupe mcp exits, and lapse after 10 idle minutes.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in Targeted) (*mcp.CallToolResult, any, error) {
+		if err := c.release(ctx, in.Target); err != nil {
+			return errResult(err), nil, nil
+		}
+		return textResult("released " + in.Target), nil, nil
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "submit_feedback",
+		Description: "Report a problem with loupe itself to loupe's maintainer, or to whoever runs this server: a tool that failed or answered wrongly, a tool or option you needed and loupe lacks, an error that did not say what to do, or a doc that was wrong. " +
+			"Not for bugs in the app under test. Call it once per problem, when you have worked around it or given up on it, not on every retry. " +
+			"Write it as an issue a maintainer can act on without asking you: problem says what you sent, what came back and what you expected; repro is the calls in order; proposed_fix is the change you would make to loupe. " +
+			"Leave out tokens, passwords, personal data, app names and what was on the screen: the report may leave this Mac and become a public GitHub issue. " +
+			"The answer says where it went (delivery) or, with no delivery, that it stayed on this Mac. Leave that as it is: whether reports leave the Mac is the person's setting, not yours. It claims nothing.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in feedbackIn) (*mcp.CallToolResult, any, error) {
+		return jsonResult(c.postJSON(ctx, "/api/feedback", nil, httpapi.FeedbackRequest{
+			Title: in.Title, Problem: in.Problem, Repro: in.Repro, ProposedFix: in.ProposedFix, Tool: in.Tool, Target: in.Target,
+		}))
+	})
+}
+
+type feedbackIn struct {
+	Title       string `json:"title" jsonschema:"one line, as an issue title"`
+	Problem     string `json:"problem" jsonschema:"what you sent, what came back, and what you expected instead"`
+	Repro       string `json:"repro,omitempty" jsonschema:"the tool calls or commands that show it, in order"`
+	ProposedFix string `json:"proposed_fix" jsonschema:"the change to loupe you think would fix it"`
+	Tool        string `json:"tool,omitempty" jsonschema:"the tool, CLI command or route it concerns"`
+	Target      string `json:"target,omitempty" jsonschema:"the id of the target it happened on, such as avd:<name>, sim:<udid> or an Android serial, if any; not a description"`
+}
+
+// addInput registers one POST /api/input tool, its action fixed by build.
+func addInput[In any](s *mcp.Server, c *Client, name, desc string, build func(In) (string, httpapi.InputRequest)) {
+	mcp.AddTool(s, &mcp.Tool{Name: name, Description: desc},
+		func(ctx context.Context, _ *mcp.CallToolRequest, in In) (*mcp.CallToolResult, any, error) {
+			t, req := build(in)
+			q := url.Values{"target": {t}}
+			res, _, err := jsonResult(c.drive(ctx, t, func() (json.RawMessage, error) {
+				// A tap naming a node has no point yet; the server points
+				// once it has found one.
+				if pointsFirst(req.Action) && req.Match == nil {
+					// The cursor starts its trip while the action is on its
+					// way, so it reaches the point about when the touch
+					// lands. Only the viewers' cursor depends on it, so a
+					// failed move is not the action's failure.
+					_, _ = c.postJSON(ctx, "/api/input", q, inputBody(httpapi.InputRequest{Action: "move", X: req.X, Y: req.Y}))
+				}
+				return c.postJSON(ctx, "/api/input", q, inputBody(req))
+			}))
+			// A scroll lands on a screen the agent has not seen; showing it
+			// saves the ui call that would follow.
+			if req.Action == "scroll" && !res.IsError {
+				c.appendScreen(ctx, t, res)
+			}
+			return res, nil, err
+		})
+}
+
+// inputBody encodes req with every coordinate its action requires, 0
+// included. InputRequest's omitempty drops a 0, and the server refuses a
+// tap at x 0 as one with no x at all. A tap naming a node sends no point.
+func inputBody(req httpapi.InputRequest) map[string]any {
+	b, _ := json.Marshal(req)
+	var body map[string]any
+	_ = json.Unmarshal(b, &body)
+	if req.Match != nil {
+		return body
+	}
+	coords := map[string]int{"x": req.X, "y": req.Y, "x2": req.X2, "y2": req.Y2}
+	for _, field := range httpapi.InputRequiredFields[req.Action] {
+		if v, ok := coords[field]; ok {
+			body[field] = v
+		}
+	}
+	return body
+}
+
+// pointsFirst reports whether an input tool moves the agent's cursor to its
+// start point before it acts: every action that touches a point.
+func pointsFirst(action string) bool {
+	return action == "tap" || action == "swipe" || action == "longPress"
+}
+
+// multipartAPKs reads each path into one multipart body, the form
+// /api/install takes for a base and its splits.
+func multipartAPKs(paths []string) ([]byte, string, error) {
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	for _, p := range paths {
+		f, err := os.Open(p)
+		if err != nil {
+			return nil, "", err
+		}
+		w, err := mw.CreateFormFile("apk", filepath.Base(p))
+		if err == nil {
+			_, err = io.Copy(w, f)
+		}
+		f.Close()
+		if err != nil {
+			return nil, "", fmt.Errorf("%s: %w", p, err)
+		}
+	}
+	if err := mw.Close(); err != nil {
+		return nil, "", err
+	}
+	return buf.Bytes(), mw.FormDataContentType(), nil
+}
+
+// appendScreen adds the target's interactive tree to res, so a sequence's or
+// scroll's answer shows where it landed and the agent saves a ui call. A
+// failed read leaves res as it was: the input's own answer still stands.
+func (c *Client) appendScreen(ctx context.Context, target string, res *mcp.CallToolResult) {
+	b, err := c.getJSON(ctx, "/api/ui", url.Values{"target": {target}, "interactive": {"1"}})
+	if err != nil {
+		return
+	}
+	res.Content = append(res.Content, &mcp.TextContent{Text: "screen now: " + compactScreen(b)})
+}
+
+// jsonResult hands the server's JSON back as the tool's text. An HTTP error
+// is a tool error, not a protocol one, so the model reads the server's code
+// (humanHeld, claimedBy, handsOff) and its retry time and can act on them.
+func jsonResult(b json.RawMessage, err error) (*mcp.CallToolResult, any, error) {
+	if err != nil {
+		return errResult(err), nil, nil
+	}
+	return textResult(string(b)), nil, nil
+}
+
+func textResult(s string) *mcp.CallToolResult {
+	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: s}}}
+}
+
+func errResult(err error) *mcp.CallToolResult {
+	r := textResult(err.Error())
+	r.IsError = true
+	return r
+}
