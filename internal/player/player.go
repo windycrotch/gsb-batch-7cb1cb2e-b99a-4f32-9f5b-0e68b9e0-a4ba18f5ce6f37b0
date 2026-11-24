@@ -110,11 +110,13 @@ type Player struct {
 
 	loading     *source.Track
 	loadingFrom int64
+	loadingInst uint64
 
 	next     *Deck
 	nextInst uint64
 	adopt    *adoption
 	nextGen  uint64
+	cuedGen  uint64
 }
 
 func New(cfg Config) *Player {
@@ -177,14 +179,16 @@ func (p *Player) Play(t source.Track, startMs int64, paused bool) uint64 {
 		return inst
 	}
 	p.adopt = nil
+	// Always claim a fresh instance number, even after a Stop that released the
+	// active slot, so events from distinct deck lifetimes never share an instance.
 	p.instance++
 	inst := p.instance
 	old, oldInst := p.active, p.activeInst
-	wasLoading := p.takeLoadingLocked()
+	wasLoading, loadingInst := p.takeLoadingLocked()
 	p.clearMixLocked()
 	p.active, p.activeInst = nil, inst
 	tr := t
-	p.loading, p.loadingFrom = &tr, startMs
+	p.loading, p.loadingFrom, p.loadingInst = &tr, startMs, inst
 	p.paused = paused
 	p.env, p.fadingOut = 1, false
 	p.mu.Unlock()
@@ -193,7 +197,7 @@ func (p *Player) Play(t source.Track, startMs int64, paused bool) uint64 {
 		p.emit(Event{Type: EventTrackEnd, Track: &old.Track, Encoded: old.Track.Encode(), Instance: oldInst, Reason: EndReplaced})
 	}
 	if wasLoading != nil {
-		p.emit(Event{Type: EventTrackEnd, Track: wasLoading, Encoded: wasLoading.Encode(), Instance: oldInst, Reason: EndReplaced})
+		p.emit(Event{Type: EventTrackEnd, Track: wasLoading, Encoded: wasLoading.Encode(), Instance: loadingInst, Reason: EndReplaced})
 	}
 	p.emit(Event{Type: EventTrackLoading, Track: &tr, Encoded: tr.Encode(), Instance: inst})
 	go p.load(t, startMs, inst)
@@ -203,11 +207,16 @@ func (p *Player) Play(t source.Track, startMs int64, paused bool) uint64 {
 func (p *Player) load(t source.Track, startMs int64, inst uint64) {
 	playable, err := p.resolve(t)
 	p.mu.Lock()
-	if p.activeInst != inst || p.ctx.Err() != nil {
+	// The request is stale if the loading slot was taken (stop, replacement,
+	// destroy) or a different instance now owns the active slot. Checking only
+	// activeInst is insufficient: while loading, active is nil and activeInst
+	// still holds this instance, so a stopped player could be repopulated.
+	if p.loadingInst != inst || p.activeInst != inst || p.ctx.Err() != nil {
 		p.mu.Unlock()
 		return
 	}
 	p.loading = nil
+	p.loadingInst = 0
 	if err != nil {
 		p.activeInst = 0
 		p.mu.Unlock()
@@ -268,6 +277,7 @@ func (p *Player) clearMixLocked() {
 	}
 	p.next, p.nextInst = nil, 0
 	p.nextGen++
+	p.cuedGen++
 	p.incGain = 1
 	p.activeGain = 1
 	p.rampUntil = time.Time{}
@@ -276,9 +286,12 @@ func (p *Player) clearMixLocked() {
 func (p *Player) Stop() {
 	p.mu.Lock()
 	d, inst := p.active, p.activeInst
-	wasLoading := p.takeLoadingLocked()
+	wasLoading, loadingInst := p.takeLoadingLocked()
 	p.clearMixLocked()
-	p.active, p.activeInst = nil, 0
+	// Keep activeInst at the released instance: a nil active deck with a stale
+	// non-zero instance makes the following Play allocate a fresh number instead
+	// of re-emitting events under the stopped track's instance.
+	p.active = nil
 	p.env, p.fadingOut = 1, false
 	p.mu.Unlock()
 	if d != nil {
@@ -286,14 +299,16 @@ func (p *Player) Stop() {
 		p.emit(Event{Type: EventTrackEnd, Track: &d.Track, Encoded: d.Track.Encode(), Instance: inst, Reason: EndStopped})
 	}
 	if wasLoading != nil {
-		p.emit(Event{Type: EventTrackEnd, Track: wasLoading, Encoded: wasLoading.Encode(), Instance: inst, Reason: EndStopped})
+		p.emit(Event{Type: EventTrackEnd, Track: wasLoading, Encoded: wasLoading.Encode(), Instance: loadingInst, Reason: EndStopped})
 	}
 }
 
-func (p *Player) takeLoadingLocked() *source.Track {
+func (p *Player) takeLoadingLocked() (*source.Track, uint64) {
 	t := p.loading
+	inst := p.loadingInst
 	p.loading = nil
-	return t
+	p.loadingInst = 0
+	return t, inst
 }
 
 func (p *Player) Pause(paused bool) {
@@ -359,6 +374,10 @@ func (p *Player) SeekTo(ms int64) error {
 }
 
 func (p *Player) LoadDeckB(t source.Track, startMs int64) (uint64, error) {
+	p.mu.Lock()
+	p.cuedGen++
+	gen := p.cuedGen
+	p.mu.Unlock()
 	playable, err := p.resolve(t)
 	if err != nil {
 		return 0, err
@@ -368,11 +387,15 @@ func (p *Player) LoadDeckB(t source.Track, startMs int64) (uint64, error) {
 	if p.ctx.Err() != nil {
 		return 0, p.ctx.Err()
 	}
+	if gen != p.cuedGen {
+		return 0, ErrNextSuperseded
+	}
 	if p.cued != nil {
 		p.dropDeckLocked(p.cued, p.cuedInst)
 	}
 	p.instance++
-	p.cued, p.cuedInst = p.newDeck(t, playable, max(0, startMs)), p.instance
+	d := p.newDeck(t, playable, max(0, startMs))
+	p.cued, p.cuedInst = d, p.instance
 	return p.cuedInst, nil
 }
 
@@ -394,7 +417,8 @@ func (p *Player) StartCrossfade(req CrossfadeRequest) error {
 		return ErrNothingToMix
 	}
 	deck, inst := p.cued, p.cuedInst
-	p.cued = nil
+	p.cued, p.cuedInst = nil, 0
+	p.cuedGen++
 	tempo := req.TempoRatio
 	if tempo <= 0 {
 		tempo = 1
@@ -463,7 +487,8 @@ func (p *Player) CancelPending() {
 	}
 	if p.cued != nil {
 		p.dropDeckLocked(p.cued, p.cuedInst)
-		p.cued = nil
+		p.cued, p.cuedInst = nil, 0
+		p.cuedGen++
 	}
 }
 
@@ -628,6 +653,8 @@ func (p *Player) promoteLocked() {
 		old.Close()
 		into := p.active.Track
 		p.emit(Event{Type: EventMixPromoted, Track: &old.Track, Instance: oldInst, Into: &into, IntoMs: p.active.PositionMs()})
+		// The old deck's end event must stay bound to its own instance even
+		// though the new deck is already active when it is emitted.
 		p.emit(Event{Type: EventTrackEnd, Track: &old.Track, Encoded: old.Track.Encode(), Instance: oldInst, Reason: EndReplaced})
 	}
 	p.emit(trackEvent(EventTrackStart, p.active, p.activeInst))
@@ -672,9 +699,11 @@ func (p *Player) Sent(info FrameInfo, at time.Time) {
 
 func (p *Player) Stall(gap time.Duration) {
 	p.mu.Lock()
-	inst := p.activeInst
-	tr := p.activeTrackLocked()
+	inst, tr := p.activeInst, p.activeTrackLocked()
 	p.mu.Unlock()
+	if tr == nil {
+		return
+	}
 	p.emit(Event{Type: EventSendStall, Track: tr, Instance: inst, StallMs: gap.Milliseconds()})
 }
 
@@ -704,7 +733,14 @@ type State struct {
 func (p *Player) State() State {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	s := State{Paused: p.paused, Volume: p.volume, Filters: p.filters, Instance: p.activeInst, DeckBLoaded: p.cued != nil}
+	// A retained activeInst with no live deck (after Stop) is only kept
+	// internally to guarantee fresh instance allocation; external state must not
+	// advertise a deck that no longer exists.
+	reportInst := uint64(0)
+	if p.active != nil || p.loading != nil {
+		reportInst = p.activeInst
+	}
+	s := State{Paused: p.paused, Volume: p.volume, Filters: p.filters, Instance: reportInst, DeckBLoaded: p.cued != nil}
 	rate := p.filters.PositionRate()
 	if p.active != nil {
 		rate *= p.active.TempoRatio()
@@ -746,16 +782,17 @@ func (p *Player) State() State {
 func (p *Player) Destroy() {
 	p.mu.Lock()
 	d, inst := p.active, p.activeInst
-	wasLoading := p.takeLoadingLocked()
+	wasLoading, loadingInst := p.takeLoadingLocked()
 	p.clearMixLocked()
 	p.active = nil
+	p.adopt = nil
 	p.mu.Unlock()
 	if d != nil {
 		d.Close()
 		p.emit(Event{Type: EventTrackEnd, Track: &d.Track, Encoded: d.Track.Encode(), Instance: inst, Reason: EndCleanup})
 	}
 	if wasLoading != nil {
-		p.emit(Event{Type: EventTrackEnd, Track: wasLoading, Encoded: wasLoading.Encode(), Instance: inst, Reason: EndCleanup})
+		p.emit(Event{Type: EventTrackEnd, Track: wasLoading, Encoded: wasLoading.Encode(), Instance: loadingInst, Reason: EndCleanup})
 	}
 	p.cancel()
 	p.events.close()

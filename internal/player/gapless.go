@@ -25,6 +25,8 @@ func (p *Player) SetNext(t source.Track) (uint64, error) {
 	p.mu.Lock()
 	p.nextGen++
 	gen := p.nextGen
+	wantActive := p.activeInst
+	wantLoading := p.loadingInst
 	p.mu.Unlock()
 	playable, err := p.resolve(t)
 	if err != nil {
@@ -35,7 +37,7 @@ func (p *Player) SetNext(t source.Track) (uint64, error) {
 	if p.ctx.Err() != nil {
 		return 0, p.ctx.Err()
 	}
-	if gen != p.nextGen {
+	if gen != p.nextGen || p.activeInst != wantActive || p.loadingInst != wantLoading {
 		return 0, ErrNextSuperseded
 	}
 	if p.active == nil && p.loading == nil {

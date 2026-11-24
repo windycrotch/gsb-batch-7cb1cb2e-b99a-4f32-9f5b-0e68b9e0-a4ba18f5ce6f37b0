@@ -192,7 +192,8 @@ func (p *Player) armHost(req HostRequest, clip *voiceClip) error {
 		return ErrTrackLoading
 	}
 	deck, inst := p.cued, p.cuedInst
-	p.cued = nil
+	p.cued, p.cuedInst = nil, 0
+	p.cuedGen++
 	run := &hostRun{clip: clip, shape: shape}
 	total := int(shape.TotalMs())
 	if p.active == nil {
