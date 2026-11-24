@@ -1,7 +1,7 @@
 package memfile
 
 import (
-	"bytes"
+	"errors"
 	"io"
 )
 
@@ -17,47 +17,57 @@ func New() FileLike {
 
 type memfile struct {
 	off int64
-	len int64
-	b   bytes.Buffer
+	buf []byte
 }
 
 func (mf *memfile) Write(p []byte) (int, error) {
-	needed := int(mf.off) + len(p) - mf.b.Cap()
-	if needed > 0 {
-		mf.b.Grow(needed)
+	if mf.off < 0 {
+		return 0, errors.New("memfile: write at negative offset")
 	}
-	n := copy(mf.b.Bytes()[mf.off:], p)
+
+	end := mf.off + int64(len(p))
+	if end > int64(len(mf.buf)) {
+		// grow the buffer, zero-padding any gap between the
+		// previous end of data and the current offset
+		grown := make([]byte, end)
+		copy(grown, mf.buf)
+		mf.buf = grown
+	}
+
+	n := copy(mf.buf[mf.off:], p)
 	mf.off += int64(n)
-	if mf.len < mf.off {
-		mf.len = mf.off
-	}
 	return n, nil
 }
 
 func (mf *memfile) Read(p []byte) (int, error) {
-	if mf.off >= mf.len {
+	if mf.off >= int64(len(mf.buf)) {
 		return 0, io.EOF
 	}
 
-	n := copy(p, mf.b.Bytes()[mf.off:mf.len])
+	n := copy(p, mf.buf[mf.off:])
 	mf.off += int64(n)
 	return n, nil
 }
 
 func (mf *memfile) Seek(off int64, whence int) (int64, error) {
+	var abs int64
 	switch whence {
 	case io.SeekStart:
-		mf.off = off
-	case io.SeekEnd:
-		mf.off = mf.len - off
+		abs = off
 	case io.SeekCurrent:
-		mf.off += off
+		abs = mf.off + off
+	case io.SeekEnd:
+		abs = int64(len(mf.buf)) + off
+	default:
+		return 0, errors.New("memfile: invalid whence")
 	}
-	if mf.off < 0 {
-		mf.off = 0
+
+	// per io.Seeker convention: seeking before the start is an error,
+	// seeking past the end is legal
+	if abs < 0 {
+		return 0, errors.New("memfile: negative position")
 	}
-	if mf.off > mf.len {
-		mf.off = mf.len
-	}
-	return mf.off, nil
+
+	mf.off = abs
+	return abs, nil
 }

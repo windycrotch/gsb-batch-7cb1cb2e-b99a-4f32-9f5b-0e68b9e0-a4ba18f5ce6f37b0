@@ -1,7 +1,9 @@
 package goff_test
 
 import (
+	"bytes"
 	"io"
+	"io/ioutil"
 	"os"
 	"testing"
 	"unsafe"
@@ -43,14 +45,15 @@ func TestTranscode(t *testing.T) {
 	defer inputFormatContext.Free()
 	loggedObjects[uintptr(unsafe.Pointer(inputFormatContext))] = "demuxer"
 
-	reader, err := os.Open(inputPath)
-	must(err)
-	defer reader.Close()
-
-	stats, err := reader.Stat()
+	// read the whole input into memory: this exercises the
+	// Reader bridge (io.ReadSeeker -> AVIOContext)
+	inputData, err := ioutil.ReadFile(inputPath)
 	must(err)
 
-	err = inputFormatContext.OpenReader(goff.NewReader(reader, stats.Size()), nil, nil)
+	inputReader := goff.NewReader(bytes.NewReader(inputData), int64(len(inputData)))
+	defer inputReader.Free()
+
+	err = inputFormatContext.OpenReader(inputReader, nil, nil)
 	must(err)
 
 	assert.EqualValues(2, inputFormatContext.NbStreams())
@@ -90,7 +93,9 @@ func TestTranscode(t *testing.T) {
 	defer outputFormatContext.Free()
 	loggedObjects[uintptr(unsafe.Pointer(outputFormatContext))] = "muxer"
 
-	outputFormatContext.SetWriter(goff.NewWriter(memBuffer))
+	outputWriter := goff.NewWriter(memBuffer)
+	defer outputWriter.Free()
+	outputFormatContext.SetWriter(outputWriter)
 
 	outputVideoStream := outputFormatContext.NewStream(inputVideoDecoder)
 	outputVideoStream.SetID(0)
@@ -223,17 +228,42 @@ func TestTranscode(t *testing.T) {
 	err = outputFormatContext.WriteTrailer()
 	must(err)
 
-	outPath := "out.mp4"
 	writerLen, err := memBuffer.Seek(0, io.SeekEnd)
 	must(err)
+	assert.True(writerLen > 0, "transcoded output must not be empty")
+	logf("Transcoded output is (%d KB) in memory", writerLen/1024)
 
-	logf("Writing (%d KB) output to (%s)", writerLen/1024, outPath)
+	// read the transcoded data back from memory: it must be a valid
+	// mp4 with exactly one (video) stream — this validates that the
+	// Writer bridge and memfile seek/write offsets produced a
+	// well-formed file
 	_, err = memBuffer.Seek(0, io.SeekStart)
+	must(err)
+	outputData := make([]byte, writerLen)
+	_, err = io.ReadFull(memBuffer, outputData)
+	must(err)
 
+	verifyContext := goff.FormatAllocContext()
+	defer verifyContext.Free()
+
+	verifyReader := goff.NewReader(bytes.NewReader(outputData), writerLen)
+	defer verifyReader.Free()
+
+	err = verifyContext.OpenReader(verifyReader, nil, nil)
+	must(err)
+
+	err = verifyContext.FindStreamInfo(nil)
+	must(err)
+
+	assert.EqualValues(1, verifyContext.NbStreams())
+	verifyStream := verifyContext.Streams()[0]
+	assert.EqualValues("video", verifyStream.CodecParameters().CodecType().String())
+
+	outPath := "out.mp4"
 	outFile, err := os.Create(outPath)
 	must(err)
 	defer outFile.Close()
 
-	_, err = io.Copy(outFile, memBuffer)
+	_, err = outFile.Write(outputData)
 	must(err)
 }
