@@ -60,12 +60,12 @@ func main() {
 
 	if config.EnableVideo {
 		videoTrack = initWebrtcTrack("video", config.VideoCodec, config.VideoTrackName)
-		go listenRtp(config.RtpHost, config.RtpVideoPort, "video", videoTrack)
+		go listenRtp(config.RtpHost, config.RtpVideoPort, "video", videoTrack, nil)
 	}
 
 	if config.EnableAudio {
 		audioTrack = initWebrtcTrack("audio", config.AudioCodec, config.AudioTrackName)
-		go listenRtp(config.RtpHost, config.RtpAudioPort, "audio", audioTrack)
+		go listenRtp(config.RtpHost, config.RtpAudioPort, "audio", audioTrack, nil)
 	}
 
 	http.HandleFunc(config.ApiLocation, OnConnect)
