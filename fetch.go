@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/m314dev/m314ss/srt"
 	"github.com/m314dev/subapi"
@@ -31,6 +32,24 @@ import (
 
 // ErrNoMatch means every candidate was either unavailable or failed to align.
 var ErrNoMatch = errors.New("no subtitle matched this video")
+
+// errTimingMismatch means a paid translation came back timed like some other
+// file. It is not a lookup failure: the original subtitle was verified and is
+// still usable, so translateFallback returns that instead of dropping both.
+var errTimingMismatch = errors.New("translation isn't timed like the original file")
+
+// Translator is the half of subapi.SubDL the translation fallback uses.
+// *subapi.SubDL satisfies it.
+type Translator interface {
+	// TranslateEp queues a translation of subtitle nID and returns the job.
+	TranslateEp(ctx context.Context, nID, targetLang, tone string, season, episode int) (subapi.Job, error)
+
+	// WaitTranslation blocks until the job is downloadable.
+	WaitTranslation(ctx context.Context, id string, every time.Duration) (subapi.Job, error)
+
+	// DownloadTranslation fetches the finished subtitle.
+	DownloadTranslation(ctx context.Context, job subapi.Job) ([]byte, error)
+}
 
 // Client searches sources in order and returns the first subtitle the audio
 // agrees with.
@@ -52,7 +71,10 @@ type Client struct {
 	// in other languages, verified the same way, and machine translated into
 	// the one asked for. Costs a credit and a wait, so it's opt in. Needs a
 	// SubDL pro key.
-	TranslateWith *subapi.SubDL
+	//
+	// It's an interface so tests (and anything with its own queue) can
+	// substitute a fake; *subapi.SubDL implements it.
+	TranslateWith Translator
 
 	// Languages to try for the translation fallback. Empty means english
 	// first, then anything.
@@ -90,10 +112,28 @@ type Result struct {
 // them, so put the cheapest source first. If nothing matches the error wraps
 // ErrNoMatch. That is a normal outcome, not a failure: ship without a
 // subtitle rather than attach a wrong one.
+//
+// If ctx is canceled or times out the error is ctx.Err() (or wraps it), never
+// ErrNoMatch: giving up is not the same as finding nothing, and a caller that
+// stops here can retry.
 func (c *Client) Fetch(ctx context.Context, q subapi.Query) (Result, error) {
-	res, err := c.search(ctx, q)
-	if err == nil || c.TranslateWith == nil || q.Lang == "" || !errors.Is(err, ErrNoMatch) {
-		return res, err
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
+	res, err := c.search(ctx, q, nil)
+	if err == nil {
+		return res, nil
+	}
+	if !errors.Is(err, ErrNoMatch) {
+		return Result{}, err
+	}
+	// A cancel that lands after search's last check must not be reported as
+	// "no match": the caller needs to tell "gave up" from "nothing fits".
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return Result{}, ctxErr
+	}
+	if c.TranslateWith == nil || q.Lang == "" {
+		return Result{}, err
 	}
 	return c.translateFallback(ctx, q, err)
 }
@@ -116,53 +156,94 @@ func (c *Client) translateFallback(ctx context.Context, q subapi.Query, prev err
 		langs = []string{"EN", ""}
 	}
 
+	// Candidates already downloaded and verified but unusable for
+	// translation because they have no id. A search in another language
+	// lists the same files again; downloading them again pays the metered
+	// half for an answer we already know. Scoped to this call so concurrent
+	// requests share nothing.
+	skip := map[string]bool{}
+
 	errs := []error{prev}
 	for _, lang := range langs {
 		if strings.EqualFold(lang, q.Lang) {
 			continue // already tried
 		}
-		if ctx.Err() != nil {
-			return Result{}, ctx.Err()
+		if err := ctx.Err(); err != nil {
+			return Result{}, err
 		}
 
 		alt := q
 		alt.Lang = lang
 		c.logf("no %s subtitle; trying %s", q.Lang, langName(lang))
-		res, err := c.search(ctx, alt)
+		res, err := c.search(ctx, alt, skip)
 		if err != nil {
+			// A canceled or timed-out search is the caller giving up, not
+			// another "nothing here". Stop instead of trying more languages.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return Result{}, ctxErr
+			}
 			errs = append(errs, err)
 			continue
 		}
 		if res.ID == "" {
-			// translation works by id, the bytes are no use to it
+			// translation works by id, the bytes are no use to it.
+			// Remember it so a search in another language, which will list
+			// the same files again, doesn't pay to download it a second time.
 			c.logf("%s: %s: verified but has no id to translate", res.Source, res.Release)
+			skip[candidateKey(res.Source, res.Release)] = true
+			errs = append(errs, fmt.Errorf("%s: %s: verified but has no id to translate", res.Source, res.Release))
 			continue
 		}
 
 		out, err := c.translate(ctx, res, q.Lang, q)
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return Result{}, ctxErr
+			}
+			if errors.Is(err, errTimingMismatch) {
+				// The translation is of some other file, but res is still a
+				// verified subtitle for this video. Return it rather than
+				// failing the request and throwing the paid work away.
+				c.logf("%s: %v; returning the verified %s subtitle instead",
+					res.Release, err, langName(res.Lang))
+				return res, nil
+			}
 			c.logf("translating %s: %v", res.Release, err)
 			errs = append(errs, err)
 			continue
 		}
 		return out, nil
 	}
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
 	return Result{}, fmt.Errorf("%w (%v)", ErrNoMatch, errors.Join(errs...))
 }
 
+// candidateKey identifies a candidate across searches in different languages.
+// Candidates that can't be translated have no id, so source and release name
+// are what is left to match on.
+func candidateKey(source, release string) string { return source + "\x00" + release }
+
 func (c *Client) translate(ctx context.Context, res Result, lang string, q subapi.Query) (Result, error) {
 	s := c.TranslateWith
-	job, err := s.TranslateEp(ctx, res.ID, strings.ToUpper(lang), c.Tone, q.Season, q.Episode)
+	job, err := await(ctx, func(ctx context.Context) (subapi.Job, error) {
+		return s.TranslateEp(ctx, res.ID, strings.ToUpper(lang), c.Tone, q.Season, q.Episode)
+	})
 	if err != nil {
 		return Result{}, err
 	}
 	c.logf("translating %s %s to %s (job %s)", langName(res.Lang), res.Release, strings.ToUpper(lang), job.Ref())
 
-	done, err := s.WaitTranslation(ctx, job.Ref(), 0)
+	done, err := await(ctx, func(ctx context.Context) (subapi.Job, error) {
+		return s.WaitTranslation(ctx, job.Ref(), 0)
+	})
 	if err != nil {
 		return Result{}, err
 	}
-	data, err := s.DownloadTranslation(ctx, done)
+	data, err := await(ctx, func(ctx context.Context) ([]byte, error) {
+		return s.DownloadTranslation(ctx, done)
+	})
 	if err != nil {
 		return Result{}, err
 	}
@@ -191,7 +272,7 @@ func (c *Client) translate(ctx context.Context, res Result, lang string, q subap
 		data = res.Sync.Retime(data)
 	}
 	if !sameTiming(data, res.Data) {
-		return Result{}, fmt.Errorf("translation of %s isn't timed like it, not the same file", res.Release)
+		return Result{}, fmt.Errorf("%w: %s", errTimingMismatch, res.Release)
 	}
 	out.Data = data
 	return out, nil
@@ -229,7 +310,48 @@ func langName(lang string) string {
 	return strings.ToUpper(lang)
 }
 
-func (c *Client) search(ctx context.Context, q subapi.Query) (Result, error) {
+// await runs f and stops waiting on it as soon as ctx is done.
+//
+// The sources and the translator take ctx and pass it to their HTTP calls, so
+// usually this is just f's own return. But one of them ignoring ctx must not
+// pin a canceled request to a download or a translation poll that nobody is
+// waiting for anymore. The goroutine is left to finish on its own; its result
+// is dropped.
+func await[T any](ctx context.Context, f func(context.Context) (T, error)) (T, error) {
+	if err := ctx.Err(); err != nil {
+		var zero T
+		return zero, err
+	}
+	type outcome struct {
+		v   T
+		err error
+	}
+	ch := make(chan outcome, 1)
+	go func() {
+		v, err := f(ctx)
+		ch <- outcome{v, err}
+	}()
+	// Prefer a result that is already there: work that finished before the
+	// cancel shouldn't be thrown away by a coin flip.
+	select {
+	case o := <-ch:
+		return o.v, o.err
+	default:
+	}
+	select {
+	case o := <-ch:
+		return o.v, o.err
+	case <-ctx.Done():
+		var zero T
+		return zero, ctx.Err()
+	}
+}
+
+// search tries the sources in order and returns the first verified candidate.
+//
+// skip holds candidates that a previous search already downloaded and found
+// unusable; they are not downloaded again. It may be nil.
+func (c *Client) search(ctx context.Context, q subapi.Query, skip map[string]bool) (Result, error) {
 	tries := c.MaxTriesPerSource
 	if tries <= 0 {
 		tries = 3
@@ -238,8 +360,19 @@ func (c *Client) search(ctx context.Context, q subapi.Query) (Result, error) {
 
 	var errs []error
 	for _, src := range c.Sources {
-		candidates, err := src.Find(ctx, q)
+		if err := ctx.Err(); err != nil {
+			return Result{}, err
+		}
+		candidates, err := await(ctx, func(ctx context.Context) ([]subapi.Candidate, error) {
+			return src.Find(ctx, q)
+		})
 		if err != nil {
+			// A canceled search is the caller giving up, not that source
+			// being empty. Moving to the next source would keep the request
+			// alive after the caller is gone.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return Result{}, ctxErr
+			}
 			logf("%s: search failed: %v", src.Name(), err)
 			errs = append(errs, fmt.Errorf("%s: %w", src.Name(), err))
 			continue
@@ -254,11 +387,20 @@ func (c *Client) search(ctx context.Context, q subapi.Query) (Result, error) {
 			if used >= tries {
 				break
 			}
-			if ctx.Err() != nil {
-				return Result{}, ctx.Err()
+			if err := ctx.Err(); err != nil {
+				return Result{}, err
 			}
-			data, err := cand.Fetch(ctx)
+			if cand.ID == "" && skip[candidateKey(cand.Source, cand.Release)] {
+				// Same file listed again for another language; it still
+				// can't be translated, so don't pay to download it twice.
+				logf("%s: %s: already downloaded and can't be translated, skipping", src.Name(), cand.Release)
+				continue
+			}
+			data, err := await(ctx, cand.Fetch)
 			if err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return Result{}, ctxErr
+				}
 				// e.g. a season pack without our episode. costs a download
 				// but not worth stopping for.
 				logf("%s: %s: %v", src.Name(), cand.Release, err)

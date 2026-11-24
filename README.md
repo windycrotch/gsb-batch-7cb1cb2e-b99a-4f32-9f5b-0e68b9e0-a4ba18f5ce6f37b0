@@ -301,7 +301,14 @@ The client can analyze the video locally and send only the resulting onset/windo
 
 This means the machine holding the video still performs the audio analysis, while the server can handle subtitle providers and keep their credentials centralized.
 
-With `"translate": true` in the request (and a SubDL Pro key on the server), a title with no subtitle in the language asked for falls back to translation. A subtitle in another language is verified against the audio the usual way, then SubDL machine-translates it (told the season and episode, which it needs for a season pack). The translation is checked against the audio too. If it is too thin to pass on its own, it is only returned when its cue times are the verified file's (at least 80% of its cues within 0.1 s). A season pack's id can stand for every episode in it, so a translation of some other episode is dropped, not shipped. Off by default, since each translation costs a credit.
+With `"translate": true` in the request (and a SubDL Pro key on the server), a title with no subtitle in the language asked for falls back to translation. A subtitle in another language is verified against the audio the usual way, then SubDL machine-translates it (told the season and episode, which it needs for a season pack). The translation is checked against the audio too. If it is too thin to pass on its own, it is only returned when its cue times are the verified file's (at least 80% of its cues within 0.1 s). A season pack's id can stand for every episode in it, so a translation of some other episode is not shipped. Off by default, since each translation costs a credit.
+
+Two outcomes of that fallback are worth knowing about:
+
+* **A translation timed like another file** (not the verified one) is dropped, but the verified subtitle itself is still a correct subtitle for the video, so it is returned as the result — with `translated` unset and `lang`/`from_lang` left describing the file actually returned. The request doesn't fail and the paid translation isn't the only thing thrown away.
+* **A verified candidate with no id** can't be translated. It is remembered for the rest of that request, so when the next language's search lists the same file again it is skipped instead of being downloaded (and paid for) a second time.
+
+If the caller cancels the request or it times out, the search in progress stops: source searches, candidate downloads, translation polling and translation downloads all see the canceled context, and the handler answers `408` with an error the caller can tell apart from a `404` no-match. Concurrent requests have independent contexts and nothing is shared between them.
 
 ## Current limitations
 

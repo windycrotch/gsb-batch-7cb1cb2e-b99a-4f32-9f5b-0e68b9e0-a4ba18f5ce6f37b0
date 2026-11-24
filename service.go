@@ -2,6 +2,7 @@ package subtitles
 
 import (
 	"cmp"
+	"context"
 	"encoding/json"
 	"errors"
 	"log"
@@ -102,11 +103,7 @@ func Handler(sources []subapi.Source, logger *log.Logger) http.Handler {
 			Season: req.Season, Episode: req.Episode, Lang: req.Lang,
 		})
 		if err != nil {
-			if errors.Is(err, ErrNoMatch) {
-				httpError(w, http.StatusNotFound, err.Error())
-				return
-			}
-			httpError(w, http.StatusBadGateway, err.Error())
+			writeFetchError(w, r, err)
 			return
 		}
 
@@ -217,6 +214,28 @@ func mountAI(mux *http.ServeMux, s *subapi.SubDL) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(m.Raw)
 	})
+}
+
+// writeFetchError reports a failed fetch. A canceled request is not a "no
+// match": the caller can retry it, and a 404 would tell it to stop trying, so
+// that case gets its own status and leaves ErrNoMatch out of the body.
+func writeFetchError(w http.ResponseWriter, r *http.Request, err error) {
+	canceled := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+	if !canceled {
+		select {
+		case <-r.Context().Done():
+			canceled = true
+		default:
+		}
+	}
+	switch {
+	case canceled:
+		httpError(w, http.StatusRequestTimeout, "request canceled: "+err.Error())
+	case errors.Is(err, ErrNoMatch):
+		httpError(w, http.StatusNotFound, err.Error())
+	default:
+		httpError(w, http.StatusBadGateway, err.Error())
+	}
 }
 
 func decode(w http.ResponseWriter, r *http.Request, out any) bool {
