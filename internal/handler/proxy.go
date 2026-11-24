@@ -2,6 +2,8 @@ package handler
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log"
@@ -30,9 +32,27 @@ type CachedResponse struct {
 
 const cacheTTL = 1 * time.Hour // Cache expiration time
 
-// generateCacheKey creates a unique cache key based on the target URL and header parameters
-func generateCacheKey(targetURL string) string {
-	return "m3u8proxy_cache:" + targetURL
+// generateCacheKey creates a unique cache key that incorporates every request
+// condition that can change the upstream result: the target URL and the
+// effective Referer header that will be sent upstream. Hashing keeps the key
+// compact and safe for arbitrary referer values.
+func generateCacheKey(targetURL, effectiveReferer string) string {
+	sum := sha256.Sum256([]byte(targetURL + "\x00" + effectiveReferer))
+	return "m3u8proxy_cache:v2:" + hex.EncodeToString(sum[:])
+}
+
+// resolveUpstreamReferer determines the Referer header value that will actually
+// be sent to the upstream server for this request, mirroring the header logic
+// used when building the upstream request.
+func resolveUpstreamReferer(refererParam, targetOrigin string) string {
+	if refererParam != "" {
+		return refererParam
+	}
+	if config.Env.DefaultReferer != "" {
+		return config.Env.DefaultReferer
+	}
+	// Fall back to the target's own origin as a last resort
+	return targetOrigin + "/"
 }
 
 func M3U8ProxyHandler(c echo.Context) error {
@@ -50,16 +70,35 @@ func M3U8ProxyHandler(c echo.Context) error {
 		return c.String(http.StatusBadRequest, "Missing 'url' query parameter")
 	}
 
-	referer := c.QueryParam("referer")
-	var refererHeader string
-	if referer != "" {
-		unscaped, err := url.QueryUnescape(referer)
-		if err != nil {
-			log.Printf("Error unescaping referer: %v", err)
-			return c.String(http.StatusBadRequest, "Invalid 'referer' query parameter")
-		}
-		refererHeader = unscaped
+	if _, err := url.ParseRequestURI(targetURL); err != nil {
+		log.Printf("Invalid target URL: %s, error: %v", targetURL, err)
+		return c.String(http.StatusBadRequest, "Invalid 'url' query parameter")
 	}
+
+	// NOTE: echo already query-decodes parameters exactly once. Using the value
+	// as-is avoids double-unescaping referers that legitimately contain
+	// '%' or '+' characters.
+	refererParam := c.QueryParam("referer")
+
+	// Parse target URL to extract origin
+	parsedURL, err := url.Parse(targetURL)
+	if err != nil {
+		log.Printf("Invalid target URL: %s, error: %v", targetURL, err)
+		return c.String(http.StatusBadRequest, "Invalid 'url' query parameter")
+	}
+	targetOrigin := parsedURL.Scheme + "://" + parsedURL.Host
+
+	// The referer actually used for the upstream request. The same value is:
+	//  - sent as the Referer header upstream,
+	//  - folded into the cache key,
+	//  - propagated into rewritten segment/playlist URLs,
+	// so cached content always matches the referer it was rewritten for.
+	upstreamReferer := resolveUpstreamReferer(refererParam, targetOrigin)
+
+	// Detect resource type from the URL path so query strings don't confuse it
+	lowerPath := strings.ToLower(parsedURL.Path)
+	isM3U8 := strings.HasSuffix(lowerPath, ".m3u8")
+	isOtherStatic := utils.IsStaticFileExtension(targetURL)
 
 	/*
 		########################################################################################
@@ -67,15 +106,15 @@ func M3U8ProxyHandler(c echo.Context) error {
 		########################################################################################
 	*/
 	// if cache exists, we will use it
-	cacheKey := generateCacheKey(targetURL)
+	cacheKey := generateCacheKey(targetURL, upstreamReferer)
 	var cachedData CachedResponse
 
-	if config.IsAvailable {
+	if config.IsAvailable && config.Client != nil {
 		val, err := config.Client.Get(ctx, cacheKey).Result()
 		if err == nil { // Cache hit
 			err = json.Unmarshal([]byte(val), &cachedData)
-			if err == nil {
-				log.Printf("CACHE HIT for %s", targetURL)
+			if err == nil && cachedData.StatusCode >= 200 && cachedData.StatusCode < 300 && len(cachedData.Body) > 0 {
+				log.Printf("CACHE HIT for %s (referer: %s)", targetURL, upstreamReferer)
 				// Apply cached headers
 				for key, values := range cachedData.Headers {
 					for _, value := range values {
@@ -89,34 +128,26 @@ func M3U8ProxyHandler(c echo.Context) error {
 				}
 				return nil // Served from cache
 			}
-			log.Printf("Error unmarshalling cached data for %s: %v. Fetching from origin.", targetURL, err)
-			// Proceed to fetch from origin if unmarshal fails
+			if err != nil {
+				log.Printf("Error unmarshalling cached data for %s: %v. Fetching from origin.", targetURL, err)
+			} else {
+				// Defensive: never serve a cached error/empty payload.
+				log.Printf("Ignoring unusable cache entry for %s (status: %d). Fetching from origin.", targetURL, cachedData.StatusCode)
+			}
+			// Proceed to fetch from origin
 		} else if err != redis.Nil {
 			log.Printf("Redis GET error for key %s: %v. Fetching from origin.", cacheKey, err)
 			// Proceed to fetch from origin on other Redis errors
 		} else {
-			log.Printf("CACHE MISS for %s", targetURL)
+			log.Printf("CACHE MISS for %s (referer: %s)", targetURL, upstreamReferer)
 		}
 	}
-
-	_, err := url.ParseRequestURI(targetURL)
-	if err != nil {
-		log.Printf("Invalid target URL: %s, error: %v", targetURL, err)
-		return c.String(http.StatusBadRequest, "Invalid 'url' query parameter")
-	}
-	isM3U8 := strings.HasSuffix(strings.ToLower(targetURL), ".m3u8")
-	isTS := strings.HasSuffix(strings.ToLower(targetURL), ".ts")
-	isOtherStatic := utils.IsStaticFileExtension(targetURL)
 
 	req, err := http.NewRequest("GET", targetURL, nil)
 	if err != nil {
 		log.Printf("Error creating request to target %s: %v", targetURL, err)
 		return c.String(http.StatusInternalServerError, "Failed to create request to target server")
 	}
-
-	// Parse target URL to extract origin
-	parsedURL, _ := url.Parse(targetURL)
-	targetOrigin := parsedURL.Scheme + "://" + parsedURL.Host
 
 	// Set browser-like headers to bypass Cloudflare
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -131,23 +162,14 @@ func M3U8ProxyHandler(c echo.Context) error {
 	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
 	req.Header.Set("Sec-Ch-Ua-Platform", `"Windows"`)
 
-	// if the referer is provided, set it in the request headers
-	if refererHeader != "" {
-		req.Header.Set("Referer", refererHeader)
-		req.Header.Set("Origin", refererHeader)
-	} else if config.Env.DefaultReferer != "" {
-		req.Header.Set("Referer", config.Env.DefaultReferer)
-		req.Header.Set("Origin", strings.TrimSuffix(config.Env.DefaultReferer, "/"))
-	} else {
-		// Fall back to the target's own origin as a last resort
-		req.Header.Set("Referer", targetOrigin+"/")
-		req.Header.Set("Origin", targetOrigin)
-	}
+	// Send the referer we resolved above; rewritten URLs propagate the same value
+	req.Header.Set("Referer", upstreamReferer)
+	req.Header.Set("Origin", strings.TrimSuffix(upstreamReferer, "/"))
 
 	upstreamResp, err := utils.ProxyHTTPClient.Do(req)
 	if err != nil {
 		log.Printf("Error fetching target URL %s: %v", targetURL, err)
-		// Check for timeout or other specific errors if needed
+		// Nothing is written to the cache on failure paths.
 		if urlErr, ok := err.(*url.Error); ok && urlErr.Timeout() {
 			return c.String(http.StatusGatewayTimeout, "Upstream server timed out")
 		}
@@ -158,7 +180,7 @@ func M3U8ProxyHandler(c echo.Context) error {
 	rawBodyBytes, err := io.ReadAll(upstreamResp.Body)
 	if err != nil {
 		log.Printf("Error reading response body from upstream %s: %v", targetURL, err)
-		return c.String(http.StatusInternalServerError, "Failed to read response from upstream server")
+		return c.String(http.StatusBadGateway, "Failed to read response from upstream server")
 	}
 
 	var responseBodyBytes []byte
@@ -179,27 +201,25 @@ func M3U8ProxyHandler(c echo.Context) error {
 		}
 	}
 
-	if (isM3U8 || isTS) && upstreamResp.StatusCode == http.StatusOK {
+	// Only playlists are rewritten. Segments (.ts) are binary payloads and must
+	// be proxied byte-for-byte; running them through the text transformer would
+	// corrupt them.
+	if isM3U8 && upstreamResp.StatusCode == http.StatusOK {
 		var transformedBodyBuffer bytes.Buffer
 		proxyRoutePath := strings.TrimPrefix(c.Path(), "/")
 		urlPrefix := proxyRoutePath + "?url="
 
-		// Determine which referer to propagate into rewritten URLs
-		propagatedReferer := refererHeader
-		if propagatedReferer == "" {
-			propagatedReferer = config.Env.DefaultReferer
-		}
-
-		err = utils.ProcessM3U8Stream(bytes.NewReader(rawBodyBytes), &transformedBodyBuffer, targetURL, urlPrefix, propagatedReferer)
+		// Propagate the exact referer used for this upstream request so nested
+		// playlists/segments requested through the proxy keep the same origin,
+		// and so their cache keys line up with a direct request using that referer.
+		err = utils.ProcessM3U8Stream(bytes.NewReader(rawBodyBytes), &transformedBodyBuffer, targetURL, urlPrefix, upstreamReferer)
 		if err != nil {
 			log.Printf("Error processing M3U8 stream for %s: %v", targetURL, err)
 			return c.String(http.StatusInternalServerError, "Error transforming M3U8 content")
 		}
 		responseBodyBytes = transformedBodyBuffer.Bytes()
 		// Force correct Content-Type for m3u8 playlists regardless of what upstream sent
-		if isM3U8 {
-			responseHeadersToClient.Set("Content-Type", "application/x-mpegURL")
-		}
+		responseHeadersToClient.Set("Content-Type", "application/x-mpegURL")
 		// Content-Length is not set from upstream as body is transformed
 	} else {
 		// No transformation or non-OK status
@@ -210,31 +230,22 @@ func M3U8ProxyHandler(c echo.Context) error {
 		}
 	}
 
-	// Prepare bodyToServe for sending to client
-	bodyToServe := bytes.NewReader(responseBodyBytes)
-	for key, values := range responseHeadersToClient {
-		for _, value := range values {
-			c.Response().Header().Set(key, value)
-		}
-	}
-
-	c.Response().WriteHeader(upstreamResp.StatusCode)
-
-	_, err = io.Copy(c.Response().Writer, bodyToServe)
-	if err != nil {
-		log.Printf("Error writing response body to client for %s: %v", targetURL, err)
-	}
-
 	/*
 		########################################################################################
 		#                          Cache the response if Redis is available
 		########################################################################################
 	*/
-	if config.IsAvailable && (upstreamResp.StatusCode == http.StatusOK || upstreamResp.StatusCode == http.StatusPartialContent) {
-		// We need to cache the headers that we sent to the client.
-		// So, use c.Response().Header() (after they've been set, but before body is fully written).
-		// Or more reliably, use the `responseHeadersToClient` we constructed.
-
+	// Only fully successful responses (body completely read, and for playlists
+	// the transformation already done above) are eligible for caching. A partial
+	// (206) playlist is never cached since it was not fully transformed.
+	// Failures never touch the cache, so a failed request can neither poison
+	// the key nor evict a good entry written concurrently by another request.
+	// The whole entry is written with a single atomic SET, so concurrent
+	// writers can only replace a complete entry with another complete entry
+	// for the same key.
+	cacheable := upstreamResp.StatusCode == http.StatusOK ||
+		(upstreamResp.StatusCode == http.StatusPartialContent && !isM3U8)
+	if config.IsAvailable && config.Client != nil && cacheable {
 		cacheEntry := CachedResponse{
 			StatusCode: upstreamResp.StatusCode,
 			Headers:    responseHeadersToClient, // Use the headers we decided to send
@@ -251,6 +262,21 @@ func M3U8ProxyHandler(c echo.Context) error {
 				log.Printf("CACHED %s (key: %s)", targetURL, cacheKey)
 			}
 		}
+	}
+
+	// Prepare bodyToServe for sending to client
+	bodyToServe := bytes.NewReader(responseBodyBytes)
+	for key, values := range responseHeadersToClient {
+		for _, value := range values {
+			c.Response().Header().Set(key, value)
+		}
+	}
+
+	c.Response().WriteHeader(upstreamResp.StatusCode)
+
+	_, err = io.Copy(c.Response().Writer, bodyToServe)
+	if err != nil {
+		log.Printf("Error writing response body to client for %s: %v", targetURL, err)
 	}
 
 	return nil
