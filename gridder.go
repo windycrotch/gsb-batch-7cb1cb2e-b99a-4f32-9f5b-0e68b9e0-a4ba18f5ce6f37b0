@@ -2,8 +2,11 @@ package gridder
 
 import (
 	"errors"
+	"image"
 	"image/color"
+	"image/png"
 	"io"
+	"sync"
 
 	"github.com/fogleman/gg"
 	"golang.org/x/image/font"
@@ -37,28 +40,64 @@ func New(imageConfig ImageConfig, gridConfig GridConfig) (*Gridder, error) {
 }
 
 // Gridder gridder structure
+//
+// The mutex guards the underlying drawing context. All drawing operations and
+// exports hold it for the whole time they touch the canvas, so concurrent
+// callers never observe a half-drawn state and cannot trigger a data race.
 type Gridder struct {
+	mu          sync.Mutex
 	imageConfig ImageConfig
 	gridConfig  GridConfig
 	ctx         *gg.Context
 }
 
 // SavePNG saves to PNG
+//
+// The grid lines and border are painted onto a throwaway snapshot of the
+// canvas, never onto the canvas itself, so exporting any number of times
+// always yields the same pixels and never thickens the lines or shifts the
+// dash phase.
 func (g *Gridder) SavePNG() error {
-	g.paintGrid()
-	g.paintBorder()
-	return g.ctx.SavePNG(g.imageConfig.GetName())
+	image := g.renderImage()
+	return gg.SavePNG(g.imageConfig.GetName(), image)
 }
 
 // EncodePNG encodes the image as a PNG and writes it to the provided io.Writer.
+//
+// As with SavePNG, the grid lines and border are composited onto a snapshot,
+// so the canvas is left untouched. A failing writer cannot pollute the canvas:
+// the snapshot is built before anything is written, and a later export retries
+// from the very same canvas state.
 func (g *Gridder) EncodePNG(w io.Writer) error {
-	g.paintGrid()
-	g.paintBorder()
-	return g.ctx.EncodePNG(w)
+	image := g.renderImage()
+	return png.Encode(w, image)
+}
+
+// renderImage produces a complete, consistent snapshot of the canvas with the
+// grid lines and border composited on top. The caller-visible canvas is never
+// modified, which makes repeated, interleaved and failing exports idempotent.
+func (g *Gridder) renderImage() image.Image {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	// NewContextForImage copies the pixels into a fresh image.RGBA, so the
+	// grid and border strokes below cannot leak back into the canvas.
+	exportCtx := gg.NewContextForImage(g.ctx.Image())
+	margin := float64(g.gridConfig.GetMarginWidth())
+	exportCtx.Translate(margin, margin)
+	g.paintGrid(exportCtx)
+	g.paintBorder(exportCtx)
+	return exportCtx.Image()
 }
 
 // PaintCell paints Cell
-func (g *Gridder) PaintCell(row int, column int, color color.Color) error {
+func (g *Gridder) PaintCell(row int, column int, c color.Color) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.paintCell(row, column, c)
+}
+
+func (g *Gridder) paintCell(row int, column int, c color.Color) error {
 	err := g.verifyInBounds(row, column)
 	if err != nil {
 		return err
@@ -67,11 +106,17 @@ func (g *Gridder) PaintCell(row int, column int, color color.Color) error {
 	cellWidth, cellHeight := g.getCellDimensions()
 	paintWidth := cellWidth - g.gridConfig.GetLineStrokeWidth()
 	paintHeight := cellHeight - g.gridConfig.GetLineStrokeWidth()
-	return g.DrawRectangle(row, column, RectangleConfig{Width: paintWidth, Height: paintHeight, Color: color})
+	return g.drawRectangle(row, column, RectangleConfig{Width: paintWidth, Height: paintHeight, Color: c})
 }
 
 // DrawRectangle draws a rectangle in a cell
 func (g *Gridder) DrawRectangle(row int, column int, rectangleConfigs ...RectangleConfig) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.drawRectangle(row, column, rectangleConfigs...)
+}
+
+func (g *Gridder) drawRectangle(row int, column int, rectangleConfigs ...RectangleConfig) error {
 	err := g.verifyInBounds(row, column)
 	if err != nil {
 		return err
@@ -107,6 +152,12 @@ func (g *Gridder) DrawRectangle(row int, column int, rectangleConfigs ...Rectang
 
 // DrawCircle draws a circle in a cell
 func (g *Gridder) DrawCircle(row int, column int, circleConfigs ...CircleConfig) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.drawCircle(row, column, circleConfigs...)
+}
+
+func (g *Gridder) drawCircle(row int, column int, circleConfigs ...CircleConfig) error {
 	err := g.verifyInBounds(row, column)
 	if err != nil {
 		return err
@@ -136,6 +187,12 @@ func (g *Gridder) DrawCircle(row int, column int, circleConfigs ...CircleConfig)
 
 // DrawPath draws a path between two cells
 func (g *Gridder) DrawPath(row1 int, column1 int, row2 int, column2 int, pathConfigs ...PathConfig) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.drawPath(row1, column1, row2, column2, pathConfigs...)
+}
+
+func (g *Gridder) drawPath(row1 int, column1 int, row2 int, column2 int, pathConfigs ...PathConfig) error {
 	err := g.verifyInBounds(row1, column1)
 	if err != nil {
 		return err
@@ -167,6 +224,12 @@ func (g *Gridder) DrawPath(row1 int, column1 int, row2 int, column2 int, pathCon
 
 // DrawLine draws a line in a cell
 func (g *Gridder) DrawLine(row int, column int, lineConfigs ...LineConfig) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.drawLine(row, column, lineConfigs...)
+}
+
+func (g *Gridder) drawLine(row int, column int, lineConfigs ...LineConfig) error {
 	err := g.verifyInBounds(row, column)
 	if err != nil {
 		return err
@@ -198,6 +261,12 @@ func (g *Gridder) DrawLine(row int, column int, lineConfigs ...LineConfig) error
 
 // DrawString draws a string in a cell
 func (g *Gridder) DrawString(row int, column int, text string, fontFace font.Face, stringConfigs ...StringConfig) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.drawString(row, column, text, fontFace, stringConfigs...)
+}
+
+func (g *Gridder) drawString(row int, column int, text string, fontFace font.Face, stringConfigs ...StringConfig) error {
 	err := g.verifyInBounds(row, column)
 	if err != nil {
 		return err
@@ -221,65 +290,65 @@ func (g *Gridder) paintBackground() {
 	g.ctx.Clear()
 }
 
-func (g *Gridder) paintGrid() {
+func (g *Gridder) paintGrid(ctx *gg.Context) {
 	canvasWidth, canvasHeight := g.getGridDimensions()
 	cellWidth, cellHeight := g.getCellDimensions()
 
 	columns := float64(g.gridConfig.GetColumns())
 
-	g.ctx.Push()
+	ctx.Push()
 	for i := 1.0; i < columns; i++ {
 		x := i * cellWidth
-		g.ctx.MoveTo(x, 0)
-		g.ctx.LineTo(x, canvasHeight)
+		ctx.MoveTo(x, 0)
+		ctx.LineTo(x, canvasHeight)
 	}
 
 	rows := float64(g.gridConfig.GetRows())
 	for i := 1.0; i < rows; i++ {
 		y := i * cellHeight
-		g.ctx.MoveTo(0, y)
-		g.ctx.LineTo(canvasWidth, y)
+		ctx.MoveTo(0, y)
+		ctx.LineTo(canvasWidth, y)
 	}
 
 	dashes := g.gridConfig.GetLineDashes()
 	if dashes > 0 {
-		g.ctx.SetDash(dashes)
+		ctx.SetDash(dashes)
 	} else {
-		g.ctx.SetDash()
+		ctx.SetDash()
 	}
-	g.ctx.SetColor(g.gridConfig.GetLineColor())
-	g.ctx.SetLineWidth(g.gridConfig.GetLineStrokeWidth())
-	g.ctx.Stroke()
-	g.ctx.Pop()
+	ctx.SetColor(g.gridConfig.GetLineColor())
+	ctx.SetLineWidth(g.gridConfig.GetLineStrokeWidth())
+	ctx.Stroke()
+	ctx.Pop()
 }
 
-func (g *Gridder) paintBorder() {
+func (g *Gridder) paintBorder(ctx *gg.Context) {
 	canvasWidth, canvasHeight := g.getGridDimensions()
 	cellWidth, cellHeight := g.getCellDimensions()
 
 	columns := float64(g.gridConfig.GetColumns())
-	g.ctx.Push()
-	g.ctx.MoveTo(0, 0)
-	g.ctx.LineTo(0, canvasHeight)
-	g.ctx.MoveTo(cellWidth*columns, 0)
-	g.ctx.LineTo(cellWidth*columns, canvasHeight)
+	ctx.Push()
+	ctx.MoveTo(0, 0)
+	ctx.LineTo(0, canvasHeight)
+	ctx.MoveTo(cellWidth*columns, 0)
+	ctx.LineTo(cellWidth*columns, canvasHeight)
 
 	rows := float64(g.gridConfig.GetRows())
-	g.ctx.MoveTo(0, 0)
-	g.ctx.LineTo(canvasWidth, 0)
-	g.ctx.MoveTo(0, cellHeight*rows)
-	g.ctx.LineTo(canvasWidth, cellHeight*rows)
+	ctx.MoveTo(0, 0)
+	ctx.LineTo(canvasWidth, 0)
+	ctx.MoveTo(0, cellHeight*rows)
+	ctx.LineTo(canvasWidth, cellHeight*rows)
 
 	dashes := g.gridConfig.GetBorderDashes()
 	if dashes > 0 {
-		g.ctx.SetDash(dashes)
+		ctx.SetDash(dashes)
 	} else {
-		g.ctx.SetDash()
+		ctx.SetDash()
 	}
-	g.ctx.SetLineWidth(g.gridConfig.GetBorderStrokeWidth())
-	g.ctx.SetColor(g.gridConfig.GetBorderColor())
-	g.ctx.Stroke()
-	g.ctx.Pop()
+	ctx.SetLineWidth(g.gridConfig.GetBorderStrokeWidth())
+	ctx.SetColor(g.gridConfig.GetBorderColor())
+	ctx.Stroke()
+	ctx.Pop()
 }
 
 func (g *Gridder) getCellDimensions() (float64, float64) {
