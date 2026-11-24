@@ -1,6 +1,7 @@
 package netease
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -38,71 +39,141 @@ func ListQualityOptions() []model.AudioQualityOption {
 
 // AvailableQualityOptions 用当前账号探测网易云的播放接口。实际权益以返回的
 // 音频流为准，而不是只看单独的 VIP 标记。
+//
+// 同一实例上的并发调用共享同一次探测：等待者拿到与发起者完全相同的档位列表，
+// 不会出现一半调用看到空列表、另一半看到完整列表的撕裂结果。只有探测成功且
+// 非空的结果才会被缓存，探测失败不会被永久固化，后续调用可以重新探测。
 func (n *Netease) AvailableQualityOptions() ([]model.AudioQualityOption, error) {
-	if n.availableQualityCache != nil {
-		return append([]model.AudioQualityOption(nil), n.availableQualityCache...), nil
-	}
+	const maxAttempts = 4
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		accountKey := n.accountCacheKey()
 
+		n.stateMu.Lock()
+		if n.availableQualityCache != nil &&
+			n.availableQualityCacheKey == accountKey &&
+			neteaseNow().Before(n.availableQualityExpiresAt) {
+			options := cloneQualityOptions(n.availableQualityCache)
+			n.stateMu.Unlock()
+			return options, nil
+		}
+		if call := n.qualityProbe; call != nil && call.accountKey == accountKey {
+			n.stateMu.Unlock()
+			// 等待正在进行的同账号探测，拿到完全一致的结果。
+			<-call.done
+			if n.accountCacheKey() != accountKey {
+				continue // Cookie 在等待期间被切换，重新按新账号探测。
+			}
+			return cloneQualityOptions(call.options), call.err
+		}
+		call := &neteaseQualityProbeCall{
+			accountKey: accountKey,
+			done:       make(chan struct{}),
+		}
+		n.qualityProbe = call
+		n.stateMu.Unlock()
+
+		options, transient, err := n.probeAvailableQualityOptions()
+
+		n.stateMu.Lock()
+		call.options = options
+		call.err = err
+		if n.qualityProbe == call {
+			n.qualityProbe = nil
+		}
+		// 只有成功且非空的结果才缓存，且必须仍是同一个账号。失败的探测保持
+		// 不缓存，下一次调用会重新探测；探测中出现临时网络错误时也不缓存，
+		// 避免把一次抖动当成账号权益固化下来。
+		accountChanged := n.accountKeyLocked() != accountKey
+		if err == nil && len(options) > 0 && !transient && !accountChanged {
+			n.availableQualityCache = cloneQualityOptions(options)
+			n.availableQualityCacheKey = accountKey
+			n.availableQualityExpiresAt = neteaseNow().Add(availableQualityCacheTTL)
+		}
+		n.stateMu.Unlock()
+
+		close(call.done)
+		if accountChanged {
+			// Cookie 在探测期间被切换：这批结果属于旧账号，不能返回给调用方，
+			// 按新账号重新探测。
+			continue
+		}
+		return cloneQualityOptions(options), err
+	}
+	return nil, fmt.Errorf("netease quality probe aborted: account cookie changed repeatedly")
+}
+
+func cloneQualityOptions(options []model.AudioQualityOption) []model.AudioQualityOption {
+	if options == nil {
+		return nil
+	}
+	return append([]model.AudioQualityOption(nil), options...)
+}
+
+// probeAvailableQualityOptions 依次探测固定歌曲和搜索到的歌曲。任何一档探测
+// 成功即得到该账号的能力区间；全部失败才返回错误。transient 表示探测期间遇到
+// 了网络/解析等临时错误，此时结果不应被缓存，以免把一次抖动当成账号权益。
+func (n *Netease) probeAvailableQualityOptions() (options []model.AudioQualityOption, transient bool, err error) {
 	fixedProbeSong := &model.Song{
 		Source: "netease",
 		ID:     neteaseQualityProbeSongID,
 	}
-	options, firstErr := n.probeNeteaseQualityLadder([]*model.Song{fixedProbeSong})
-	if len(options) == 0 {
-		probeSongs := make([]*model.Song, 0, 5)
-		probeSongs = append(probeSongs, fixedProbeSong)
-		seenSongIDs := map[string]struct{}{neteaseQualityProbeSongID: {}}
-		if songs, err := n.Search(neteaseQualityProbeKeyword); err == nil {
-			for i := range songs {
-				if i >= 4 {
-					break
-				}
-				if _, exists := seenSongIDs[songs[i].ID]; exists {
-					continue
-				}
-				if songs[i].Source == "" {
-					songs[i].Source = "netease"
-				}
-				seenSongIDs[songs[i].ID] = struct{}{}
-				probeSongs = append(probeSongs, &songs[i])
+	options, transient, firstErr := n.probeNeteaseQualityLadder([]*model.Song{fixedProbeSong})
+	if len(options) > 0 {
+		return options, transient, nil
+	}
+
+	probeSongs := make([]*model.Song, 0, 5)
+	probeSongs = append(probeSongs, fixedProbeSong)
+	seenSongIDs := map[string]struct{}{neteaseQualityProbeSongID: {}}
+	if songs, err := n.Search(neteaseQualityProbeKeyword); err == nil {
+		for i := range songs {
+			if i >= 4 {
+				break
 			}
-		}
-		options, searchErr := n.probeNeteaseQualityLadder(probeSongs)
-		if firstErr == nil {
-			firstErr = searchErr
-		}
-		if len(options) > 0 {
-			n.availableQualityCache = append([]model.AudioQualityOption(nil), options...)
-			return append([]model.AudioQualityOption(nil), options...), nil
+			if _, exists := seenSongIDs[songs[i].ID]; exists {
+				continue
+			}
+			if songs[i].Source == "" {
+				songs[i].Source = "netease"
+			}
+			seenSongIDs[songs[i].ID] = struct{}{}
+			probeSongs = append(probeSongs, &songs[i])
 		}
 	}
-	if len(options) > 0 {
-		n.availableQualityCache = append([]model.AudioQualityOption(nil), options...)
-		return append([]model.AudioQualityOption(nil), options...), nil
+	searchOptions, searchTransient, searchErr := n.probeNeteaseQualityLadder(probeSongs)
+	transient = transient || searchTransient
+	if len(searchOptions) > 0 {
+		return searchOptions, transient, nil
+	}
+	if firstErr == nil {
+		firstErr = searchErr
 	}
 	if firstErr != nil {
-		return nil, firstErr
+		return nil, transient, firstErr
 	}
-	n.availableQualityCache = []model.AudioQualityOption{}
-	return []model.AudioQualityOption{}, nil
+	return []model.AudioQualityOption{}, transient, nil
 }
 
 func (n *Netease) probeNeteaseQualityLadder(
 	probeSongs []*model.Song,
-) ([]model.AudioQualityOption, error) {
+) ([]model.AudioQualityOption, bool, error) {
 	var firstErr error
+	transient := false
 	for candidateIndex, candidate := range neteaseQualityCandidates {
 		for _, song := range probeSongs {
 			_, err := n.GetDownloadURLWithQuality(song, string(candidate.option.Value))
 			if err == nil {
-				return neteaseQualityLadderFrom(candidateIndex), nil
+				return neteaseQualityLadderFrom(candidateIndex), transient, nil
+			}
+			if isNeteaseTransientError(err) {
+				transient = true
 			}
 			if firstErr == nil {
 				firstErr = err
 			}
 		}
 	}
-	return nil, firstErr
+	return nil, transient, firstErr
 }
 
 // neteaseQualityLadderFrom 返回探测成功的档位及其全部更低档位。账号权益是一个
@@ -246,5 +317,32 @@ func neteaseQualityAtLeast(actual model.AudioQuality, requested model.AudioQuali
 }
 
 func neteaseQualityError(quality string) error {
-	return fmt.Errorf("netease audio quality %s is unavailable for this song or account", quality)
+	return fmt.Errorf("%w: %s is unavailable for this song or account", errNeteaseQualityUnavailable, quality)
+}
+
+var errNeteaseQualityUnavailable = errors.New("netease audio quality unavailable")
+
+// isNeteaseTransientError 区分“临时拿不到”和“账号/歌曲本来就没有该档位”：
+// 空地址、降级和明确不可用属于权益结论；网络、编解码、HTTP 状态等属于临时
+// 故障，不应被当成探测结论缓存。
+func isNeteaseTransientError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errNeteaseQualityUnavailable) {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	permanentMarkers := []string{
+		"unavailable for this song or account",
+		"eapi download url not found",
+		"download url not found",
+		"netease returned",
+	}
+	for _, marker := range permanentMarkers {
+		if strings.Contains(message, marker) {
+			return false
+		}
+	}
+	return true
 }

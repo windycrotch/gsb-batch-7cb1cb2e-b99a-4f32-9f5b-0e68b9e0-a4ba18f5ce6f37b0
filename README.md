@@ -76,6 +76,25 @@ n := netease.New(os.Getenv("NETEASE_COOKIE")) // 自动补齐客户端标识
 options, err := n.AvailableQualityOptions()   // 按账号实际权益返回，最高可用音质排在最前
 ```
 
+### 账号一致性
+
+`Netease` 实例以 Cookie 绑定一个账号，音质探测、VIP 状态和下载地址缓存都只对
+该账号有效：
+
+- `AvailableQualityOptions` 的探测结果只反映当前实例 Cookie 的权益。失败（例如
+  全部档位都拿不到）不会被永久固化，下一次调用会重新探测；探测过程中出现网络
+  抖动同样不会写入缓存。
+- 同一实例上的并发调用共享一次探测，等待者拿到与发起者完全一致的档位列表，不会
+  出现部分调用拿到空列表、部分调用拿到完整列表的撕裂结果。
+- 下载地址缓存按“账号 + 歌曲 + 档位”隔离，换 Cookie 后不会命中旧账号条目；
+  同一歌曲同一档位在有效期内复用地址，过期后重新请求。
+- 请求档位高于账号实际可用档位时返回明确错误（`netease audio quality ... is
+  unavailable for this song or account`），不会用低档位地址冒充；接口临时失败
+  返回空地址时也不会写入缓存。
+
+切换账号请使用实例的登录流程（`CheckQRLogin` 成功）或重新 `New` 一个实例，不要在
+并发请求过程中直接改写底层 Cookie 字段。
+
 ## Soda 扫码登录
 
 `soda.CreateQRLogin` / `soda.CheckQRLogin` 目前仍处于调试状态。汽水音乐新版 PC 官方 passport 扫码流程依赖动态 `a_bogus` / `msToken` 风控签名，当前实现尚未调通完整登录链路，调用方不要把它作为稳定扫码登录能力暴露给用户。

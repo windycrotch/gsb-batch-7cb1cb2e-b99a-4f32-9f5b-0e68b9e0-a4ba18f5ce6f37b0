@@ -39,7 +39,7 @@ func (n *Netease) GetTopLists() ([]model.TopList, error) {
 	body, err := utils.Post(TopListAPI, strings.NewReader(""),
 		utils.WithHeader("Referer", Referer),
 		utils.WithHeader("Content-Type", "application/x-www-form-urlencoded"),
-		utils.WithHeader("Cookie", n.cookie),
+		utils.WithHeader("Cookie", n.cookieSnapshot()),
 		utils.WithRandomIPHeader(),
 	)
 	if err != nil {

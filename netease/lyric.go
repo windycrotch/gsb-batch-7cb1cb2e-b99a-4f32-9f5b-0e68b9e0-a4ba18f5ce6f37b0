@@ -41,7 +41,7 @@ func (n *Netease) GetLyrics(s *model.Song) (string, error) {
 	headers := []utils.RequestOption{
 		utils.WithHeader("Referer", Referer),
 		utils.WithHeader("Content-Type", "application/x-www-form-urlencoded"),
-		utils.WithHeader("Cookie", n.cookie),
+		utils.WithHeader("Cookie", n.cookieSnapshot()),
 		utils.WithRandomIPHeader(),
 	}
 

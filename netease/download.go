@@ -49,7 +49,14 @@ func (n *Netease) getDownloadURL(s *model.Song, levels []string, allowFallback b
 		songID = s.Extra["song_id"]
 	}
 
-	if cached, ok := n.getCachedDownloadURL(songID, strings.Join(levels, ",")); ok {
+	// 整个请求绑定同一账号快照：请求期间即使发生登录/切换，也不会把 A 账号
+	// 拿到的地址写到 B 账号的缓存里。账号键从同一个快照推导，避免两次读取之间
+	// 被切换导致键与请求所用 Cookie 不一致。
+	cookie := n.cookieSnapshot()
+	accountKey := utils.MD5(cookie)
+	levelKey := strings.Join(levels, ",")
+
+	if cached, ok := n.getCachedDownloadURL(accountKey, songID, levelKey); ok {
 		if cached.ext != "" {
 			s.Ext = cached.ext
 		}
@@ -57,7 +64,7 @@ func (n *Netease) getDownloadURL(s *model.Song, levels []string, allowFallback b
 	}
 
 	for _, level := range levels {
-		url, ext, bitrate, actualLevel, err := n.getEAPIDownloadURL(songID, level)
+		url, ext, bitrate, actualLevel, err := n.getEAPIDownloadURL(songID, level, cookie)
 		if err == nil && url != "" {
 			requestedLevel, ok := neteaseQualityForLevel(level)
 			if !ok {
@@ -68,12 +75,12 @@ func (n *Netease) getDownloadURL(s *model.Song, levels []string, allowFallback b
 				continue
 			}
 			s.Ext = ext
-			n.setCachedDownloadURL(songID, strings.Join(levels, ","), url, s.Ext)
+			n.setCachedDownloadURL(accountKey, songID, levelKey, url, s.Ext)
 			return url, nil
 		}
 	}
 	if !allowFallback {
-		return "", neteaseQualityError(strings.Join(levels, ","))
+		return "", neteaseQualityError(levelKey)
 	}
 
 	br := 320000
@@ -107,14 +114,15 @@ func (n *Netease) getDownloadURL(s *model.Song, levels []string, allowFallback b
 	form.Set("params", params)
 	form.Set("encSecKey", encSecKey)
 
+	weapiEndpoint := neteaseDownloadWeAPIEndpoint
 	headers := []utils.RequestOption{
 		utils.WithHeader("Referer", Referer),
 		utils.WithHeader("Content-Type", "application/x-www-form-urlencoded"),
-		utils.WithHeader("Cookie", n.cookie),
+		utils.WithHeader("Cookie", cookie),
 		utils.WithRandomIPHeader(),
 	}
 
-	body, err := utils.Post(DownloadAPI, strings.NewReader(form.Encode()), headers...)
+	body, err := utils.Post(weapiEndpoint, strings.NewReader(form.Encode()), headers...)
 	if err != nil {
 		return "", err
 	}
@@ -139,6 +147,6 @@ func (n *Netease) getDownloadURL(s *model.Song, levels []string, allowFallback b
 			expectedBr,
 		)
 	}
-	n.setCachedDownloadURL(songID, strings.Join(levels, ","), resp.Data[0].URL, s.Ext)
+	n.setCachedDownloadURL(accountKey, songID, levelKey, resp.Data[0].URL, s.Ext)
 	return resp.Data[0].URL, nil
 }

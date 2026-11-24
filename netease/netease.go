@@ -29,10 +29,29 @@ const (
 	RecommendedPlaylistAPI = "https://music.163.com/weapi/personalized/playlist"
 )
 
+// Netease 是一个账号绑定实例：探测出的音质权益、VIP 状态和下载地址缓存都只
+// 对创建/登录时的 Cookie 有效。并发调用会共享同一次探测，不会看到半成品结果。
 type Netease struct {
-	cookie                string
-	isVipCache            *bool
-	availableQualityCache []model.AudioQualityOption
+	cookie   string
+	cookieMu sync.RWMutex
+
+	// stateMu 保护账号级缓存。网络请求期间不会持有该锁。
+	stateMu                   sync.Mutex
+	isVipCache                *bool
+	isVipCacheKey             string
+	availableQualityCache     []model.AudioQualityOption
+	availableQualityCacheKey  string
+	availableQualityExpiresAt time.Time
+	qualityProbe              *neteaseQualityProbeCall
+}
+
+// neteaseQualityProbeCall 表示一次进行中的音质探测。并发调用者等待同一个
+// done 通道，从而拿到完全一致的结果，而不是各自探测出不同的档位集合。
+type neteaseQualityProbeCall struct {
+	accountKey string
+	done       chan struct{}
+	options    []model.AudioQualityOption
+	err        error
 }
 
 type neteaseLinkKind string
@@ -74,8 +93,23 @@ var vipStatusCache = struct {
 	items map[string]cachedVIPStatus
 }{items: make(map[string]cachedVIPStatus)}
 
-const downloadURLCacheTTL = 10 * time.Minute
-const vipStatusCacheTTL = 10 * time.Minute
+// 这些 TTL 用变量而不是常量，测试可以缩短它们来验证过期后的重新探测/重取。
+var (
+	downloadURLCacheTTL      = 10 * time.Minute
+	vipStatusCacheTTL        = 10 * time.Minute
+	availableQualityCacheTTL = 10 * time.Minute
+	// neteaseNow 让缓存过期逻辑可测试。
+	neteaseNow = time.Now
+)
+
+// 探测与下载都通过这几个入口发请求。保留常量给调用方引用，同时用变量承接，
+// 测试可以指向本地 httptest 服务器而不触碰真实网易云接口。
+var (
+	neteaseSearchEndpoint        = SearchAPI
+	neteaseDownloadWeAPIEndpoint = DownloadAPI
+	neteaseDownloadEAPIEndpoint  = DownloadEAPI
+	neteaseUserAccountEndpoint   = UserAccountAPI
+)
 
 // New 创建网易云客户端。Cookie 会保留调用方的登录字段，并在缺失时补上高档
 // 音质需要的 PC 客户端标识；调用方传入的 os/appver 不会被覆盖。
@@ -83,36 +117,70 @@ func New(cookie string) *Netease { return &Netease{cookie: withClientIdentity(co
 
 var defaultNetease = New("")
 
-func (n *Netease) vipStatusCacheKey() string {
-	return utils.MD5(n.cookie)
+// cookieSnapshot 返回当前 Cookie 的一致快照，避免读取与登录写入并发竞争。
+func (n *Netease) cookieSnapshot() string {
+	n.cookieMu.RLock()
+	defer n.cookieMu.RUnlock()
+	return n.cookie
 }
 
-func (n *Netease) getCachedVIPStatus() (bool, bool) {
-	key := n.vipStatusCacheKey()
-	now := time.Now()
+// accountCacheKey 是账号级缓存的隔离键。不同 Cookie（不同账号）绝不会共享
+// 探测结果或下载地址。
+func (n *Netease) accountCacheKey() string {
+	return utils.MD5(n.cookieSnapshot())
+}
+
+// setCookie 更新实例 Cookie，并让所有账号级缓存失效。QR 登录成功或上层切换
+// 账号时必须走这里，否则新账号会继续命中旧账号的探测结果和地址。
+func (n *Netease) setCookie(cookie string) {
+	identity := withClientIdentity(cookie)
+
+	oldAccountKey := n.accountCacheKey()
+	n.cookieMu.Lock()
+	n.cookie = identity
+	n.cookieMu.Unlock()
+
+	n.stateMu.Lock()
+	n.resetAccountStateLocked()
+	n.stateMu.Unlock()
+
+	// 账号键已变，旧账号的地址不会再被命中；顺手清掉，避免长期占用内存。
+	purgeAccountDownloadURLCache(oldAccountKey)
+}
+
+// resetAccountStateLocked 清空账号级缓存。调用方必须持有 stateMu。
+func (n *Netease) resetAccountStateLocked() {
+	n.isVipCache = nil
+	n.isVipCacheKey = ""
+	n.availableQualityCache = nil
+	n.availableQualityCacheKey = ""
+	n.availableQualityExpiresAt = time.Time{}
+	n.qualityProbe = nil
+}
+
+func (n *Netease) getCachedVIPStatus(accountKey string) (bool, bool) {
+	now := neteaseNow()
 
 	vipStatusCache.Lock()
 	defer vipStatusCache.Unlock()
 
-	item, ok := vipStatusCache.items[key]
+	item, ok := vipStatusCache.items[accountKey]
 	if !ok {
 		return false, false
 	}
 	if now.After(item.expiresAt) {
-		delete(vipStatusCache.items, key)
+		delete(vipStatusCache.items, accountKey)
 		return false, false
 	}
 	return item.isVip, true
 }
 
-func (n *Netease) setCachedVIPStatus(isVip bool) {
-	key := n.vipStatusCacheKey()
-
+func (n *Netease) setCachedVIPStatus(accountKey string, isVip bool) {
 	vipStatusCache.Lock()
 	defer vipStatusCache.Unlock()
-	vipStatusCache.items[key] = cachedVIPStatus{
+	vipStatusCache.items[accountKey] = cachedVIPStatus{
 		isVip:     isVip,
-		expiresAt: time.Now().Add(vipStatusCacheTTL),
+		expiresAt: neteaseNow().Add(vipStatusCacheTTL),
 	}
 }
 
@@ -136,11 +204,11 @@ func (n *Netease) cloudSearch(keyword string, searchType int, limit int) ([]byte
 	headers := []utils.RequestOption{
 		utils.WithHeader("Referer", Referer),
 		utils.WithHeader("Content-Type", "application/x-www-form-urlencoded"),
-		utils.WithHeader("Cookie", n.cookie),
+		utils.WithHeader("Cookie", n.cookieSnapshot()),
 		utils.WithRandomIPHeader(),
 	}
 
-	return utils.Post(SearchAPI, strings.NewReader(form.Encode()), headers...)
+	return utils.Post(neteaseSearchEndpoint, strings.NewReader(form.Encode()), headers...)
 }
 
 // joinArtistNames 拼接用于展示的歌手名。
@@ -162,7 +230,7 @@ func (n *Netease) fetchAlbumDetail(albumID string) (*model.Playlist, []model.Son
 	headers := []utils.RequestOption{
 		utils.WithHeader("Referer", Referer),
 		utils.WithHeader("Content-Type", "application/x-www-form-urlencoded"),
-		utils.WithHeader("Cookie", n.cookie),
+		utils.WithHeader("Cookie", n.cookieSnapshot()),
 		utils.WithRandomIPHeader(),
 	}
 
@@ -322,7 +390,7 @@ func (n *Netease) fetchPlaylistDetailLimited(playlistID string, maxSongs int) (*
 	headers := []utils.RequestOption{
 		utils.WithHeader("Referer", Referer),
 		utils.WithHeader("Content-Type", "application/x-www-form-urlencoded"),
-		utils.WithHeader("Cookie", n.cookie),
+		utils.WithHeader("Cookie", n.cookieSnapshot()),
 		utils.WithRandomIPHeader(),
 	}
 
@@ -426,7 +494,7 @@ func (n *Netease) fetchSongsBatch(songIDs []string) ([]model.Song, error) {
 	headers := []utils.RequestOption{
 		utils.WithHeader("Referer", Referer),
 		utils.WithHeader("Content-Type", "application/x-www-form-urlencoded"),
-		utils.WithHeader("Cookie", n.cookie),
+		utils.WithHeader("Cookie", n.cookieSnapshot()),
 		utils.WithRandomIPHeader(),
 	}
 
@@ -566,13 +634,15 @@ func isDigits(value string) bool {
 	return true
 }
 
-func (n *Netease) downloadURLCacheKey(songID string, levels string) string {
-	return songID + ":" + levels + ":" + utils.MD5(n.cookie)
+// downloadURLCacheKey 同时带上账号、歌曲与档位，保证换 Cookie 后不会命中
+// 上一个账号的地址，也不会把某一档位的地址复用给另一档位。
+func downloadURLCacheKey(accountKey string, songID string, levels string) string {
+	return accountKey + ":" + songID + ":" + levels
 }
 
-func (n *Netease) getCachedDownloadURL(songID string, levels string) (cachedDownloadURL, bool) {
-	key := n.downloadURLCacheKey(songID, levels)
-	now := time.Now()
+func (n *Netease) getCachedDownloadURL(accountKey string, songID string, levels string) (cachedDownloadURL, bool) {
+	key := downloadURLCacheKey(accountKey, songID, levels)
+	now := neteaseNow()
 
 	downloadURLCache.Lock()
 	defer downloadURLCache.Unlock()
@@ -588,18 +658,32 @@ func (n *Netease) getCachedDownloadURL(songID string, levels string) (cachedDown
 	return item, true
 }
 
-func (n *Netease) setCachedDownloadURL(songID string, levels string, url string, ext string) {
+// setCachedDownloadURL 只缓存真正可用的地址。空地址、或档位高于返回流实际
+// 音质的结果都不应固化，否则后续请求会拿到被静默降级的地址。
+func (n *Netease) setCachedDownloadURL(accountKey string, songID string, levels string, url string, ext string) {
 	if strings.TrimSpace(url) == "" {
 		return
 	}
-	key := n.downloadURLCacheKey(songID, levels)
+	key := downloadURLCacheKey(accountKey, songID, levels)
 
 	downloadURLCache.Lock()
 	defer downloadURLCache.Unlock()
 	downloadURLCache.items[key] = cachedDownloadURL{
 		url:       url,
 		ext:       ext,
-		expiresAt: time.Now().Add(downloadURLCacheTTL),
+		expiresAt: neteaseNow().Add(downloadURLCacheTTL),
+	}
+}
+
+// purgeAccountDownloadURLCache 清掉某账号在某次切换前的下载地址缓存。账号键已
+// 变化时旧条目不会再被命中，这里主动清理避免内存里长期残留其他账号的地址。
+func purgeAccountDownloadURLCache(accountKey string) {
+	downloadURLCache.Lock()
+	defer downloadURLCache.Unlock()
+	for key := range downloadURLCache.items {
+		if strings.HasPrefix(key, accountKey+":") {
+			delete(downloadURLCache.items, key)
+		}
 	}
 }
 
@@ -630,7 +714,7 @@ func preferredDownloadLevels(s *model.Song) []string {
 }
 
 // getEAPIDownloadURL 获取下载地址，以及描述实际返回音频流的元数据。
-func (n *Netease) getEAPIDownloadURL(songID string, quality string) (string, string, int, string, error) {
+func (n *Netease) getEAPIDownloadURL(songID string, quality string, cookie string) (string, string, int, string, error) {
 	idNum, err := strconv.Atoi(songID)
 	if err != nil {
 		return "", "", 0, "", fmt.Errorf("invalid song id: %v", err)
@@ -651,8 +735,10 @@ func (n *Netease) getEAPIDownloadURL(songID string, quality string) (string, str
 		"header":     headerJSON,
 	}
 
+	eapiEndpoint := neteaseDownloadEAPIEndpoint
+
 	payloadBytes, _ := json.Marshal(payload)
-	params := EncryptEApi(DownloadEAPI, string(payloadBytes))
+	params := EncryptEApi(eapiEndpoint, string(payloadBytes))
 
 	form := url.Values{}
 	form.Set("params", params)
@@ -660,11 +746,11 @@ func (n *Netease) getEAPIDownloadURL(songID string, quality string) (string, str
 	headers := []utils.RequestOption{
 		utils.WithHeader("Referer", Referer),
 		utils.WithHeader("Content-Type", "application/x-www-form-urlencoded"),
-		utils.WithHeader("Cookie", n.cookie),
+		utils.WithHeader("Cookie", cookie),
 		utils.WithRandomIPHeader(),
 	}
 
-	body, err := utils.Post(DownloadEAPI, strings.NewReader(form.Encode()), headers...)
+	body, err := utils.Post(eapiEndpoint, strings.NewReader(form.Encode()), headers...)
 	if err != nil {
 		return "", "", 0, "", err
 	}

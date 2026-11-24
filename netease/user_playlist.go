@@ -12,7 +12,7 @@ import (
 )
 
 func (n *Netease) GetUserPlaylists(page, limit int) ([]model.Playlist, error) {
-	if strings.TrimSpace(n.cookie) == "" {
+	if strings.TrimSpace(n.cookieSnapshot()) == "" {
 		return nil, fmt.Errorf("netease user playlists require cookie")
 	}
 	if page < 1 {
@@ -36,7 +36,7 @@ func (n *Netease) GetUserPlaylists(page, limit int) ([]model.Playlist, error) {
 	accountBody, err := utils.Post(UserAccountAPI, strings.NewReader(accountForm.Encode()),
 		utils.WithHeader("Referer", Referer),
 		utils.WithHeader("Content-Type", "application/x-www-form-urlencoded"),
-		utils.WithHeader("Cookie", n.cookie),
+		utils.WithHeader("Cookie", n.cookieSnapshot()),
 		utils.WithRandomIPHeader(),
 	)
 	if err != nil {
@@ -71,7 +71,7 @@ func (n *Netease) GetUserPlaylists(page, limit int) ([]model.Playlist, error) {
 	body, err := utils.Post(UserPlaylistAPI, strings.NewReader(form.Encode()),
 		utils.WithHeader("Referer", Referer),
 		utils.WithHeader("Content-Type", "application/x-www-form-urlencoded"),
-		utils.WithHeader("Cookie", n.cookie),
+		utils.WithHeader("Cookie", n.cookieSnapshot()),
 		utils.WithRandomIPHeader(),
 	)
 	if err != nil {

@@ -10,18 +10,24 @@ import (
 
 // IsVipAccount 报告当前账号是否为 VIP。
 func (n *Netease) IsVipAccount() (bool, error) {
-	if n.isVipCache != nil {
-		return *n.isVipCache, nil
-	}
+	cookie := n.cookieSnapshot()
+	accountKey := utils.MD5(cookie)
 
-	if n.cookie == "" {
-		isVip := false
-		n.isVipCache = &isVip
+	n.stateMu.Lock()
+	if n.isVipCache != nil && n.isVipCacheKey == accountKey {
+		isVip := *n.isVipCache
+		n.stateMu.Unlock()
+		return isVip, nil
+	}
+	n.stateMu.Unlock()
+
+	if cookie == "" {
+		n.setAccountVIPCache(accountKey, false)
 		return false, nil
 	}
 
-	if cached, ok := n.getCachedVIPStatus(); ok {
-		n.isVipCache = &cached
+	if cached, ok := n.getCachedVIPStatus(accountKey); ok {
+		n.setAccountVIPCache(accountKey, cached)
 		return cached, nil
 	}
 
@@ -37,11 +43,11 @@ func (n *Netease) IsVipAccount() (bool, error) {
 	headers := []utils.RequestOption{
 		utils.WithHeader("Referer", Referer),
 		utils.WithHeader("Content-Type", "application/x-www-form-urlencoded"),
-		utils.WithHeader("Cookie", n.cookie),
+		utils.WithHeader("Cookie", cookie),
 		utils.WithRandomIPHeader(),
 	}
 
-	body, err := utils.Post(UserAccountAPI, strings.NewReader(form.Encode()), headers...)
+	body, err := utils.Post(neteaseUserAccountEndpoint, strings.NewReader(form.Encode()), headers...)
 	if err != nil {
 		return false, fmt.Errorf("failed to fetch user account info: %w", err)
 	}
@@ -58,7 +64,25 @@ func (n *Netease) IsVipAccount() (bool, error) {
 	}
 
 	isVip := resp.Code == 200 && resp.Profile.VipType != 0
-	n.isVipCache = &isVip
-	n.setCachedVIPStatus(isVip)
+	n.setAccountVIPCache(accountKey, isVip)
+	n.setCachedVIPStatus(accountKey, isVip)
 	return isVip, nil
+}
+
+// setAccountVIPCache 只有在 Cookie 未被并发切换时才写入实例级 VIP 缓存，
+// 避免把旧账号的结果贴到新账号上。
+func (n *Netease) setAccountVIPCache(accountKey string, isVip bool) {
+	n.stateMu.Lock()
+	defer n.stateMu.Unlock()
+	if n.accountKeyLocked() != accountKey {
+		return
+	}
+	value := isVip
+	n.isVipCache = &value
+	n.isVipCacheKey = accountKey
+}
+
+// accountKeyLocked 返回当前账号键。调用方必须持有 stateMu。
+func (n *Netease) accountKeyLocked() string {
+	return utils.MD5(n.cookieSnapshot())
 }
