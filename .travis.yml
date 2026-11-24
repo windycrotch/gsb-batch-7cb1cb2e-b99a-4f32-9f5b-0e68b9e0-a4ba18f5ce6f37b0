@@ -1,0 +1,20 @@
+language: go
+
+go:
+  - "1.14"
+
+addons:
+  apt:
+    update: true
+    packages:
+      - build-essential
+
+before_install:
+  - source vendor-env.sh
+  # for nasm
+  - export PATH=$PATH:$GOFF_PREFIX/bin
+  - ./vendor-all.sh
+
+script:
+  - go test -v ./...
+
