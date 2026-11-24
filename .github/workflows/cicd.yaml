@@ -1,0 +1,98 @@
+name: CICD
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  golint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: golint
+        uses: Jerome1337/golint-action@v1.0.3
+        with:
+          golint-path: "./..."
+
+  golangci-lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.1.6
+          args: --timeout 3m0s
+
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_DB: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+
+      memcached:
+        image: bitnami/memcached:1.6.20
+        ports:
+          - 11211:11211
+
+      minio:
+        image: bitnami/minio:latest
+        env:
+          MINIO_ROOT_USER: root
+          MINIO_ROOT_PASSWORD: password
+        ports:
+          - 9000:9000
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Build
+        run: |
+          go build -o livemix.bin .
+          go build -o livemix-util.bin ./bin/util/...
+
+      - name: Test
+        run: go test --count 1 -timeout 60s -short ./...
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: /tmp/gcp-creds.json
+          PGHOST: localhost
+          PGPORT: "5432"
+          PGDATABASE: postgres
+          PGUSER: postgres
+          PGPASSWORD: postgres
+          MEMCACHED_HOST: localhost
+          MEMCACHED_PORT: "11211"
+          UNITTEST_S3_ENDPOINT: "localhost:9000"
+          AWS_ACCESS_KEY_ID: root
+          AWS_SECRET_ACCESS_KEY: password

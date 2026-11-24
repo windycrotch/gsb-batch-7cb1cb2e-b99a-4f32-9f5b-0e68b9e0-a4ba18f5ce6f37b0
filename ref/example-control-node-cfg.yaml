@@ -1,0 +1,224 @@
+---
+#########################################################################################
+# Metrics framework configuration
+metrics:
+  # HTTP hosting server configuration
+  service:
+    # HTTP server binding interface
+    listenOn: 0.0.0.0
+    # HTTP server binding port
+    appPort: 3001
+    # Connection timeout configurations in seconds
+    timeoutSecs:
+      # Maximum duration for reading the entire request, including the body in seconds.
+      # A zero or negative value means there will be no timeout.
+      read: 60
+      # Maximum duration before timing out writes of the response in seconds. A zero
+      # or negative value means there will be no timeout.
+      write: 60
+      # Maximum amount of time to wait for the next request when keep-alives are enabled
+      # in seconds. If IdleTimeout is zero, the value of ReadTimeout is used. If both
+      # are zero, there is no timeout.
+      idle: 300
+
+  # Prometheus metrics endpoint
+  metricsEndpoint: /metrics
+
+  # Max number of metrics requests in parallel to support
+  maxRequests: 4
+
+  # Metrics framework features to enable
+  features:
+    # Whether to enable Golang application metrics
+    enableAppMetrics: false
+
+    # Whether to enable HTTP request metrics
+    enableHTTPMetrics: true
+
+    # Whether to enable PubSub metrics
+    enablePubSubMetrics: true
+
+    # Whether to enable Task processor operational metrics
+    enableTaskProcessorMetrics: true
+
+#########################################################################################
+# Postgres persistence configuration
+postgres:
+  # Postgres listening host
+  host: localhost
+  # Postgres listening port
+  port: 5432
+  # Postgres DB name
+  db: postgres
+  # Postgres user name. Password is provided separately
+  user: postgres
+  # Configures the SSL setting for connecting to Postgres
+  ssl:
+    # Whether to enable SSL when connecting to Postgres
+    enabled: false
+    # If using SSL when connecting to Postgres, this is the CA trust chain to verify.
+    #caFile: server-ca-chain.crt
+
+#########################################################################################
+# System management sub-module configuration
+management:
+  # Module REST API configuration
+  api:
+    # HTTP hosting server configuration
+    service:
+      # HTTP server binding interface
+      listenOn: 0.0.0.0
+      # HTTP server binding port
+      appPort: 8080
+      # Connection timeout configurations in seconds
+      timeoutSecs:
+        # Maximum duration for reading the entire request, including the body in seconds.
+        # A zero or negative value means there will be no timeout.
+        read: 60
+        # Maximum duration before timing out writes of the response in seconds. A zero
+        # or negative value means there will be no timeout.
+        write: 60
+        # Maximum amount of time to wait for the next request when keep-alives are enabled
+        # in seconds. If IdleTimeout is zero, the value of ReadTimeout is used. If both
+        # are zero, there is no timeout.
+        idle: 300
+    # API endpoint settings
+    apis:
+      # Endpoint parameters
+      endPoint:
+        # Endpoint path prefix for the APIs
+        pathPrefix: /
+      # Request logging parameters
+      requestLogging:
+        # Output request logs at this level
+        logLevel: warn
+        # Output health check logs at this level
+        healthLogLevel: debug
+        # HTTP header containing the API request ID
+        requestIDHeader: X-Request-ID
+        # List of headers to not include in logging metadata
+        skipHeaders:
+          - "WWW-Authenticate"
+          - "Authorization"
+          - "Proxy-Authenticate"
+          - "Proxy-Authorization"
+
+  # System management PubSub request-response client configuration
+  requestResponse:
+    # GCP project to operate in
+    gcpProject: development
+    # Number of support workers to spawn to process inbound requests
+    supportWorkerCount: 2
+    # Outbound request timeout enforcement check interval in secs
+    requestTimeoutEnforceIntInSec: 60
+    # PubSub topic this client listen on for inbound request
+    self:
+      # Pubsub topic to subscribe to
+      topic: local-dev-ctrl-node
+      # Message retention within the subscription in secs
+      msgTTL: 600
+
+  # Video source management settings
+  videoSourceManagement:
+    # The maximum delay a source status report can be before the control node marks
+    # source as no longer connected
+    statusReportMaxDelayInSec: 60
+
+  # Recording session management settings
+  recordingManagement:
+    # The number of seconds between recording segment cleanup runs. During each run,
+    # recording segments not associated with any recordings are purged.
+    segmentCleanupIntInSec: 300
+
+#########################################################################################
+# Central VOD server configurations
+vod:
+  # Module REST API configuration
+  api:
+    # HTTP hosting server configuration
+    service:
+      # HTTP server binding interface
+      listenOn: 0.0.0.0
+      # HTTP server binding port
+      appPort: 8081
+      # Connection timeout configurations in seconds
+      timeoutSecs:
+        # Maximum duration for reading the entire request, including the body in seconds.
+        # A zero or negative value means there will be no timeout.
+        read: 60
+        # Maximum duration before timing out writes of the response in seconds. A zero
+        # or negative value means there will be no timeout.
+        write: 60
+        # Maximum amount of time to wait for the next request when keep-alives are enabled
+        # in seconds. If IdleTimeout is zero, the value of ReadTimeout is used. If both
+        # are zero, there is no timeout.
+        idle: 300
+    # API endpoint settings
+    apis:
+      # Endpoint parameters
+      endPoint:
+        # Endpoint path prefix for the APIs
+        pathPrefix: /
+      # Request logging parameters
+      requestLogging:
+        # Output request logs at this level
+        logLevel: debug
+        # HTTP header containing the API request ID
+        requestIDHeader: X-Request-ID
+        # List of headers to not include in logging metadata
+        skipHeaders:
+          - "WWW-Authenticate"
+          - "Authorization"
+          - "Proxy-Authenticate"
+          - "Proxy-Authorization"
+
+  # Memcached based video segment cache
+  cache:
+    # List of memcached servers
+    servers:
+      - 127.0.0.1:18080
+
+  # Number of video segments to include when building a live VOD playlist.
+  liveVODSegmentCount: 2
+
+  # when a segment is read from cold storage, store it in local cache with this TTL in secs.
+  segmentCacheTTLInSec: 300
+
+  # Supports live streaming, the receiver accepts video segments from sources
+  # to be proxied to through the system control node.
+  #
+  # Tracking window is the duration in time a video segment is tracked. Segments
+  # are forgotten after this tracking window.
+  #
+  # The minimum value is (Segment Length x liveVODSegmentCount). Less than that, and
+  # segments will be missing during live streaming.
+  segmentReceiverTrackingWindow: 60
+
+  # Video recording storage config
+  recordingStorage:
+    # Storage bucket to place all the recording video segments in
+    bucket: livemix
+    # Prefix used when defining the object key to store a segment with
+    objectPrefix: recording-sessions
+    # S3 object store config
+    s3:
+      # S3 server endpoint
+      endpoint: localhost:9000
+      # Whether to TLS when connecting
+      useTLS: false
+
+  # Number of worker threads in the video segment reader
+  segmentReaderWorkerCount: 4
+
+  # Max time in second to complete a segment read
+  segmentReadMaxWaitTimeInSec: 30
+
+#########################################################################################
+# System broadcast channel configuration
+broadcast:
+  # Broadcast PubSub settings
+  pubsub:
+    # Broadcast channel PubSub topic
+    topic: local-dev-system-events
+    # Message retention within the subscription in secs
+    msgTTL: 600

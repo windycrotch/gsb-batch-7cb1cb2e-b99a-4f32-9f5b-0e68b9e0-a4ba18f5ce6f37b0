@@ -1,0 +1,8 @@
+docs/
+tmp/
+*.bin
+*.bkp
+.prepare
+.env
+.env.ctrl
+.env.edge
