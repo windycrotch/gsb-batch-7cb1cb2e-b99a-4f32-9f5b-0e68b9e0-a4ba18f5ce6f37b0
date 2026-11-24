@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"strings"
 	"time"
@@ -13,6 +16,58 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
+
+// Sentinel errors allowing callers (and HTTP handlers) to tell permanent
+// "this path does not exist" conditions apart from transient storage
+// failures that the user should retry.
+var (
+	// ErrNotFound aliases the canonical os.ErrNotExist so errors.Is checks
+	// against either name succeed.
+	ErrNotFound = os.ErrNotExist
+	// ErrInvalidPath means the user supplied path is malformed or attempts
+	// to escape the library root.
+	ErrInvalidPath = errors.New("invalid path")
+	// ErrEmptyFile means the requested object exists but has zero bytes.
+	ErrEmptyFile = errors.New("the file is empty")
+)
+
+// ValidateStoragePath rejects paths containing parent-directory traversal
+// segments. It is a defense in depth on top of the ValidatePath middleware
+// and is safe to call directly from handlers or the media library.
+func ValidateStoragePath(p string) error {
+	for _, segment := range strings.FieldsFunc(p, func(r rune) bool {
+		return r == '/' || r == '\\'
+	}) {
+		if segment == ".." {
+			return fmt.Errorf("%w: %q escapes the library root", ErrInvalidPath, p)
+		}
+	}
+	return nil
+}
+
+// IsNotFoundError reports whether err represents a path that genuinely does
+// not exist, either because the storage layer synthesized ErrNotFound from
+// an empty listing or because S3 answered with a 404/NotFound error.
+func IsNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrNotFound) {
+		return true
+	}
+	var notFound *types.NotFound
+	if errors.As(err, &notFound) {
+		return true
+	}
+	var noSuchKey *types.NoSuchKey
+	if errors.As(err, &noSuchKey) {
+		return true
+	}
+	// Covers smithy/http response errors and any other error exposing the
+	// HTTP status code directly.
+	var statusCoder interface{ HTTPStatusCode() int }
+	return errors.As(err, &statusCoder) && statusCoder.HTTPStatusCode() == http.StatusNotFound
+}
 
 type storageEntry struct {
 	path string
@@ -154,6 +209,9 @@ func (store *S3Storage) List(ctx context.Context, p string) ([]*StorageDirectory
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
+			if IsNotFoundError(err) {
+				return nil, nil, fmt.Errorf("%w: %q", ErrNotFound, p)
+			}
 			return nil, nil, err
 		}
 		prefixes = append(prefixes, page.CommonPrefixes...)
@@ -166,7 +224,7 @@ func (store *S3Storage) List(ctx context.Context, p string) ([]*StorageDirectory
 	}
 
 	if len(prefixes) == 0 && len(objects) == 0 {
-		return nil, nil, errors.New("directory doesn't exist")
+		return nil, nil, fmt.Errorf("%w: directory doesn't exist: %q", ErrNotFound, p)
 	}
 
 	var dirs []*StorageDirectory
@@ -185,6 +243,9 @@ func (store *S3Storage) List(ctx context.Context, p string) ([]*StorageDirectory
 
 // FileSize returns size of the file under the given path.
 func (store *S3Storage) FileSize(ctx context.Context, p string) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	input := &s3.HeadObjectInput{
 		Bucket: aws.String(store.cfg.Bucket),
 		Key:    aws.String(store.prefix(p)),
@@ -198,12 +259,21 @@ func (store *S3Storage) FileSize(ctx context.Context, p string) (int64, error) {
 
 // FileContentURL returns a publicly accessible URL for the file under the given path.
 func (store *S3Storage) FileContentURL(ctx context.Context, p string) (string, error) {
+	// A request canceled before any S3 call must not reach the network.
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	size, err := store.FileSize(ctx, p)
 	if err != nil {
 		return "", err
 	}
+	// Cancellation may have arrived while HeadObject was in flight; do not
+	// sign a URL nobody is waiting for.
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if size == 0 {
-		return "", errors.New("no content")
+		return "", fmt.Errorf("no content: %w: %q", ErrEmptyFile, p)
 	}
 	presignedURL, err := store.presigner.PresignGetObject(ctx,
 		&s3.GetObjectInput{
