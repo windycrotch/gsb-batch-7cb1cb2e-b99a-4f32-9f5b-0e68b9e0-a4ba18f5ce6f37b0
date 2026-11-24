@@ -2,6 +2,7 @@ package razor
 
 import (
 	"fmt"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,7 +16,7 @@ type MessageHandler[MessageQueueWhat comparable, PayloadType any] struct {
 	callback MessageHandlerCallback[MessageQueueWhat, PayloadType]
 	lock     *LockAndNotify
 
-	aborted bool
+	aborted atomic.Bool
 
 	logger *Logger
 }
@@ -26,7 +27,6 @@ func NewMessageHandler[MessageQueueWhat comparable, PayloadType any](logger *Log
 		queue:    NewMessageQueue[MessageQueueWhat, PayloadType](queueLength),
 		callback: callback,
 		lock:     NewLockAndNotify(),
-		aborted:  false,
 		logger:   logger,
 	}
 }
@@ -43,7 +43,7 @@ func (mh *MessageHandler[MessageQueueWhat, PayloadType]) Send(what MessageQueueW
 	mh.logger.Trace(mh.label, fmt.Sprintf("Send: %v", what))
 	mh.lock.Enter()
 
-	if mh.aborted {
+	if mh.aborted.Load() {
 		mh.logger.Info(mh.label, "Send called on aborted messagehandler")
 		mh.lock.Leave()
 
@@ -53,7 +53,7 @@ func (mh *MessageHandler[MessageQueueWhat, PayloadType]) Send(what MessageQueueW
 
 		mh.lock.Leave()
 
-		mh.logger.Assert(mh.label, "Handler queue too short in send", !result)
+		mh.logger.Assert(mh.label, "Handler queue too short in send", result)
 
 		mh.lock.Notify()
 
@@ -61,11 +61,47 @@ func (mh *MessageHandler[MessageQueueWhat, PayloadType]) Send(what MessageQueueW
 	}
 }
 
+// SendWait is like Send but waits for room in the queue (up to timeout) rather than
+// dropping the message when it is momentarily full. It must only be called from a
+// goroutine other than the handler's own loop, otherwise a full queue could deadlock.
+// It is for messages whose loss would leave state permanently inconsistent (timers and
+// teardown), not for best-effort notifications.
+func (mh *MessageHandler[MessageQueueWhat, PayloadType]) SendWait(what MessageQueueWhat, payload *PayloadType, timeout time.Duration) bool {
+	mh.logger.Trace(mh.label, fmt.Sprintf("SendWait: %v", what))
+
+	deadline := time.Now().Add(timeout)
+
+	for {
+		mh.lock.Enter()
+
+		if mh.aborted.Load() {
+			mh.lock.Leave()
+			return false
+		}
+
+		result := mh.queue.TryPush(time.Now(), what, payload)
+		mh.lock.Leave()
+
+		if result {
+			mh.logger.Assert(mh.label, "Handler queue too short in send wait", true)
+			mh.lock.Notify()
+			return true
+		}
+
+		if !time.Now().Before(deadline) {
+			mh.logger.Assert(mh.label, "Handler queue too short in send wait", false)
+			return false
+		}
+
+		mh.lock.Wait(2 * time.Millisecond)
+	}
+}
+
 func (mh *MessageHandler[MessageQueueWhat, PayloadType]) Timeout(what MessageQueueWhat, payload *PayloadType, delay time.Duration) bool {
 	mh.logger.Trace(mh.label, fmt.Sprintf("Timeout: %v %s", what, delay))
 	mh.lock.Enter()
 
-	if mh.aborted {
+	if mh.aborted.Load() {
 		mh.logger.Info(mh.label, "Timeout called on aborted messagehandler")
 		mh.lock.Leave()
 		return false
@@ -73,7 +109,7 @@ func (mh *MessageHandler[MessageQueueWhat, PayloadType]) Timeout(what MessageQue
 		result := mh.queue.TryPush(time.Now().Add(delay), what, payload)
 		mh.lock.Leave()
 
-		mh.logger.Assert(mh.label, "Handler queue too short in timout", !result)
+		mh.logger.Assert(mh.label, "Handler queue too short in timeout", result)
 
 		mh.lock.Notify()
 
@@ -85,7 +121,7 @@ func (mh *MessageHandler[MessageQueueWhat, PayloadType]) Cancel(what MessageQueu
 	mh.logger.Trace(mh.label, fmt.Sprintf("Cancel: %v", what))
 	mh.lock.Enter()
 
-	if mh.aborted {
+	if mh.aborted.Load() {
 		mh.logger.Info(mh.label, "Cancel called on aborted messagehandler")
 		mh.lock.Leave()
 	} else {
@@ -100,7 +136,7 @@ func (mh *MessageHandler[MessageQueueWhat, PayloadType]) CancelAll() {
 	mh.logger.Trace(mh.label, "CancelAll")
 	mh.lock.Enter()
 
-	if mh.aborted {
+	if mh.aborted.Load() {
 		mh.logger.Info(mh.label, "CancelAll called on aborted messagehandler (will happen once every time)")
 		mh.lock.Leave()
 	} else {
@@ -167,7 +203,7 @@ func (mh *MessageHandler[MessageQueueWhat, PayloadType]) Loop(oncleanup func()) 
 	go func() {
 		work := func() {
 			for {
-				if mh.aborted {
+				if mh.aborted.Load() {
 					return
 				}
 
@@ -202,10 +238,14 @@ func (mh *MessageHandler[MessageQueueWhat, PayloadType]) Loop(oncleanup func()) 
 // Does not block waiting though
 func (mh *MessageHandler[MessageQueueWhat, PayloadType]) Abort() {
 	mh.logger.Trace(mh.label, "Abort")
-	mh.lock.Enter()
-	mh.aborted = true
-	mh.lock.Leave()
+	mh.aborted.Store(true)
 
 	mh.CancelAll()
 	mh.logger.Trace(mh.label, "Abort returned")
+}
+
+// IsAborted reports whether the handler has been aborted. Callers which would
+// otherwise block waiting for a response can use this to avoid waiting forever.
+func (mh *MessageHandler[MessageQueueWhat, PayloadType]) IsAborted() bool {
+	return mh.aborted.Load()
 }

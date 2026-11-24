@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"atomirex.com/umbrella/razor"
@@ -28,9 +29,14 @@ const (
 	sfuSignalClients
 	sfuAddClient
 	sfuRemoveClient
+	sfuRemoveClientTracks
 
 	sfuGetCurrentServers
 	sfuSetCurrentServers
+
+	sfuServerConnectionEvent
+	sfuServerRetry
+	sfuServerConnectTimeout
 
 	sfuGetStatus
 )
@@ -38,7 +44,13 @@ const (
 type sfuCommandMessage struct {
 	intrack           *incomingTrack
 	client            *client
+	remoteClient      RemoteClient
+	trackOwner        RemoteClient
 	SetCurrentServers *CurrentServers
+
+	serverEvent      *serverConnectionEvent
+	serverURL        string
+	serverGeneration uint64
 
 	result *sfuCommandResult
 }
@@ -58,15 +70,40 @@ type Sfu struct {
 	// UmbrellaID -> track
 	localTracks map[string]*incomingTrack // Set of all incoming tracks which are being relayed
 
+	// UmbrellaID -> the client which contributed that inbound track. When a client
+	// goes away its tracks are removed from localTracks (and from every other
+	// client), so /status cannot retain tracks from a disconnected session.
+	trackOwners map[string]RemoteClient
+
 	handler *razor.MessageHandler[sfuCommand, sfuCommandMessage]
 
-	intendedServers map[string]bool // This works because strings completely define the spec of the server right now
-	servers         map[string]RemoteClient
+	// intendedServers is the last submitted intent. servers tracks, for every intended
+	// address, the single connection attempt or established connection working towards
+	// that intent. The two converge after every evaluation; they are kept separate so
+	// the visible list only shows servers which are genuinely connected.
+	intendedServers map[string]bool
+	servers         map[string]*serverEntry
+
+	// serverTokenSeq hands out the tokens which identify individual connection
+	// attempts, so stale timers can be recognised and ignored.
+	serverTokenSeq uint64
+
+	serverRetryBaseDelay     time.Duration
+	serverRetryMaxDelay      time.Duration
+	serverMaxConnectAttempts int
+	serverConnectTimeout     time.Duration
+
+	// serverHealthyConnectionDuration is how long a connection must stay up before a
+	// later disconnect resets the backoff attempt count rather than continuing it.
+	serverHealthyConnectionDuration time.Duration
 
 	logger *razor.Logger
 
 	loggerPion logging.LeveledLogger
 
+	// mdnsMu guards mdnsConn: it is set from the mdns goroutine in main and read from
+	// client dial goroutines.
+	mdnsMu   sync.RWMutex
 	mdnsConn *mdns.Conn
 }
 
@@ -75,7 +112,9 @@ func (s *Sfu) GetStatus() *SFUStatus {
 		status: make(chan *SFUStatus, 1),
 	}}
 
-	s.handler.Send(sfuGetStatus, &msg)
+	if !s.handler.Send(sfuGetStatus, &msg) {
+		return &SFUStatus{}
+	}
 
 	return <-msg.result.status
 }
@@ -85,7 +124,9 @@ func (s *Sfu) GetCurrentServers() *CurrentServers {
 		servers: make(chan *CurrentServers, 1),
 	}}
 
-	s.handler.Send(sfuGetCurrentServers, &msg)
+	if !s.handler.Send(sfuGetCurrentServers, &msg) {
+		return &CurrentServers{}
+	}
 
 	return <-msg.result.servers
 }
@@ -98,7 +139,9 @@ func (s *Sfu) SetCurrentServers(update *CurrentServers) *CurrentServers {
 		},
 	}
 
-	s.handler.Send(sfuSetCurrentServers, &msg)
+	if !s.handler.Send(sfuSetCurrentServers, &msg) {
+		return &CurrentServers{}
+	}
 
 	return <-msg.result.servers
 }
@@ -145,135 +188,21 @@ func NewSfu(logger *razor.Logger, minPort uint16, maxPort uint16, ip *string) *S
 			logger:    logger,
 		},
 		localTracks:     make(map[string]*incomingTrack),
+		trackOwners:     make(map[string]RemoteClient),
 		intendedServers: make(map[string]bool),
-		servers:         make(map[string]RemoteClient),
+		servers:         make(map[string]*serverEntry),
 		logger:          logger,
 		loggerPion:      loggerPion,
+
+		serverRetryBaseDelay:     defaultServerRetryBaseDelay,
+		serverRetryMaxDelay:      defaultServerRetryMaxDelay,
+		serverMaxConnectAttempts: defaultServerMaxConnectAttempts,
+		serverConnectTimeout:     defaultServerConnectTimeout,
+
+		serverHealthyConnectionDuration: defaultServerHealthyConnectionDuration,
 	}
 
-	s.handler = razor.NewMessageHandler(logger, "sfu", 1024, func(what sfuCommand, payload *sfuCommandMessage) bool {
-		shouldSignalClients := false
-
-		switch what {
-		case sfuAddClient:
-			s.clients = append(s.clients, payload.client)
-
-			// Add all existing tracks
-			for _, t := range s.localTracks {
-				payload.client.handler.Send(clientAddOutgoingTrackForIncomingTrack, &clientCommandMessage{incomingTrack: t})
-			}
-
-			shouldSignalClients = true
-		case sfuRemoveClient:
-			index := -1
-			for i, c := range s.clients {
-				if c == payload.client {
-					index = i
-				}
-			}
-
-			if index >= 0 {
-				s.clients = append(s.clients[:index], s.clients[index+1:]...)
-			}
-
-			shouldSignalClients = true
-		case sfuAddOutgoingTracksForIncomingTrack:
-			logger.Info("sfu", "adding track: "+payload.intrack.String())
-			intrack := payload.intrack
-			s.localTracks[intrack.UmbrellaID()] = intrack
-
-			for _, c := range s.clients {
-				c.AddOutgoingTracksForIncomingTrack(intrack)
-			}
-
-			shouldSignalClients = true
-		case sfuRemoveAllOutgoingTracksForIncomingTrack:
-			logger.Info("sfu", "removing all outgoing tracks for track: "+payload.intrack.String())
-			delete(s.localTracks, payload.intrack.UmbrellaID())
-
-			for _, c := range s.clients {
-				c.RemoveOutgoingTracksForIncomingTrack(payload.intrack)
-			}
-
-			shouldSignalClients = true
-		case sfuSignalClients:
-			shouldSignalClients = true
-		case sfuGetStatus:
-			// Terrible version of this which blocks while polling everything
-			// Should really pass around a thing that gathers the info
-			// but in reality I should move to a pub/sub thing that pushes the data out on changes anyway
-			// this is to debug the mess as is :P
-			logger.Info("sfu", "SFU getting status servers")
-			servers := make([]string, 0)
-			for t := range s.servers {
-				servers = append(servers, t)
-			}
-			logger.Info("sfu", "SFU getting status relaying")
-			relaying := make([]*TrackDescriptor, 0)
-			for _, t := range s.localTracks {
-				relaying = append(relaying, t.descriptor)
-			}
-			logger.Info("sfu", "SFU getting status clients")
-			clients := make([]*SFUStatusClient, 0)
-			for _, c := range s.clients {
-				logger.Info("sfu", "SFU getting status for client "+c.Label())
-				clients = append(clients, c.getStatus())
-				logger.Info("sfu", "SFU received status for client "+c.Label())
-			}
-
-			logger.Info("sfu", "SFU getting status returning")
-			status := &SFUStatus{
-				RelayingTracks: relaying,
-				Servers:        servers,
-				Clients:        clients,
-			}
-
-			payload.result.status <- status
-		case sfuGetCurrentServers:
-			result := &CurrentServers{Servers: make([]string, 0)}
-
-			for t := range s.servers {
-				result.Servers = append(result.Servers, t)
-			}
-
-			payload.result.servers <- result
-		case sfuSetCurrentServers:
-			// "intended" servers model, then regularly evaluate, so setup/teardown repeatedly is ok
-			mentioned := make(map[string]bool)
-			for _, t := range payload.SetCurrentServers.Servers {
-				mentioned[t] = true
-			}
-
-			// Just overwrite it with what the client sent! (For now)
-			s.intendedServers = mentioned
-
-			s.evaluateServers()
-
-			shouldSignalClients = true
-
-			result := &CurrentServers{Servers: make([]string, 0)}
-
-			for t := range s.servers {
-				result.Servers = append(result.Servers, t)
-			}
-
-			payload.result.servers <- result
-		}
-
-		if shouldSignalClients {
-			logger.Verbose("sfu", "SFU should signaling clients")
-			s.handler.Cancel(sfuSignalClients)
-
-			for _, c := range s.clients {
-				logger.Verbose("sfu", "SFU signaling client "+c.Label())
-				c.RequestEvalState()
-			}
-
-			logger.Verbose("sfu", "SFU finished signaling clients")
-		}
-
-		return true
-	})
+	s.handler = razor.NewMessageHandler(logger, "sfu", 1024, s.newSfuHandlerCallback())
 
 	s.handler.Loop(func() {
 		panic("SFU unexpectedly terminated")
@@ -282,30 +211,31 @@ func NewSfu(logger *razor.Logger, minPort uint16, maxPort uint16, ip *string) *S
 	return s
 }
 
-func (s *Sfu) evaluateServers() {
-	// Ensure any running servers that should be stopped are stopping or stopped
-	for t := range s.servers {
-		mention := s.intendedServers[t]
-		if !mention {
-			s.servers[t].stop()
+func (s *Sfu) isServerConnected(url string) bool {
+	entry, exists := s.servers[url]
+	return exists && entry.state == ServerState_Connected
+}
 
-			// TODO only actually delete the server when it's really stopped (need the get servers endpoint to be pub/sub based first or it'll be useless)
-			delete(s.servers, t)
-		}
-	}
+// The following implement RemoteClientObserver for relay server connections. They only
+// enqueue an event; all state changes happen on the SFU message handler goroutine so
+// that submissions and connection lifecycle events are applied in one serial order.
 
-	// Create and start any servers that should exist but do not (i.e. if they are still stopping leave them until stopped and removed)
-	for t, _ := range s.intendedServers {
-		_, exists := s.servers[t]
-		if !exists {
-			server := s.remoteClientFactory.NewClient(&RemoteClientParameters{
-				logger:   s.logger,
-				trunkurl: t,
-				s:        s,
-			})
-			s.servers[t] = server
-		}
-	}
+func (s *Sfu) ServerConnected(url string, client RemoteClient) {
+	s.handler.Send(sfuServerConnectionEvent, &sfuCommandMessage{
+		serverEvent: &serverConnectionEvent{kind: serverEventConnected, url: url, client: client},
+	})
+}
+
+func (s *Sfu) ServerConnectFailed(url string, client RemoteClient, err error) {
+	s.handler.Send(sfuServerConnectionEvent, &sfuCommandMessage{
+		serverEvent: &serverConnectionEvent{kind: serverEventConnectFailed, url: url, client: client, err: err},
+	})
+}
+
+func (s *Sfu) ServerDisconnected(url string, client RemoteClient, err error) {
+	s.handler.Send(sfuServerConnectionEvent, &sfuCommandMessage{
+		serverEvent: &serverConnectionEvent{kind: serverEventDisconnected, url: url, client: client, err: err},
+	})
 }
 
 func (s *Sfu) addTrack(intrack *incomingTrack) {
@@ -314,6 +244,51 @@ func (s *Sfu) addTrack(intrack *incomingTrack) {
 
 func (s *Sfu) removeOutgoingTracksForIncomingTrack(t *incomingTrack) {
 	s.handler.Send(sfuRemoveAllOutgoingTracksForIncomingTrack, &sfuCommandMessage{intrack: t})
+}
+
+// removeLocalTrackLocked stops relaying a track and tells every remaining client to
+// drop their outgoing sender for it. Must run on the SFU handler goroutine.
+func (s *Sfu) removeLocalTrackLocked(intrack *incomingTrack) {
+	umbrellaID := intrack.UmbrellaID()
+
+	delete(s.localTracks, umbrellaID)
+	delete(s.trackOwners, umbrellaID)
+
+	for _, c := range s.clients {
+		c.RemoveOutgoingTracksForIncomingTrack(intrack)
+	}
+}
+
+// removeTracksOwnedByLocked removes every track contributed by a client which has gone
+// away, so a disconnected session cannot leave its inbound tracks or their senders
+// visible in /status. Returns whether anything was removed.
+func (s *Sfu) removeTracksOwnedByLocked(owner RemoteClient) bool {
+	if owner == nil {
+		return false
+	}
+
+	removed := make([]*incomingTrack, 0)
+	for umbrellaID, o := range s.trackOwners {
+		if o != owner {
+			continue
+		}
+
+		if intrack, exists := s.localTracks[umbrellaID]; exists {
+			removed = append(removed, intrack)
+		}
+	}
+
+	for _, intrack := range removed {
+		s.removeLocalTrackLocked(intrack)
+	}
+
+	return len(removed) > 0
+}
+
+// dropTracksOwnedBy is the synchronous entry point used when a relay server is stopped
+// from the SFU handler goroutine (removal from the intent list).
+func (s *Sfu) dropTracksOwnedBy(owner RemoteClient) {
+	s.removeTracksOwnedByLocked(owner)
 }
 
 func (s *Sfu) WebsocketHandler(w http.ResponseWriter, r *http.Request) {
@@ -327,7 +302,9 @@ func (s *Sfu) WebsocketHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Sfu) SetMdnsConn(mdnsConn *mdns.Conn) {
+	s.mdnsMu.Lock()
 	s.mdnsConn = mdnsConn
+	s.mdnsMu.Unlock()
 }
 
 // Use our own mdns for resolving .local addresses to work around compatibility problems
@@ -335,12 +312,18 @@ func (s *Sfu) SetMdnsConn(mdnsConn *mdns.Conn) {
 // If the host is not found this will return an error
 // If the host is found the string returned will contain the IP as a string . . .
 func (s *Sfu) mdnsLookup(hostname string) (string, error) {
-	if s.mdnsConn == nil {
+	s.mdnsMu.RLock()
+	mdnsConn := s.mdnsConn
+	s.mdnsMu.RUnlock()
+
+	if mdnsConn == nil {
 		return "", fmt.Errorf("attempting to resolve local subnet host while mdns not in use")
 	}
 
-	ctx, _ := context.WithTimeout(context.Background(), 1*time.Second)
-	_, addr, err := s.mdnsConn.QueryAddr(ctx, hostname)
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	_, addr, err := mdnsConn.QueryAddr(ctx, hostname)
 	if err != nil {
 		return "", err
 	} else {

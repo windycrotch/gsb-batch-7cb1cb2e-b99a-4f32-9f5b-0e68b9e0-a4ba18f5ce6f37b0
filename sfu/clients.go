@@ -3,6 +3,7 @@ package sfu
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"atomirex.com/umbrella/razor"
 	"github.com/gorilla/websocket"
@@ -11,6 +12,7 @@ import (
 type RemoteClient interface {
 	Label() string
 	getStatus() *SFUStatusClient
+	getStatusWithTimeout(timeout time.Duration) *SFUStatusClient
 	stop()
 	AddOutgoingTracksForIncomingTrack(*incomingTrack)
 	RemoveOutgoingTracksForIncomingTrack(*incomingTrack)
@@ -31,6 +33,10 @@ type RemoteClientParameters struct {
 	trunkurl string
 	s        *Sfu
 	ws       *websocket.Conn
+
+	// observer receives connection lifecycle reports when this client represents an
+	// outbound relay server connection. Nil for inbound web clients.
+	observer RemoteClientObserver
 }
 
 type RemoteClientFactory interface {
@@ -65,7 +71,8 @@ func (rcf *DefaultRemoteClientFactory) NewClient(params *RemoteClientParameters)
 					logger: params.logger,
 				},
 
-				url: params.trunkurl,
+				url:      params.trunkurl,
+				observer: params.observer,
 			}
 
 			c.run(params.s)
@@ -79,6 +86,7 @@ func (rcf *DefaultRemoteClientFactory) NewClient(params *RemoteClientParameters)
 				},
 
 				trunkurl: params.trunkurl,
+				observer: params.observer,
 			}
 
 			c.run(nil, params.s)

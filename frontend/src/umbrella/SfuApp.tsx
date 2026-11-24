@@ -1,7 +1,7 @@
 import React, { useEffect } from 'react';
 import ReactDOM from 'react-dom';
 import { useRef, useState } from 'react';
-import { SetUpstreamTracks, RemoteNodeMessage, TrackDescriptor, TrackKind, CurrentServers, MidToUmbrellaIDMapping, SFUStatus, SFUStatusClient, SFUStatusPeerConnection } from '../generated/sfu'
+import { SetUpstreamTracks, RemoteNodeMessage, TrackDescriptor, TrackKind, CurrentServers, MidToUmbrellaIDMapping, SFUStatus, SFUStatusClient, SFUStatusPeerConnection, ServerStatus, ServerState } from '../generated/sfu'
 
 function trackKindFromString(k: string) : TrackKind  {
     switch(k) {
@@ -513,33 +513,57 @@ export const SfuApp = () => {
 };
 
 export const ServersApp = () => {
-    const [servers, setServers] = useState<string[]>([]);
+    const [serverStatuses, setServerStatuses] = useState<ServerStatus[]>([]);
     const addServerInputRef = useRef<HTMLInputElement | null>(null);
+
+    const applyCurrentServers = (current: CurrentServers) => {
+        // The returned "servers" list only contains addresses with a live connection;
+        // "serverStatuses" also covers addresses which are connecting, retrying or
+        // have failed, so the page shows the real state rather than just the intent.
+        setServerStatuses(current.serverStatuses);
+    };
+
+    const refreshServers = () => {
+        fetch(window.location.pathname, {method: 'GET', headers:{'Content-Type': "application/x-protobuf"}})
+        .then((response) => response.arrayBuffer())
+        .then((buffer) => {
+            applyCurrentServers(CurrentServers.fromBinary(new Uint8Array(buffer)));
+        }).catch(console.log);
+    };
 
     useEffect(() => {
         fetch(window.location.pathname, {method: 'GET', headers:{'Content-Type': "application/x-protobuf"}})
         .then((response) => response.arrayBuffer())
         .then((buffer) => {
-            setServers(CurrentServers.fromBinary(new Uint8Array(buffer)).servers);
+            applyCurrentServers(CurrentServers.fromBinary(new Uint8Array(buffer)));
             addServerInputRef.current?.focus();
         }).catch(console.log);
 
-        return () => {};
+        // Connecting/retrying addresses change state on their own, so poll.
+        const interval = setInterval(refreshServers, 2000);
+
+        return () => clearInterval(interval);
     }, []);
 
     const addServerClick = () => {
         const updateVal = addServerInputRef.current!.value!;
-        const serversUpdate = updateVal === "" ? [] : [updateVal];
+        if (updateVal === "") {
+            addServerInputRef.current!.value = "";
+            return;
+        }
 
-        fetch(window.location.pathname, 
+        // Add to what is already intended (deduplicated) rather than replacing it.
+        const intended = Array.from(new Set([...serverStatuses.map(s => s.url), updateVal]));
+
+        fetch(window.location.pathname,
             {
-                method: 'POST', 
+                method: 'POST',
                 headers:{'Content-Type': "application/x-protobuf"},
-                body: CurrentServers.toBinary({servers:serversUpdate})
+                body: CurrentServers.toBinary({servers: intended, serverStatuses: []})
             }
         ).then((response) => response.arrayBuffer())
         .then((buffer) => {
-            setServers(CurrentServers.fromBinary(new Uint8Array(buffer)).servers);
+            applyCurrentServers(CurrentServers.fromBinary(new Uint8Array(buffer)));
             addServerInputRef.current?.focus();
         }).catch(console.log);
 
@@ -547,16 +571,35 @@ export const ServersApp = () => {
     };
 
     const removeServerClick = (server: string) => {
-        fetch(window.location.pathname, 
+        const intended = serverStatuses.map(s => s.url).filter((s) => s !== server);
+
+        fetch(window.location.pathname,
             {
-                method: 'POST', 
+                method: 'POST',
                 headers:{'Content-Type': "application/x-protobuf"},
-                body: CurrentServers.toBinary({servers: servers.filter((s) => s !== server)})
+                body: CurrentServers.toBinary({servers: intended, serverStatuses: []})
             }
         ).then((response) => response.arrayBuffer())
         .then((buffer) => {
-            setServers(CurrentServers.fromBinary(new Uint8Array(buffer)).servers);
+            applyCurrentServers(CurrentServers.fromBinary(new Uint8Array(buffer)));
         }).catch(console.log);
+    };
+
+    const serverStateText = (status: ServerStatus) : string => {
+        switch (status.state) {
+            case ServerState.Connected:
+                return "connected";
+            case ServerState.Connecting:
+                return "connecting";
+            case ServerState.Retrying: {
+                const seconds = Math.max(0, Math.round(status.nextRetryInMillis / 1000));
+                return `retrying in ${seconds}s (${status.attempts} failed attempt${status.attempts === 1 ? "" : "s"})`;
+            }
+            case ServerState.Failed:
+                return `failed after ${status.attempts} attempt${status.attempts === 1 ? "" : "s"}`;
+            default:
+                return "unknown";
+        }
     };
 
     return (
@@ -565,11 +608,15 @@ export const ServersApp = () => {
                 <h4>Servers</h4>
                 <div style={{ flexBasis: '100%' }}></div>
                 <ul>
-                { servers.length === 0 ? ( <li>No servers</li>) : (<>
-                    { servers.map((server, index) => (
-                        <li>{ server } <button onClick={() => { removeServerClick(server) }}>Remove</button></li>
+                { serverStatuses.length === 0 ? ( <li>No servers</li>) : (<>
+                    { serverStatuses.map((status) => (
+                        <li key={status.url}>
+                            { status.url } &mdash; { serverStateText(status) }
+                            { status.lastError !== "" ? <> <em>({ status.lastError })</em></> : null }
+                            {" "}<button onClick={() => { removeServerClick(status.url) }}>Remove</button>
+                        </li>
                     )) }
-                </>) } 
+                </>) }
                 </ul>
                 <div style={{ flexBasis: '100%' }}></div>
                 <input ref={addServerInputRef} type='text' /><button onClick={addServerClick}>Add Server</button>

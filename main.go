@@ -5,7 +5,6 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
-	"io"
 	"io/fs"
 	"log"
 	"net"
@@ -23,7 +22,6 @@ import (
 	"github.com/atomirex/mdns"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
-	"google.golang.org/protobuf/proto"
 )
 
 // nolint
@@ -191,69 +189,14 @@ func main() {
 	addHandler("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFilesSub))))
 
 	generic := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/status" {
-			contentType := r.Header.Get("Content-Type")
-			if contentType == "application/x-protobuf" {
-				status := s.GetStatus()
-
-				log.Println("SFU STATUS", status)
-
-				data, err := proto.Marshal(status)
-				if err != nil {
-					http.Error(w, "Failed to serialize Protobuf", http.StatusInternalServerError)
-					return
-				}
-
-				w.Header().Set("Content-Type", contentType)
-				w.WriteHeader(http.StatusOK)
-
-				w.Write(data)
+		switch r.URL.Path {
+		case "/status":
+			if s.HandleStatus(w, r) {
 				return
 			}
-		}
-
-		if r.URL.Path == "/servers" {
-			contentType := r.Header.Get("Content-Type")
-			if contentType == "application/x-protobuf" {
-				switch r.Method {
-				case http.MethodGet:
-					data, err := proto.Marshal(s.GetCurrentServers())
-					if err != nil {
-						http.Error(w, "Failed to serialize Protobuf", http.StatusInternalServerError)
-						return
-					}
-
-					w.Header().Set("Content-Type", contentType)
-					w.WriteHeader(http.StatusOK)
-
-					w.Write(data)
-					return
-				case http.MethodPost:
-					body, err := io.ReadAll(r.Body)
-					if err != nil {
-						http.Error(w, "Failed to read payload", http.StatusInternalServerError)
-						return
-					}
-
-					var update sfu.CurrentServers
-					err = proto.Unmarshal(body, &update)
-					if err != nil {
-						http.Error(w, "Failed to deserialize payload", http.StatusInternalServerError)
-						return
-					}
-
-					data, err := proto.Marshal(s.SetCurrentServers(&update))
-					if err != nil {
-						http.Error(w, "Failed to serialize Protobuf", http.StatusInternalServerError)
-						return
-					}
-
-					w.Header().Set("Content-Type", contentType)
-					w.WriteHeader(http.StatusOK)
-
-					w.Write(data)
-					return
-				}
+		case "/servers":
+			if s.HandleServers(w, r) {
+				return
 			}
 		}
 

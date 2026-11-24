@@ -68,7 +68,14 @@ When it's running you should be able to access it at https://DOMAIN/umbrella/sfu
 #### Connecting the two
 The real party trick here is a joint session across SFUs. To do this access the server to push to the other (most likely local to cloud, so local), and visit https://HOSTNAME:8081/servers . In the text field put the websocket address for the other server and press the button. The websocket address is "wsb" instead of "sfu", and the protocol is "wss" instead of "https". For example: wss://DOMAIN/umbrella/wsb To stop trunking remove the server connection.
 
-What should happen is all client data for each SFU is relayed to every client of both SFUs, as the result of the data going over the connection between the relays. 
+What should happen is all client data for each SFU is relayed to every client of both SFUs, as the result of the data going over the connection between the relays.
+
+The server list shows the real state of each address rather than just what was submitted: "connected", "connecting", "retrying in Ns" (with the last error) or "failed". A connection which cannot be established is retried with backoff and then given up on; either way it is not listed as a current server, and removing an address stops it whatever state it is in.
+
+The same information is available without the UI. Both endpoints speak `application/x-protobuf`:
+ * `GET /servers` returns `CurrentServers`: `servers` is the set of addresses with a live connection; `serverStatuses` covers every intended address (including connecting / retrying / failed) with the attempt count and last error.
+ * `POST /servers` replaces the intended list and returns the resulting `CurrentServers`, so the response reflects what actually happened rather than echoing the request.
+ * `GET /status` returns `SFUStatus` (relaying tracks, clients, the live `servers` list, and the same `serverStatuses`).
 
 This is a hacked up UI, but it does work.
 

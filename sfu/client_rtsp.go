@@ -30,14 +30,19 @@ type rtspClientCommandMessage struct{}
 type RtspClient struct {
 	BaseClient
 
-	url     string
-	handler *razor.MessageHandler[rtspClientCommand, rtspClientCommandMessage]
+	url      string
+	observer RemoteClientObserver
+	handler  *razor.MessageHandler[rtspClientCommand, rtspClientCommandMessage]
 
 	rtsplibClient   *gortsplib.Client
 	rtspDescription *description.Session
 }
 
 func (r *RtspClient) stop() {
+	if r.handler == nil {
+		return
+	}
+
 	r.handler.Send(rtspClientStop, nil)
 }
 
@@ -57,6 +62,8 @@ func (r *RtspClient) run(s *Sfu) {
 				return true
 			}
 
+			// Retrying is owned by the SFU (with observable backoff), so a failed
+			// dial reports and stops rather than rescheduling itself.
 			failedCheck := func(err error) bool {
 				if err == nil {
 					return false
@@ -69,13 +76,18 @@ func (r *RtspClient) run(s *Sfu) {
 					r.rtsplibClient = nil
 				}
 
-				r.handler.Timeout(rtspClientDial, nil, 5000*time.Millisecond)
+				if r.observer != nil {
+					r.observer.ServerConnectFailed(r.url, r, err)
+				}
+
+				r.handler.Send(rtspClientStop, nil)
 				return true
 			}
 
 			u, err := base.ParseURL(r.url)
 			if err != nil {
 				log.Println("Invalid url", err)
+				failedCheck(err)
 				return true
 			}
 
@@ -114,18 +126,24 @@ func (r *RtspClient) run(s *Sfu) {
 				return true
 			}
 
+			// Capture the connection locally for the media goroutine. stop() may clear
+			// the fields (and close the client) on the handler goroutine at any time,
+			// so the media/RTCP goroutines must not re-read them.
+			client := r.rtsplibClient
+			desc := r.rtspDescription
+
 			go func() {
 				defer s.removeOutgoingTracksForIncomingTrack(videointrack)
 
 				// setup all medias
 				// this must be called before StartRecording(), since it overrides the control attribute.
-				err = r.rtsplibClient.SetupAll(r.rtspDescription.BaseURL, r.rtspDescription.Medias)
+				err := client.SetupAll(desc.BaseURL, desc.Medias)
 				if failedCheck(err) {
 					return
 				}
 
 				// read RTP packets from the reader and route them to the publisher
-				r.rtsplibClient.OnPacketRTPAny(func(medi *description.Media, forma format.Format, pkt *rtp.Packet) {
+				client.OnPacketRTPAny(func(medi *description.Media, forma format.Format, pkt *rtp.Packet) {
 					if medi.Type == description.MediaTypeVideo {
 						p := pkt.Clone()
 						p.Extension = false
@@ -139,6 +157,7 @@ func (r *RtspClient) run(s *Sfu) {
 				})
 
 				rtcpStop := make(chan struct{})
+				defer close(rtcpStop)
 
 				go func() {
 					// Otherwise it basically never does this!
@@ -159,7 +178,7 @@ func (r *RtspClient) run(s *Sfu) {
 								return
 							}
 						case <-keyframehack.C:
-							err := r.rtsplibClient.WritePacketRTCP(r.rtspDescription.Medias[0], &rtcp.PictureLossIndication{})
+							err := client.WritePacketRTCP(desc.Medias[0], &rtcp.PictureLossIndication{})
 							if err != nil {
 								return
 							}
@@ -168,17 +187,22 @@ func (r *RtspClient) run(s *Sfu) {
 				}()
 
 				// start playing
-				_, err = r.rtsplibClient.Play(nil)
-				failedCheck(err)
+				_, err = client.Play(nil)
+				if failedCheck(err) {
+					return
+				}
 
-				failedCheck(r.rtsplibClient.Wait())
-
-				// Properly stop the other goroutines
-				// Dislike this, especially needing to check for panics
-				close(rtcpStop)
+				waitErr := client.Wait()
+				if r.observer != nil && waitErr != nil {
+					r.observer.ServerDisconnected(r.url, r, waitErr)
+				}
 			}()
 
-			s.handler.Send(sfuAddOutgoingTracksForIncomingTrack, &sfuCommandMessage{intrack: videointrack})
+			s.handler.Send(sfuAddOutgoingTracksForIncomingTrack, &sfuCommandMessage{intrack: videointrack, trackOwner: r})
+
+			if r.observer != nil {
+				r.observer.ServerConnected(r.url, r)
+			}
 
 			return true
 		}
@@ -204,5 +228,9 @@ func (r *RtspClient) RequestEvalState() {
 }
 
 func (r *RtspClient) getStatus() *SFUStatusClient {
+	return r.getStatusWithTimeout(2 * time.Second)
+}
+
+func (r *RtspClient) getStatusWithTimeout(timeout time.Duration) *SFUStatusClient {
 	return nil
 }

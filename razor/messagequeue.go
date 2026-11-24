@@ -35,8 +35,8 @@ func (mq *MessageQueue[MessageQueueWhat, PayloadType]) Capacity() uint16 {
 }
 
 func (mq *MessageQueue[MessageQueueWhat, PayloadType]) TryPush(at time.Time, what MessageQueueWhat, payload *PayloadType) bool {
-	Assert(mq.size < mq.capacity)
-
+	// A full queue is a normal, recoverable condition (the caller decides whether to
+	// drop the message or wait), so this must return false rather than panicking.
 	if mq.size >= mq.capacity {
 		return false
 	}

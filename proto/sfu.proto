@@ -62,16 +62,37 @@ message RemoteNodeMessage {
     MidToUmbrellaIDMappings midMappings = 6;
 }
 
+// The lifecycle of an intended relay server.
+// Connecting and Retrying are transient; Failed is terminal until the address is submitted again.
+enum ServerState {
+    ServerStateUnknown = 0;
+    Connecting = 1;
+    Connected = 2;
+    Retrying = 3;
+    Failed = 4;
+}
+
+// The observable state of one intended relay server address.
+message ServerStatus {
+    string url = 1;
+    ServerState state = 2;
+    int32 attempts = 3;          // consecutive failed connection attempts (reset on connect)
+    string lastError = 4;        // last connection error, empty if none
+    int32 nextRetryInMillis = 5; // time until the next retry, only set while Retrying
+}
+
 // Returned from the /servers endpoint with content-type application/x-protobuf
 message CurrentServers {
-    repeated string servers = 1; // urls of the servers
+    repeated string servers = 1; // urls of the servers with a live connection right now
+    repeated ServerStatus serverStatuses = 2; // every intended server, including connecting/retrying/failed ones
 }
 
 // Returned by the /status endpoint with content-type application/x-protobuf
 message SFUStatus {
     repeated TrackDescriptor relayingTracks = 1;
     repeated SFUStatusClient clients = 2;
-    repeated string servers = 3;
+    repeated string servers = 3; // urls of the servers with a live connection right now
+    repeated ServerStatus serverStatuses = 4;
 }
 
 

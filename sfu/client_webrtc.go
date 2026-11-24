@@ -4,9 +4,12 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"atomirex.com/umbrella/razor"
@@ -53,10 +56,29 @@ type clientCommandResult struct {
 type client struct {
 	BaseClient
 
-	trunkurl  string // Empty means this is a normal web client - should replace with proper roles or similar
-	incoming  *PeerConnection
-	outgoing  *PeerConnection
-	websocket *websocket.Conn
+	trunkurl string // Empty means this is a normal web client - should replace with proper roles or similar
+	incoming *PeerConnection
+	outgoing *PeerConnection
+
+	// websocketMu guards websocket, which is assigned on the handler goroutine once a
+	// dial succeeds and read by stop() from whichever goroutine is tearing the client
+	// down.
+	websocketMu sync.Mutex
+	websocket   *websocket.Conn
+
+	// observer receives connection lifecycle reports for relay server (trunk) clients.
+	// Nil for clients which represent an inbound connection.
+	observer RemoteClientObserver
+
+	// abortCh is closed the first time stop is called. Anything which can block (a
+	// dial, a websocket write) selects on it so a stopped server cannot linger and
+	// hold up a replacement connection.
+	abortCh   chan struct{}
+	abortOnce sync.Once
+
+	// stopped is set as soon as teardown starts. Late callbacks then know not to
+	// report a disconnect for a client which the SFU itself asked to stop.
+	stopped atomic.Bool
 
 	// The umbrellaId -> incomingTrack
 	incomingTracks map[string]*incomingTrackWithClientState
@@ -77,16 +99,46 @@ type client struct {
 }
 
 func (c *client) getStatus() *SFUStatusClient {
+	return c.getStatusWithTimeout(2 * time.Second)
+}
+
+func (c *client) getStatusWithTimeout(timeout time.Duration) *SFUStatusClient {
+	if c.handler == nil || c.handler.IsAborted() {
+		return nil
+	}
+
 	msg := clientCommandMessage{result: &clientCommandResult{
 		status: make(chan *SFUStatusClient, 1),
 	}}
 
-	c.handler.Send(clientGetStatus, &msg)
+	if !c.handler.Send(clientGetStatus, &msg) {
+		return nil
+	}
 
-	return <-msg.result.status
+	select {
+	case <-c.abortCh:
+		return nil
+	default:
+	}
+
+	select {
+	case status := <-msg.result.status:
+		return status
+	case <-time.After(timeout):
+		// A client which is wedged (or has gone AWOL mid-teardown) must not block
+		// /status for everyone else.
+		return nil
+	case <-c.abortCh:
+		return nil
+	}
 }
 
 func (c *client) run(ws *websocket.Conn, s *Sfu) {
+	c.runWithPeerConnectionFactory(ws, s, s.peerConnectionFactory)
+}
+
+func (c *client) runWithPeerConnectionFactory(ws *websocket.Conn, s *Sfu, pcFactory PeerConnectionFactory) {
+	c.abortCh = make(chan struct{})
 	c.incomingTracks = make(map[string]*incomingTrackWithClientState)
 	c.outgoingTracks = make(map[string]*outgoingTrackWithClientState)
 
@@ -96,13 +148,24 @@ func (c *client) run(ws *websocket.Conn, s *Sfu) {
 
 	c.senders = make(map[string]*webrtc.RTPSender)
 
-	incoming, err := s.peerConnectionFactory.NewPeerConnection(fmt.Sprintf("incoming for %s", c.label))
-	if c.logger.NilErrCheck(c.label, "Failed to create an incoming peer connection", err) {
+	if pcFactory == nil {
+		// No peer connection factory means no media can ever flow. Report it as a
+		// failed connection attempt instead of leaving a client with no handler.
+		err := fmt.Errorf("no peer connection factory available")
+		c.reportConnectFailed(err)
+		c.stopped.Store(true)
 		return
 	}
 
-	outgoing, err := s.peerConnectionFactory.NewPeerConnection(fmt.Sprintf("outgoing for %s", c.label))
+	incoming, err := pcFactory.NewPeerConnection(fmt.Sprintf("incoming for %s", c.label))
+	if c.logger.NilErrCheck(c.label, "Failed to create an incoming peer connection", err) {
+		c.reportConnectFailed(err)
+		return
+	}
+
+	outgoing, err := pcFactory.NewPeerConnection(fmt.Sprintf("outgoing for %s", c.label))
 	if c.logger.NilErrCheck(c.label, "Failed to create an outgoing peer connection", err) {
+		c.reportConnectFailed(err)
 		return
 	}
 
@@ -143,7 +206,8 @@ func (c *client) run(ws *websocket.Conn, s *Sfu) {
 		case clientKeyframeGateUnlock:
 			sendKeyFrameGate = false
 		case clientSendProto:
-			if c.websocket == nil {
+			ws := c.currentWebsocket()
+			if ws == nil {
 				c.logger.Error(c.label, "Attempting send when not connected to websocket")
 				return true
 			}
@@ -158,7 +222,7 @@ func (c *client) run(ws *websocket.Conn, s *Sfu) {
 
 			c.logger.Verbose(c.label, "ws proto sending "+payload.message.String())
 
-			err = c.websocket.WriteMessage(websocket.BinaryMessage, data)
+			err = ws.WriteMessage(websocket.BinaryMessage, data)
 
 			if c.logger.NilErrCheck(c.label, "Failed to write proto to ws", err) {
 				stop()
@@ -242,9 +306,27 @@ func (c *client) run(ws *websocket.Conn, s *Sfu) {
 
 			payload.result.status <- status
 		case clientDialWs:
-			if c.websocket != nil {
+			if c.currentWebsocket() != nil {
 				return true
 			}
+
+			if c.stopped.Load() {
+				return true
+			}
+
+			// Cancelling this context aborts an in-flight dial as soon as the client
+			// is stopped, so a removed server cannot keep a connection attempt alive
+			// (or complete it later behind the SFU's back).
+			dialContext, cancelDial := context.WithCancel(context.Background())
+			defer cancelDial()
+
+			go func() {
+				select {
+				case <-c.abortCh:
+					cancelDial()
+				case <-dialContext.Done():
+				}
+			}()
 
 			dialer := websocket.Dialer{
 				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // TODO remove this bad ignoring of certs, but useful for local testing
@@ -269,13 +351,33 @@ func (c *client) run(ws *websocket.Conn, s *Sfu) {
 				},
 			}
 
-			conn, _, err := dialer.Dial(c.trunkurl, nil)
-			if c.logger.NilErrCheck(c.label, "Error dialling ws "+c.trunkurl, err) {
-				c.handler.Timeout(clientDialWs, nil, time.Second*10)
+			conn, _, err := dialer.DialContext(dialContext, c.trunkurl, nil)
+			if err != nil {
+				if c.stopped.Load() || errors.Is(err, context.Canceled) {
+					return true
+				}
+
+				// Report the failure so the SFU can retry this address with backoff
+				// using a fresh client, rather than this client retrying internally.
+				c.logger.Error(c.label, "Error dialling ws "+c.trunkurl+" "+err.Error())
+				c.reportConnectFailed(err)
+				stop()
 				return true
 			}
 
-			c.websocket = conn
+			// Both the stopped check and the install happen under the websocket lock,
+			// so a concurrent stop() either closes this connection or is guaranteed to
+			// see it (and clear it). Without that a stop landing between the check and
+			// the install could leave a live connection behind.
+			if !c.installWebsocket(conn) {
+				// We were stopped while the dial was in flight: never let a stopped
+				// server end up holding a live connection.
+				conn.Close()
+				return true
+			}
+
+			c.reportConnected()
+
 			go func() {
 				c.continueWebsocket(s)
 			}()
@@ -327,14 +429,18 @@ func (c *client) run(ws *websocket.Conn, s *Sfu) {
 	}
 
 	c.handler.Loop(func() {
-		for _, it := range c.incomingTracks {
-			s.removeOutgoingTracksForIncomingTrack(it.track)
-		}
+		// Whatever ends this client, its inbound tracks must stop being relayed by the
+		// SFU. Removing them by ownership (rather than by iterating this client's map,
+		// which may race with the handler goroutine) means /status cannot keep showing
+		// tracks or senders for a session which has gone away.
+		// These are teardown messages: losing either would leave a departed session's
+		// tracks or the session itself permanently visible in /status, so wait briefly
+		// for queue room rather than dropping them. This runs on the client's own loop
+		// goroutine, never on the SFU handler goroutine, so it cannot deadlock the SFU.
+		s.handler.SendWait(sfuRemoveClientTracks, &sfuCommandMessage{remoteClient: c}, 5*time.Second)
+		s.handler.SendWait(sfuRemoveClient, &sfuCommandMessage{remoteClient: c}, 5*time.Second)
 
-		if ws != nil {
-			ws.Close()
-			ws = nil
-		}
+		c.clearWebsocket()
 
 		if outgoing != nil {
 			outgoing.wrapped.GracefulClose()
@@ -351,8 +457,89 @@ func (c *client) run(ws *websocket.Conn, s *Sfu) {
 }
 
 func (c *client) stop() {
+	c.stopped.Store(true)
+	c.abortOnce.Do(func() {
+		close(c.abortCh)
+	})
+
+	// Unblocks a pending read so a websocket loop ends promptly. The connection is
+	// closed under the lock, and the field is cleared so nothing later writes to a
+	// connection which has been torn down.
+	c.clearWebsocket()
+
+	// run() can return before the handler exists if PeerConnection construction fails;
+	// stop() must stay safe in that case rather than panicking the SFU goroutine.
+	if c.handler == nil {
+		return
+	}
+
 	c.handler.CancelAll()
 	c.handler.Send(clientStop, nil)
+}
+
+func (c *client) currentWebsocket() *websocket.Conn {
+	c.websocketMu.Lock()
+	defer c.websocketMu.Unlock()
+
+	return c.websocket
+}
+
+func (c *client) setWebsocket(ws *websocket.Conn) {
+	c.websocketMu.Lock()
+	c.websocket = ws
+	c.websocketMu.Unlock()
+}
+
+// installWebsocket publishes a freshly dialled connection, unless teardown has already
+// begun (in which case the caller must discard it). The install and the stopped check
+// are atomic with respect to clearWebsocket, so no stop can be lost in between.
+func (c *client) installWebsocket(ws *websocket.Conn) bool {
+	c.websocketMu.Lock()
+	defer c.websocketMu.Unlock()
+
+	if c.stopped.Load() {
+		return false
+	}
+
+	c.websocket = ws
+	return true
+}
+
+func (c *client) clearWebsocket() {
+	c.websocketMu.Lock()
+	ws := c.websocket
+	c.websocket = nil
+	c.websocketMu.Unlock()
+
+	if ws != nil {
+		ws.Close()
+	}
+}
+
+// reportConnected / reportConnectFailed / reportDisconnected forward lifecycle details
+// for relay server clients. They are no-ops for inbound web clients (nil observer).
+func (c *client) reportConnected() {
+	if c.observer == nil {
+		return
+	}
+
+	c.observer.ServerConnected(c.trunkurl, c)
+}
+
+func (c *client) reportConnectFailed(err error) {
+	if c.observer == nil {
+		return
+	}
+
+	c.observer.ServerConnectFailed(c.trunkurl, c, err)
+}
+
+func (c *client) reportDisconnected(err error) {
+	if c.observer == nil || c.stopped.Load() {
+		return
+	}
+
+	c.observer.ServerDisconnected(c.trunkurl, c, err)
 }
 
 func (c *client) pcTerminated() bool {
@@ -536,7 +723,7 @@ func (c *client) evalIncomingState(s *Sfu) {
 
 					go c.fanoutIncoming(intrack.track, s)
 
-					s.handler.Send(sfuAddOutgoingTracksForIncomingTrack, &sfuCommandMessage{intrack: intrack.track})
+					s.handler.Send(sfuAddOutgoingTracksForIncomingTrack, &sfuCommandMessage{intrack: intrack.track, trackOwner: c})
 					c.logger.Info(c.label, "New incoming track sent to SFU: "+umbrellaId)
 				}
 			}
@@ -709,13 +896,16 @@ func (c *client) continueWebsocket(s *Sfu) {
 		c.stop()
 	}()
 
-	ws := c.websocket
+	ws := c.currentWebsocket()
+	if ws == nil {
+		c.stop()
+		return
+	}
+
 	incoming := c.incoming
 	outgoing := c.outgoing
 
-	s.handler.Send(sfuAddClient, &sfuCommandMessage{client: c})
-
-	defer s.handler.Send(sfuRemoveClient, &sfuCommandMessage{client: c})
+	s.handler.Send(sfuAddClient, &sfuCommandMessage{remoteClient: c})
 
 	icecandidate := func(i *webrtc.ICECandidate, incoming bool) {
 		if i == nil {
@@ -811,12 +1001,18 @@ func (c *client) continueWebsocket(s *Sfu) {
 	for {
 		var message RemoteNodeMessage
 		_, raw, err := ws.ReadMessage()
-		if c.logger.NilErrCheck(c.label, "Failed to read message", err) {
+		if err != nil {
+			// Only a connection which had actually been established counts as a
+			// disconnect; one which was stopped by the SFU does not report at all.
+			c.reportDisconnected(err)
+			c.stop()
 			return
 		}
 
 		if err := proto.Unmarshal(raw, &message); err != nil {
 			c.logger.Error(c.label, "Failed to unmarshal proto to message: "+err.Error())
+			c.reportDisconnected(err)
+			c.stop()
 			return
 		}
 
