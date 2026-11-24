@@ -60,7 +60,6 @@ func main() {
 			rain2.layout()
 		})
 		rain2.Clicked = func() {
-			return
 			index++
 			rain1.lowGlyphCanvas = lowGlyphCanvases[index%2]
 			rain1.highGlyphCanvas = highGlyphCanvases[index%2]
@@ -69,6 +68,12 @@ func main() {
 
 			js.Global.Get("document").Get("body").Get("style").Set("background", backgrounds[index%2])
 		}
+		// Exposed for browser-side verification of rebuild behavior:
+		// generation counts, canvas node counts, listener checks.
+		js.Global.Set("digitalRain", map[string]interface{}{
+			"rain1": rain1,
+			"rain2": rain2,
+		})
 	})
 }
 
@@ -100,7 +105,14 @@ type DigitalRain struct {
 	minSpeed        int
 	maxSpeed        int
 	brightness      float64
+	generation      int // incremented on every successful canvas rebuild
 	Clicked         func()
+}
+
+// Generation returns how many times the canvas has been rebuilt.
+// Exposed for browser-side verification (window.digitalRain).
+func (r *DigitalRain) Generation() int {
+	return r.generation
 }
 
 func NewDigitalRain(parent *js.Object, screenCols int, minSpeed int, maxSpeed int, brightness float64) (*DigitalRain, error) {
@@ -137,23 +149,52 @@ func (r *DigitalRain) start() error {
 
 func (r *DigitalRain) layout() {
 	ratio := js.Global.Get("devicePixelRatio").Float()
+	if ratio <= 0 {
+		ratio = 1
+	}
 	width := r.parent.Get("offsetWidth").Float() * ratio
 	height := r.parent.Get("offsetHeight").Float() * ratio
+	if width <= 0 || height <= 0 {
+		// The parent has no measurable size (e.g. display:none or a
+		// zero-sized container). Keep the previous canvas untouched so
+		// the page never ends up blank or half-initialized.
+		return
+	}
 	if r.canvas != nil && r.width == width && r.height == height && r.ratio == ratio {
 		return
 	}
-	r.width, r.height, r.ratio = width, height, ratio
-	if r.canvas != nil {
-		r.parent.Call("removeChild", r.canvas)
+
+	// Build the replacement canvas first. Only when it is fully usable
+	// do we swap it in, so a failure here leaves the old canvas running.
+	canvas := js.Global.Get("document").Call("createElement", "canvas")
+	ctx := canvas.Call("getContext", "2d")
+	if ctx == nil || !js.Global.Call("Boolean", ctx).Bool() {
+		// No 2D context available; keep rendering to the old canvas.
+		return
 	}
-	r.canvas = js.Global.Get("document").Call("createElement", "canvas")
-	r.ctx = r.canvas.Call("getContext", "2d")
-	r.canvas.Set("width", r.width)
-	r.canvas.Set("height", r.height)
-	r.canvas.Get("style").Set("width", ftoa(r.width/r.ratio)+"px")
-	r.canvas.Get("style").Set("height", ftoa(r.height/r.ratio)+"px")
-	r.canvas.Get("style").Set("position", "absolute")
-	r.parent.Call("appendChild", r.canvas)
+	canvas.Set("width", width)
+	canvas.Set("height", height)
+	canvas.Get("style").Set("width", ftoa(width/ratio)+"px")
+	canvas.Get("style").Set("height", ftoa(height/ratio)+"px")
+	canvas.Get("style").Set("position", "absolute")
+	canvas.Get("style").Set("left", "0")
+	canvas.Get("style").Set("top", "0")
+
+	// Swap atomically and preserve the stacking order: insert the new
+	// canvas exactly where the old one was, then remove the old node.
+	// The old node (and with it its listeners) leaves the DOM here, so
+	// the number of canvas nodes never grows with rebuilds.
+	if r.canvas != nil {
+		r.parent.Call("insertBefore", canvas, r.canvas)
+		r.parent.Call("removeChild", r.canvas)
+	} else {
+		r.parent.Call("appendChild", canvas)
+	}
+	r.canvas = canvas
+	r.ctx = ctx
+	r.width, r.height, r.ratio = width, height, ratio
+	r.generation++
+
 	if r.highGlyphCanvas == nil {
 		r.highGlyphCanvas = highGlyphCanvases[index%2]
 	}
@@ -161,7 +202,14 @@ func (r *DigitalRain) layout() {
 		r.lowGlyphCanvas = lowGlyphCanvases[index%2]
 	}
 
+	// The handlers capture the generation they were registered for.
+	// A rebuild bumps r.generation, so even if a stale canvas somehow
+	// still receives an event, its callbacks are inert.
+	gen := r.generation
 	r.canvas.Call("addEventListener", "click", func(ev *js.Object) {
+		if gen != r.generation {
+			return // stale canvas, ignore
+		}
 		if r.overLink(ev.Get("x").Int(), ev.Get("y").Int()) {
 			js.Global.Set("location", githubLink)
 
@@ -173,6 +221,9 @@ func (r *DigitalRain) layout() {
 	})
 
 	r.canvas.Call("addEventListener", "mousemove", func(ev *js.Object) {
+		if gen != r.generation {
+			return // stale canvas, ignore
+		}
 		if r.overLink(ev.Get("x").Int(), ev.Get("y").Int()) {
 			r.canvas.Get("style").Set("cursor", "pointer")
 			r.linkover = true
@@ -182,7 +233,12 @@ func (r *DigitalRain) layout() {
 		}
 	})
 
-	r.loop(r.timestamp)
+	// Repaint the current state onto the new canvas without advancing
+	// time and without spawning new drops: drops keep their column,
+	// row, speed and glyph sequence, so the migration is visually
+	// continuous. The next animation frame advances by the real
+	// elapsed time only, because r.timestamp is left untouched here.
+	r.render()
 }
 
 func (r *DigitalRain) overLink(x int, y int) bool {
@@ -305,13 +361,24 @@ func (r *DigitalRain) loop(timestamp Duration) {
 		r.timestamp = timestamp
 		return
 	}
+	if r.canvas == nil || r.ctx == nil || r.width <= 0 || r.height <= 0 {
+		// No usable canvas (e.g. the initial layout failed because the
+		// parent had zero size). Keep the clock moving so that when a
+		// canvas does appear, drops advance by real elapsed time only.
+		r.timestamp = timestamp
+		return
+	}
 	elapsed := timestamp - r.timestamp
+	if elapsed < 0 {
+		elapsed = 0
+	}
 	r.timestamp = timestamp
 
 	r.dropRandomWaterDrop(timestamp)
-	r.ctx.Call("clearRect", 0, 0, r.width, r.height)
-	defer r.drawTitles()
 
+	// Advance drops by the real elapsed time. A canvas rebuild never
+	// touches r.timestamp, so a rebuild happening between two frames
+	// can neither double-count nor lose any time span.
 	var drops []*waterDrop
 	for _, drop := range r.drops {
 		var ri = randi()
@@ -321,19 +388,34 @@ func (r *DigitalRain) loop(timestamp Duration) {
 				drop.spedup = true
 			}
 		}
-		gbrightness := r.brightness
-		age := (timestamp - drop.created)
-		if age < Second {
-			gbrightness = float64(age / Second)
-		}
-
 		drop.row += float64(elapsed) / float64(Second) * drop.speed
-		gl := len(drop.glyphs)
-
-		if int(drop.row)-gl > r.maxRows() {
+		if int(drop.row)-len(drop.glyphs) > r.maxRows() {
 			continue
 		}
 		drops = append(drops, drop)
+	}
+	r.drops = drops
+
+	r.render()
+}
+
+// render draws the current drop state without advancing time, spawning
+// drops, or otherwise mutating drop positions. It is called once per
+// animation frame from loop, and directly after a canvas rebuild so the
+// new canvas shows the exact same state the old one did.
+func (r *DigitalRain) render() {
+	if r.ctx == nil {
+		return
+	}
+	r.ctx.Call("clearRect", 0, 0, r.width, r.height)
+	defer r.drawTitles()
+
+	for _, drop := range r.drops {
+		gbrightness := r.brightness
+		age := (r.timestamp - drop.created)
+		if age < Second {
+			gbrightness = float64(age / Second)
+		}
 		gcount := int(drop.row - drop.start)
 		if gcount > len(drop.glyphs) {
 			gcount = len(drop.glyphs)
@@ -351,7 +433,6 @@ func (r *DigitalRain) loop(timestamp Duration) {
 			r.drawGlyphAt(glyph, drop.col, row, brightness*gbrightness, i == 0)
 		}
 	}
-	r.drops = drops
 }
 
 const (
