@@ -2,13 +2,21 @@ package cloud
 
 import (
 	"context"
-
-	"github.com/OmGuptaIND/config"
 )
 
-// GetStore retrieves the store from the context, if ctx is nil it returns the global store.
+// ContextKey is the type of the context keys used by this package.
+type ContextKey string
+
+// ClientKey is the context key under which a CloudClient is stored.
+const ClientKey ContextKey = "client"
+
+// GetClient retrieves the cloud client from the context, if ctx is nil it returns nil.
 func GetClient(ctx *context.Context) CloudClient {
-	ctxStore, _ := (*ctx).Value(config.CloudClientKey).(CloudClient)
+	if ctx == nil || *ctx == nil {
+		return nil
+	}
+
+	ctxStore, _ := (*ctx).Value(ClientKey).(CloudClient)
 
 	return ctxStore
 }

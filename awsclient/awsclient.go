@@ -1,4 +1,4 @@
-package cloud
+package awsclient
 
 import (
 	"bytes"
@@ -7,6 +7,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/OmGuptaIND/cloud"
 	"github.com/OmGuptaIND/env"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/client"
@@ -28,7 +29,7 @@ type AwsClient struct {
 }
 
 // AwsClient handles the connection with AWS S3 Bucket of the recording to the cloud.
-func NewAwsClient(ctx context.Context, opts *AwsClientOptions) (CloudClient, error) {
+func NewAwsClient(ctx context.Context, opts *AwsClientOptions) (cloud.CloudClient, error) {
 	bucketConfig := &aws.Config{
 		Credentials:      credentials.NewStaticCredentials(env.GetBucketKeyId(), env.GetBucketAppKey(), ""),
 		Endpoint:         aws.String(env.GetBucketEndpoint()),
@@ -83,7 +84,7 @@ func (a *AwsClient) CreateMultipartUpload(storagePath *string) (*string, error) 
 }
 
 // UploadPart uploads a part of the file to the cloud.
-func (a *AwsClient) UploadPart(input *CloudUploadPartInput) (*CloudUploadPartReponse, error) {
+func (a *AwsClient) UploadPart(input *cloud.CloudUploadPartInput) (*cloud.CloudUploadPartReponse, error) {
 	partInput := &s3.UploadPartInput{
 		Body:       bytes.NewReader(*input.Buffer),
 		Bucket:     aws.String(a.bucketName),
@@ -98,14 +99,14 @@ func (a *AwsClient) UploadPart(input *CloudUploadPartInput) (*CloudUploadPartRep
 		return nil, fmt.Errorf("failed to upload part %d: %v", *partInput.PartNumber, err)
 	}
 
-	return &CloudUploadPartReponse{
+	return &cloud.CloudUploadPartReponse{
 		ETag:       partResp.ETag,
 		PartNumber: partInput.PartNumber,
 	}, nil
 }
 
 // CompleteMultipartUpload completes the multipart upload session for the file.
-func (a *AwsClient) CompletePartUpload(input *CloudUploadPartInput) (*CloudUploadPartCompleted, error) {
+func (a *AwsClient) CompletePartUpload(input *cloud.CloudUploadPartInput) (*cloud.CloudUploadPartCompleted, error) {
 	completedParts := make([]*s3.CompletedPart, 0)
 
 	for _, part := range *input.Parts {
@@ -130,7 +131,7 @@ func (a *AwsClient) CompletePartUpload(input *CloudUploadPartInput) (*CloudUploa
 
 	recordingUrl := fmt.Sprintf("https://%s.%s/%s", a.bucketName, env.GetBucketEndpoint(), *input.StoragePath)
 
-	return &CloudUploadPartCompleted{
+	return &cloud.CloudUploadPartCompleted{
 		Recording_Url: &recordingUrl,
 	}, nil
 }

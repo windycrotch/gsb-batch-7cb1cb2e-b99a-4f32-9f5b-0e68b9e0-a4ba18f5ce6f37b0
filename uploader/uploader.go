@@ -7,17 +7,17 @@ import (
 	"io"
 	"log"
 	"sync"
-	"sync/atomic"
 
 	"github.com/OmGuptaIND/cloud"
-	"github.com/OmGuptaIND/config"
 )
 
+// MaxBufferSize is the size of a single upload part.
+var MaxBufferSize = int64(5 * 1024 * 1024) // 5MB
+
 type Uploader struct {
-	id     string
-	ctx    context.Context
-	closed atomic.Bool
-	wg     *sync.WaitGroup
+	id  string
+	ctx context.Context
+	wg  *sync.WaitGroup
 
 	recordingId *string
 	storagePath string
@@ -29,14 +29,27 @@ type Uploader struct {
 
 	completedMtx   *sync.Mutex
 	completedParts []*cloud.CloudUploadPartReponse
-	buffer         []byte
+	partErr        error
+
+	// stopMtx serializes Stop calls so concurrent callers share a single
+	// finalization. stopResult caches the successful result so repeated
+	// Stop calls are idempotent; failures are not cached and can be retried.
+	stopMtx    sync.Mutex
+	stopResult *cloud.CloudUploadPartCompleted
+
+	buffer []byte
 }
 
-// NewUploader creates a new Uploader instance.
+// NewUploader creates a new Uploader instance. Start must be called exactly
+// once after NewUploader returns, before Stop is called.
 func NewUploader(ctx context.Context, reader *bufio.Reader, recordingId *string) (*Uploader, error) {
 	uploadCtx := context.WithoutCancel(ctx)
 
 	cloudClient := cloud.GetClient(&uploadCtx)
+
+	if cloudClient == nil {
+		return nil, fmt.Errorf("no cloud client found in context")
+	}
 
 	storagePath := fmt.Sprintf("recording_%s.mp4", *recordingId)
 
@@ -51,7 +64,6 @@ func NewUploader(ctx context.Context, reader *bufio.Reader, recordingId *string)
 		id:          *uploaderId,
 		recordingId: recordingId,
 		storagePath: storagePath,
-		closed:      atomic.Bool{},
 
 		wg: &sync.WaitGroup{},
 
@@ -63,8 +75,12 @@ func NewUploader(ctx context.Context, reader *bufio.Reader, recordingId *string)
 		completedMtx:   &sync.Mutex{},
 		completedParts: make([]*cloud.CloudUploadPartReponse, 0),
 
-		buffer: make([]byte, config.MAX_BUFFER_SIZE),
+		buffer: make([]byte, MaxBufferSize),
 	}
+
+	// Account for the Start loop up front so a concurrent Stop can never
+	// observe an empty WaitGroup while Start is still being scheduled.
+	uploader.wg.Add(1)
 
 	return uploader, nil
 }
@@ -99,9 +115,29 @@ func (u *Uploader) addCompletedPart(part *cloud.CloudUploadPartReponse) {
 	u.completedParts = append(u.completedParts, part)
 }
 
-// Start starts the Uploader.
+// setPartErr records the first part upload error, so Stop can surface it
+// instead of silently completing a recording with missing parts.
+func (u *Uploader) setPartErr(err error) {
+	u.completedMtx.Lock()
+	defer u.completedMtx.Unlock()
+
+	if u.partErr == nil {
+		u.partErr = err
+	}
+}
+
+// getPartErr returns the first part upload error, if any.
+func (u *Uploader) getPartErr() error {
+	u.completedMtx.Lock()
+	defer u.completedMtx.Unlock()
+
+	return u.partErr
+}
+
+// Start starts the Uploader. It reads from the recording until EOF, uploading
+// a part every time the buffer fills up, and uploads the remaining buffered
+// data as the final part once EOF is reached.
 func (u *Uploader) Start() error {
-	u.wg.Add(1)
 	defer func() {
 		log.Println("Start Uploader is done, Getting out of Start Uploader")
 		u.wg.Done()
@@ -123,8 +159,8 @@ func (u *Uploader) Start() error {
 
 		bytesRead += n
 
-		if bytesRead >= int(config.MAX_BUFFER_SIZE) || (err == io.EOF && bytesRead > 0) {
-			log.Println("New Part Started", u.partNumber, " Size", bytesRead, " Req_Size", config.MAX_BUFFER_SIZE)
+		if bytesRead >= int(MaxBufferSize) || (err == io.EOF && bytesRead > 0) {
+			log.Println("New Part Started", u.partNumber, " Size", bytesRead, " Req_Size", MaxBufferSize)
 			tempBuffer := make([]byte, bytesRead)
 			copy(tempBuffer, u.buffer[:bytesRead])
 
@@ -142,6 +178,7 @@ func (u *Uploader) Start() error {
 
 				if err != nil {
 					log.Println("Failed to upload part", partInput.PartNumber, err)
+					u.setPartErr(fmt.Errorf("part %d: %w", partInput.PartNumber, err))
 					return
 				}
 
@@ -161,25 +198,40 @@ func (u *Uploader) Start() error {
 	return nil
 }
 
-// Stop stops the Uploader, buffers everything from the recording onto a temp buffer after which start a different goroutine to upload the last part.
-// After all parts are uploaded, it completes the upload.
+// Stop waits until every remaining byte of the recording has been uploaded
+// and then commits the multipart upload.
+//
+// Stop is safe to call repeatedly and concurrently: concurrent callers wait
+// for the in-flight finalization and share its outcome. A successful result
+// is cached and returned to every subsequent caller; a failure is not cached,
+// so Stop can be retried and will attempt the completion again.
 func (u *Uploader) Stop() (*cloud.CloudUploadPartCompleted, error) {
-	log.Println("Stopping uploader...")
+	u.stopMtx.Lock()
+	defer u.stopMtx.Unlock()
 
-	if u.closed.Load() {
-		log.Println("Uploader is already closed")
-		return nil, fmt.Errorf("uploader is already closed")
+	if u.stopResult != nil {
+		log.Println("Uploader already stopped, returning cached result")
+		return u.stopResult, nil
 	}
 
+	log.Println("Stopping uploader...")
+
+	// Wait for the read loop and all in-flight part uploads, so every
+	// remaining byte of the recording is uploaded before completing.
 	u.wg.Wait()
+
+	// A failed part upload must never be treated as a success.
+	if err := u.getPartErr(); err != nil {
+		return nil, fmt.Errorf("cannot complete upload, a part failed to upload: %w", err)
+	}
 
 	resp, err := u.completeUpload()
 
 	if err != nil {
-		log.Println("Failed to complete upload", err)
+		return nil, err
 	}
 
-	u.closed.Store(true)
+	u.stopResult = resp
 
 	return resp, nil
 }
@@ -196,6 +248,10 @@ func (u *Uploader) completeUpload() (*cloud.CloudUploadPartCompleted, error) {
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to complete multipart upload: %v", err)
+	}
+
+	if resp == nil || resp.Recording_Url == nil {
+		return nil, fmt.Errorf("completed multipart upload but got no recording url back")
 	}
 
 	log.Println("Multipart upload completed", u.GetID(), " Completed Parts Count", len(u.completedParts))

@@ -10,6 +10,7 @@ import (
 	"github.com/OmGuptaIND/cloud"
 	"github.com/OmGuptaIND/config"
 	"github.com/OmGuptaIND/display"
+	"github.com/OmGuptaIND/finalizer"
 	"github.com/OmGuptaIND/livestream"
 	"github.com/OmGuptaIND/recorder"
 	"github.com/OmGuptaIND/uploader"
@@ -30,8 +31,10 @@ type Pipeline struct {
 	Uploader   *uploader.Uploader
 	Livestream *livestream.Livestream
 
-	mtx *sync.Mutex
-	Wg  *sync.WaitGroup
+	finalizer        *finalizer.Finalizer
+	displayCloseOnce sync.Once
+
+	Wg *sync.WaitGroup
 
 	*NewPipelineOptions
 }
@@ -47,9 +50,10 @@ func NewPipeline(ctx context.Context, opts *NewPipelineOptions) (*Pipeline, erro
 		ctx:                ctx,
 		cancel:             cancel,
 		Wg:                 &sync.WaitGroup{},
-		mtx:                &sync.Mutex{},
 		NewPipelineOptions: opts,
 	}
+
+	pipeLine.finalizer = finalizer.New(pipeLine.stopSource, pipeLine.finalizeUpload)
 
 	return pipeLine, nil
 }
@@ -178,15 +182,50 @@ func (p *Pipeline) setupLivestream() error {
 }
 
 // Stop: stops the Pipeline.
+//
+// Stop is safe to call repeatedly and concurrently with the same Pipeline:
+// the finalizer guarantees the shutdown sequence runs only once, concurrent
+// callers share the in-flight result, and a failed shutdown can be retried
+// until it succeeds. Only a fully successful Stop returns the recording url.
 func (p *Pipeline) Stop() (*cloud.CloudUploadPartCompleted, error) {
-	p.mtx.Lock()
-	defer p.mtx.Unlock()
 	log.Println("Stopping Pipeline...", p.ID)
 
+	resp, err := p.finalizer.Stop()
+
+	if err != nil {
+		return nil, err
+	}
+
+	log.Println("Pipeline Stopped", p.ID)
+
+	return resp, nil
+}
+
+// stopSource stops the recording process first, then tears down the display.
+// It is idempotent so it can safely run again when a failed Stop is retried.
+func (p *Pipeline) stopSource() error {
 	p.cancel()
 
+	if p.Recorder != nil {
+		if err := p.Recorder.Close(); err != nil {
+			return fmt.Errorf("error Stopping Recorder: %w", err)
+		}
+	}
+
 	if p.Display != nil {
-		p.Display.Close()
+		p.displayCloseOnce.Do(func() {
+			p.Display.Close()
+		})
+	}
+
+	return nil
+}
+
+// finalizeUpload waits until every remaining byte of the recording has been
+// uploaded and then commits the multipart upload.
+func (p *Pipeline) finalizeUpload() (*cloud.CloudUploadPartCompleted, error) {
+	if p.Uploader == nil {
+		return nil, fmt.Errorf("no uploader found for pipeline %s", p.ID)
 	}
 
 	resp, err := p.Uploader.Stop()
@@ -196,7 +235,6 @@ func (p *Pipeline) Stop() (*cloud.CloudUploadPartCompleted, error) {
 	}
 
 	p.Wg.Wait()
-	log.Println("Pipeline Stopped", p.ID)
 
 	return resp, nil
 }

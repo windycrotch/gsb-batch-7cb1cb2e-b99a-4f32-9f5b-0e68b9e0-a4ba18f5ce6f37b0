@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -99,24 +100,23 @@ func (a *ApiServer) stopRecording(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "Invalid request payload")
 	}
 
-	p, ok := store.GetStore(&a.ctx).GetPipeline(req.Id)
+	// StopPipeline keeps the pipeline in the store when the shutdown fails,
+	// so the caller can retry with the same id; it removes the pipeline only
+	// after the stop has fully succeeded, after which the id is not found.
+	resp, err := store.GetStore(&a.ctx).StopPipeline(req.Id)
 
-	if !ok {
+	if errors.Is(err, store.ErrPipelineNotFound) {
 		return fiber.NewError(fiber.StatusNotFound, "Pipeline not found")
 	}
 
-	resp, err := p.Stop()
-
-	if resp == nil || err != nil {
+	if err != nil {
 		log.Println("Error Occured Stopping Pipeline", err)
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to stop recording pipeline")
 	}
 
-	store.GetStore(&a.ctx).RemovePipeline(p.ID)
-
 	return c.JSON(StopRecordingResponse{
 		Status:       "Recording stopped",
-		Id:           p.ID,
+		Id:           req.Id,
 		RecordingUrl: *resp.Recording_Url,
 	})
 }

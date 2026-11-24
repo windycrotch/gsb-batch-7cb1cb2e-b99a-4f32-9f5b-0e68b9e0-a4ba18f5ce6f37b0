@@ -141,26 +141,18 @@ func (r *Recorder) StartRecording() error {
 }
 
 // Close sends an interrupt signal to the recording process and waits for it to finish.
+// It is idempotent: concurrent and repeated calls are safe, only the first one
+// actually stops the process.
 func (r *Recorder) Close() error {
-	if r.recordCmd == nil {
-		log.Println("Recording process is not running")
-		return nil
-	}
-
-	if r.ctx.Err() != nil {
-		log.Println("Context is already cancelled, no need to stop Recorder")
-		return nil
-	}
-
 	r.mtx.Lock()
 	defer r.mtx.Unlock()
-
-	log.Println("Stopping Recorder process...")
 
 	if r.recordCmd == nil || r.recordCmd.Process == nil {
 		log.Println("Recording FFmpeg process is not running")
 		return nil
 	}
+
+	log.Println("Stopping Recorder process...")
 
 	defer func() {
 		if r.CloseHook != nil {
@@ -197,7 +189,10 @@ func (r *Recorder) Close() error {
 
 	r.recordCmd = nil
 	r.stdout = nil
-	close(r.done)
+	// NOTE: r.done is intentionally not closed. The cmd.Wait goroutine above
+	// may still send the process exit error after a timeout-kill, and sending
+	// on a closed channel would panic; the channel is buffered so the send
+	// never blocks.
 
 	return nil
 }
