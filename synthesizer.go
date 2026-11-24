@@ -68,7 +68,9 @@ func (s *Synthesizer) SetInstruments(is *SynthesizerInstruments) error {
 		return errors.New("mismatching channel count")
 	}
 
-	s.stream.activeChannels = s.stream.activeChannels[:0]
+	// assignCompiledModule rewinds the stream and resets every
+	// channel, so no state from the previous instruments
+	// (or played notes) leaks into the next audition.
 	s.stream.assignCompiledModule(is.instOnly)
 
 	return nil
@@ -99,8 +101,6 @@ func (s *Synthesizer) GetInstruments() *SynthesizerInstruments {
 // is only interested in instruments (and samples).
 func (s *Synthesizer) LoadInstruments(m *xmfile.Module, config LoadModuleConfig) error {
 	s.stream.applyConfigDefaults(m, &config)
-
-	s.stream.activeChannels = s.stream.activeChannels[:0]
 
 	instOnly, err := s.compileModuleInstruments(m, config)
 	if err != nil {
@@ -150,23 +150,31 @@ func (s *Synthesizer) compileModuleInstruments(m *xmfile.Module, config LoadModu
 	return compiled, nil
 }
 
-func (s *Synthesizer) prepareToPlay(duration float64) {
-	s.noteCompiler.reset(&s.stream.module)
-
-	s.stream.module.effectTab = s.stream.module.effectTab[:0]
-	s.stream.module.noteTab = s.stream.module.noteTab[:0]
-
-	if duration == 0 {
-		s.stream.setTempo(240)
-	} else {
-		s.stream.setTempo(1 + int(ticksPerSecond(s.stream.bpm)*duration))
-	}
-}
-
 // PlayNote plays one or more notes up to the specified duration.
 // Using 0 for the duration will play it for several seconds.
+//
+// Every call starts the audition from a clean state: nothing
+// (note, instrument, envelope frame, portamento target, vibrato
+// phase or sample offset) is inherited from the previous audition.
+//
+// If a note can't be compiled, an error is returned and the
+// previously prepared (still playable) state is left untouched.
 func (s *Synthesizer) PlayNote(duration float64, notes ...xmfile.PatternNote) error {
-	s.prepareToPlay(duration)
+	numChannels := len(s.stream.channels)
+
+	tempo := 240
+	if duration != 0 {
+		tempo = 1 + int(ticksPerSecond(s.stream.bpm)*duration)
+	}
+
+	// Compile the notes into temporary tables first.
+	// If anything goes wrong, the stream state is not modified
+	// and the previous note can still be played.
+	tmp := s.stream.module
+	tmp.ticksPerRow = tempo
+	tmp.noteTab = make([]patternNote, 0, numChannels)
+	tmp.effectTab = make([]noteEffect, 0, 8)
+	s.noteCompiler.reset(&tmp)
 
 	chansUsed := 0
 	for _, note := range notes {
@@ -174,17 +182,26 @@ func (s *Synthesizer) PlayNote(duration float64, notes ...xmfile.PatternNote) er
 		if err != nil {
 			return err
 		}
-		s.stream.module.noteTab = append(s.stream.module.noteTab, n)
+		tmp.noteTab = append(tmp.noteTab, n)
 		chansUsed++
-		if chansUsed >= len(s.stream.channels) {
+		if chansUsed >= numChannels {
 			break
 		}
 	}
 
-	for chansUsed < len(s.stream.channels) {
-		s.stream.module.noteTab = append(s.stream.module.noteTab, patternNote{})
+	for chansUsed < numChannels {
+		tmp.noteTab = append(tmp.noteTab, patternNote{})
 		chansUsed++
 	}
+
+	// Commit the new note data and restart the playback from
+	// a clean state, so this audition inherits nothing from
+	// the previous one. The fresh tables are also never shared
+	// with SynthesizerInstruments snapshots or other streams.
+	s.stream.module.noteTab = tmp.noteTab
+	s.stream.module.effectTab = tmp.effectTab
+	s.stream.setTempo(tempo)
+	s.stream.rewind()
 
 	return nil
 }

@@ -10,10 +10,6 @@ type objectPoolList[T any] struct {
 	used int
 }
 
-func (l *objectPoolList[T]) Reset() {
-	l.used = 0
-}
-
 func (l *objectPoolList[T]) ElemsAvailable() int {
 	return len(l.data) - l.used
 }
@@ -27,13 +23,6 @@ func (l *objectPoolList[T]) MakeSlice(n int) []T {
 func initObjectPool[T any](p *objectPool[T], listSize int) {
 	p.lists = make([]objectPoolList[T], 0, 6)
 	p.listSize = listSize
-}
-
-func (p *objectPool[T]) Reset() {
-	for i := range p.lists {
-		l := &p.lists[i]
-		l.Reset()
-	}
 }
 
 func (p *objectPool[T]) MakeSlice(n int) []T {

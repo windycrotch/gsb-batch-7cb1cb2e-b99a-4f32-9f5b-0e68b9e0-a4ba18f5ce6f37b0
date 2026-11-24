@@ -32,14 +32,19 @@ func NewParser(config ParserConfig) *Parser {
 // ParseFromBytes is like Parse, but it uses the byte slide directly.
 func (p *Parser) ParseFromBytes(data []byte) (*Module, error) {
 	err := p.impl.Parse(data)
-	return &p.impl.module, err
+	// Return a copy of the module object, so the next Parse call
+	// can't clobber it while preparing the parser for another run.
+	m := p.impl.module
+	return &m, err
 }
 
 // Parse decodes the XM module file.
 //
-// Note that calling Parse again invalidates previously returned module.
-// This allows a better memory-reuse inside the parser for multi-use cases.
-// If you want to keep more than one module object at time, perform deep cloning.
+// Every Parse call returns an independent Module object;
+// the previously returned modules are never invalidated or
+// modified by the subsequent Parse calls.
+// It's therefore safe to parse several modules with the same
+// parser and load them into streams afterwards.
 func (p *Parser) Parse(r io.Reader) (*Module, error) {
 	// TODO: may want to re-use data buffer between the Parse calls.
 	data, err := io.ReadAll(r)

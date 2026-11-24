@@ -185,13 +185,9 @@ func (s *Stream) LoadModule(m *xmfile.Module, config LoadModuleConfig) error {
 		return errors.New("unsupported sample rate (only 44100 is supported)")
 	}
 
-	if cap(s.channels) < m.NumChannels {
-		s.channels = make([]streamChannel, m.NumChannels)
-		s.activeChannels = make([]*streamChannel, m.NumChannels)
-	}
-	s.channels = s.channels[:m.NumChannels]
-	s.activeChannels = s.activeChannels[:0]
-
+	// Compile the new module before touching any of the stream state.
+	// If the compilation fails, the old module keeps playing normally:
+	// there will be no half-new half-old state inside the stream.
 	compiled, err := compileModule(m, moduleConfig{
 		sampleRate: config.SampleRate,
 		bpm:        config.BPM,
@@ -202,6 +198,18 @@ func (s *Stream) LoadModule(m *xmfile.Module, config LoadModuleConfig) error {
 		return err
 	}
 
+	if cap(s.channels) < m.NumChannels {
+		s.channels = make([]streamChannel, m.NumChannels)
+		s.activeChannels = make([]*streamChannel, m.NumChannels)
+	}
+	s.channels = s.channels[:m.NumChannels]
+	s.activeChannels = s.activeChannels[:0]
+
+	// assignCompiledModule resets the playback position, tempo,
+	// global volume, pending jump state and every channel to
+	// the initial state of the new module.
+	// The caller-level settings (SetLooping, SetVolume and the
+	// event handler) are preserved.
 	s.assignCompiledModule(compiled)
 
 	return nil

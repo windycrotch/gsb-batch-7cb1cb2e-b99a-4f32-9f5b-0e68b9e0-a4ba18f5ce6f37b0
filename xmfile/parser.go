@@ -25,8 +25,6 @@ type parser struct {
 
 	config ParserConfig
 
-	needsReset bool
-
 	// These fields below are needed for better error reporting.
 	stage         string
 	stageIndex    int
@@ -35,48 +33,30 @@ type parser struct {
 }
 
 func newParser(config ParserConfig) *parser {
-	p := &parser{
+	return &parser{
 		noteSet: make(map[uint64]uint16, 512),
 		config:  config,
 	}
-	p.module.Notes = make([]PatternNote, 0, 512)
-	initObjectPool(&p.uint16pool, 2048*8)
-	initObjectPool(&p.patternRowPool, 64*20)
-	return p
 }
 
 func (p *parser) Parse(data []byte) error {
 	p.data = data
 	p.reset()
-	p.needsReset = true
 	return p.parse()
 }
 
 func (p *parser) reset() {
-	if !p.needsReset {
-		// This will only happen during the first run of the parser.
-		return
-	}
-
+	// Every Parse call produces a completely independent module:
+	// no mutable state (module slices, object pools) may be shared
+	// with the modules returned by the previous Parse calls.
+	// The noteSet map never escapes into the module, so it can
+	// be safely reused after clearing.
 	p.offset = 0
-	for k := range p.noteSet {
-		delete(p.noteSet, k)
-	}
-	p.uint16pool.Reset()
-	p.patternRowPool.Reset()
-
-	// Now reset the module.
-	{
-		notes := p.module.Notes[:0]
-		patterns := p.module.Patterns[:0]
-		instruments := p.module.Instruments[:0]
-		patternOrder := p.module.PatternOrder[:0]
-		p.module = Module{
-			Notes:        notes,
-			Patterns:     patterns,
-			Instruments:  instruments,
-			PatternOrder: patternOrder,
-		}
+	clear(p.noteSet)
+	initObjectPool(&p.uint16pool, 2048*8)
+	initObjectPool(&p.patternRowPool, 64*20)
+	p.module = Module{
+		Notes: make([]PatternNote, 0, 512),
 	}
 }
 
