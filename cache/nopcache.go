@@ -20,8 +20,8 @@ func (c *NopCache) Create(_ context.Context, _ KeyFunc) (BlobWriter, error) {
 
 type nopBlobWriter struct{}
 
-func (c *nopBlobWriter) Write(_ []byte) (int, error) {
-	return 0, nil
+func (c *nopBlobWriter) Write(p []byte) (int, error) {
+	return len(p), nil
 }
 
 func (c *nopBlobWriter) Seek(_ int64, _ int) (int64, error) {

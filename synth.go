@@ -42,6 +42,7 @@ type Synth struct {
 	renderBuf []float32
 	readPos   int
 	prevNote  *sequence.Note
+	cacheErr  error
 }
 
 // New creates a new [Synth] with the given sample rate, voicebank, resampler, and concatenator.
@@ -134,6 +135,14 @@ func (s *Synth) ReadSamples(p []float32) (int, error) {
 				return n, fmt.Errorf("gotau Synth: failed to render note %q: %w", note.Lyric, err)
 			}
 			s.prevNote = &note
+			if s.cacheErr != nil {
+				// the note itself was rendered and concatenated successfully
+				// (and stays in the buffer), but caching it failed; report
+				// the failure so the caller perceives it during this read
+				err := s.cacheErr
+				s.cacheErr = nil
+				return n, fmt.Errorf("gotau Synth: failed to cache note %q: %w", note.Lyric, err)
+			}
 		}
 
 		copied := copy(p[n:], s.renderBuf[s.readPos:])
@@ -300,64 +309,37 @@ func (s *Synth) renderSingleNote(note sequence.Note, otoEntry otoini.Entry, next
 		return fmt.Errorf("failed to stat voicebank audio file: %w", err)
 	}
 
-	var resampled aio.SampleReader
-	var doCache bool
 	key := s.getKeyFunc(resampleCfg, otoEntry.FilePath(), fileinfo)
 	ctx := context.Background()
-	if rc, err := s.resCache.Open(ctx, key); err == nil {
-		resampled, err = wav.NewDecoder(rc)
-		if err != nil {
-			return err
-		}
-	} else {
-		f, err := s.vb.FS().Open(otoEntry.FilePath())
-		if err != nil {
-			return err
-		}
-		defer f.Close()
 
-		deco, _, err := codec.Decode(f)
-		if err != nil {
-			return err
-		}
-		if sr := int(deco.Format().SampleRate.Hertz()); sr != s.sr {
-			return fmt.Errorf("voicebank (%d Hz) and synth (%d Hz) sample rates do not match", sr, s.sr)
-		}
-
-		if analyzer, ok := s.res.(resampler.Analyzer); ok {
-			// check if there's the analysis sidecar file available
-			ext := filepath.Ext(otoEntry.FilePath())
-			name := otoEntry.FilePath()[:len(otoEntry.FilePath())-len(ext)]
-			analysisPath := name + strings.ReplaceAll(ext, ".", "_") + analyzer.AnalysisExt()
-			analysisFile, err := s.vb.FS().Open(analysisPath)
-			if err == nil {
-				resampled, err = analyzer.ResampleWithAnalysis(deco, analysisFile, resampleCfg)
-				if err != nil {
-					return fmt.Errorf("failed to resample: %w", err)
-				}
-				if err := analysisFile.Close(); err != nil {
-					return fmt.Errorf("failed to close analysis sidecar file: %w", err)
-				}
-			} else {
-				// nope
-				resampled, err = s.res.Resample(deco, resampleCfg)
-				if err != nil {
-					return fmt.Errorf("failed to resample: %w", err)
-				}
+	var noteBuf []float32
+	var doCache bool
+	for {
+		// try to reuse the cached resampled note, if there's any
+		if rc, err := s.resCache.Open(ctx, key); err == nil {
+			dec, decErr := wav.NewDecoder(rc)
+			if decErr == nil {
+				noteBuf, decErr = aio.ReadAll(dec)
 			}
-		} else {
-			resampled, err = s.res.Resample(deco, resampleCfg)
-			if err != nil {
-				return fmt.Errorf("failed to resample: %w", err)
+			_ = rc.Close()
+			if decErr == nil {
+				break // cache hit
 			}
+			// the cached entry is invalid (e.g. a previous cache write was
+			// interrupted halfway); do not use it, re-render the note and
+			// replace the entry below
 		}
 
+		resampled, err := s.resampleNote(otoEntry, resampleCfg)
+		if err != nil {
+			return err
+		}
+		noteBuf, err = aio.ReadAll(resampled)
+		if err != nil {
+			return fmt.Errorf("failed to read resampled audio: %w", err)
+		}
 		doCache = true
-	}
-
-	noteBuf, err := aio.ReadAll(resampled)
-	if err != nil {
-		return fmt.Errorf("failed to read resampled audio: %w", err)
+		break
 	}
 
 	var doCacheDone chan error
@@ -372,7 +354,6 @@ func (s *Synth) renderSingleNote(note sequence.Note, otoEntry otoini.Entry, next
 
 			f, err := s.resCache.Create(ctx, key)
 			if err != nil {
-				_ = f.Abort()
 				cacheErr = fmt.Errorf("failed to create cache entry: %w", err)
 				return
 			}
@@ -420,21 +401,69 @@ func (s *Synth) renderSingleNote(note sequence.Note, otoEntry otoini.Entry, next
 		Envelope:    note.Envelope,
 		AudioFormat: afmt.Format{SampleRate: freq.Frequency(s.sr) * freq.Hertz, NumChannels: 1},
 	}
-	s.renderBuf, err = s.cat.Concatenate(s.renderBuf, noteBuf, concatCfg)
+	newBuf, err := s.cat.Concatenate(s.renderBuf, noteBuf, concatCfg)
 	if err != nil {
 		return fmt.Errorf("failed to concatenate: %w", err)
 	}
+	s.renderBuf = newBuf
 
 	// wait for caching to finish and check error
 	if doCache {
 		if err := <-doCacheDone; err != nil {
-			// log error instead???
-			// it's non-critical (kinda) since it only affects caching
-			return err
+			// the note has already been concatenated into the render buffer,
+			// so the rendered audio and the playback timeline are unaffected;
+			// stash the failure so ReadSamples can report it to the caller
+			// during this very read
+			s.cacheErr = fmt.Errorf("failed to cache resampled note: %w", err)
 		}
 	}
 
 	return nil
+}
+
+// resampleNote renders a single note by decoding its voicebank audio file and
+// running it through the resampler (with an analysis sidecar file, if the
+// resampler supports it and one is available).
+func (s *Synth) resampleNote(otoEntry otoini.Entry, resampleCfg resampler.ResampleConfig) (aio.SampleReader, error) {
+	f, err := s.vb.FS().Open(otoEntry.FilePath())
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	deco, _, err := codec.Decode(f)
+	if err != nil {
+		return nil, err
+	}
+	if sr := int(deco.Format().SampleRate.Hertz()); sr != s.sr {
+		return nil, fmt.Errorf("voicebank (%d Hz) and synth (%d Hz) sample rates do not match", sr, s.sr)
+	}
+
+	if analyzer, ok := s.res.(resampler.Analyzer); ok {
+		// check if there's the analysis sidecar file available
+		ext := filepath.Ext(otoEntry.FilePath())
+		name := otoEntry.FilePath()[:len(otoEntry.FilePath())-len(ext)]
+		analysisPath := name + strings.ReplaceAll(ext, ".", "_") + analyzer.AnalysisExt()
+		analysisFile, err := s.vb.FS().Open(analysisPath)
+		if err == nil {
+			resampled, err := analyzer.ResampleWithAnalysis(deco, analysisFile, resampleCfg)
+			if err != nil {
+				_ = analysisFile.Close()
+				return nil, fmt.Errorf("failed to resample: %w", err)
+			}
+			if err := analysisFile.Close(); err != nil {
+				return nil, fmt.Errorf("failed to close analysis sidecar file: %w", err)
+			}
+			return resampled, nil
+		}
+		// nope, no analysis sidecar file available
+	}
+
+	resampled, err := s.res.Resample(deco, resampleCfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resample: %w", err)
+	}
+	return resampled, nil
 }
 
 func (s *Synth) resolvePhoneme(ph phonemizer.Phoneme, prefix prefixmap.Prefix) (e otoini.Entry, ok bool) {
