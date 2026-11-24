@@ -22,16 +22,16 @@ type Playlist struct {
 	forceNext    chan bool
 	nanBreakSize int
 
-	playing     bool
-	currentSong string
+	playing      bool
+	playingLast  bool
+	playingMutex sync.RWMutex
+	currentSong  string
 
 	sampleIndexRead  uint64
 	sampleIndexWrite uint64
 
 	newSongHandler     func(startSampleIndex uint64, filename string, songLength int64)
 	pauseToggleHandler func(playing bool, sample uint64)
-
-	playingLast bool
 }
 
 // StreamLoop reads the samples of the song into the internal buffer.
@@ -46,12 +46,12 @@ func (pl *Playlist) StreamLoop(ctx context.Context) {
 			continue
 		}
 
-		pl.currentSong = filename
+		pl.setCurrentSong(filename)
 
 		s, err := getStreamer(filename)
 		if err != nil {
 			logger.Warnf("skipping song %s in playlist: failed to get streamer: %v", filename, err)
-			pl.position++
+			pl.advancePosition()
 			continue
 		}
 
@@ -61,8 +61,8 @@ func (pl *Playlist) StreamLoop(ctx context.Context) {
 }
 
 func (pl *Playlist) nextSong() (song string) {
-	pl.songsMutex.RLock()
-	defer pl.songsMutex.RUnlock()
+	pl.songsMutex.Lock()
+	defer pl.songsMutex.Unlock()
 	if len(pl.songs) == 0 {
 		return ""
 	}
@@ -74,13 +74,13 @@ func (pl *Playlist) nextSong() (song string) {
 func (pl *Playlist) pushStreamer(s beep.StreamSeekCloser) {
 	buf := make([][2]float64, streamerBufferSize)
 	if pl.newSongHandler != nil {
-		go pl.newSongHandler(pl.sampleIndexWrite, pl.currentSong, int64(s.Len()))
+		go pl.newSongHandler(pl.sampleIndexWrite, pl.CurrentSong(), int64(s.Len()))
 	}
 
 	for {
 		n, ok := streamerBufferSize, true
 		pl.callPauseToggleHandler()
-		if pl.playing {
+		if pl.Playing() {
 			n, ok = s.Stream(buf)
 			pl.pushBuffer(buf[:n])
 		} else {
@@ -99,7 +99,7 @@ func (pl *Playlist) shouldBreakStreamerPushLoop(n int, ok bool, bufSize int) boo
 	}
 
 	if !ok || n < bufSize {
-		pl.position++
+		pl.advancePosition()
 		return true
 	}
 	return false
@@ -130,16 +130,36 @@ func (pl *Playlist) pushSample(low, high float64) {
 }
 
 func (pl *Playlist) callPauseToggleHandler() {
-	if pl.playing != pl.playingLast && pl.pauseToggleHandler != nil {
+	pl.playingMutex.Lock()
+	handler := pl.pauseToggleHandler
+	changed := pl.playing != pl.playingLast && handler != nil
+	var playing bool
+	var sample uint64
+	if changed {
 		pl.playingLast = pl.playing
-		go pl.pauseToggleHandler(pl.playing, pl.sampleIndexWrite)
+		playing = pl.playing
+		sample = pl.sampleIndexWrite
+	}
+	pl.playingMutex.Unlock()
+
+	if changed {
+		go handler(playing, sample)
 	}
 }
 
 // SetPos jumps to the song at pos.
 func (pl *Playlist) SetPos(pos int) {
+	pl.songsMutex.Lock()
 	pl.position = pos
+	pl.songsMutex.Unlock()
+
 	pl.forceNext <- true
+}
+
+func (pl *Playlist) advancePosition() {
+	pl.songsMutex.Lock()
+	pl.position++
+	pl.songsMutex.Unlock()
 }
 
 // Pos returns the position of the song currently being played.
@@ -225,17 +245,29 @@ func (pl *Playlist) Fill(low []float64, high []float64) uint64 {
 
 // Playing returns true if the playlist is currently playing audio.
 func (pl *Playlist) Playing() bool {
+	pl.playingMutex.RLock()
+	defer pl.playingMutex.RUnlock()
 	return pl.playing
 }
 
 // SetPlaying can set whether or not the playlist should be playing audio.
 func (pl *Playlist) SetPlaying(p bool) {
+	pl.playingMutex.Lock()
+	defer pl.playingMutex.Unlock()
 	pl.playing = p
 }
 
 // CurrentSong returns the song currently being played
 func (pl *Playlist) CurrentSong() string {
+	pl.songsMutex.RLock()
+	defer pl.songsMutex.RUnlock()
 	return pl.currentSong
+}
+
+func (pl *Playlist) setCurrentSong(song string) {
+	pl.songsMutex.Lock()
+	defer pl.songsMutex.Unlock()
+	pl.currentSong = song
 }
 
 // SetNewSongHandler sets the new song handler, which is called every time the playlist begins playing a new song
@@ -245,6 +277,8 @@ func (pl *Playlist) SetNewSongHandler(nsh func(startSampleIndex uint64, filename
 
 // SetPauseToggleHandler sets the pause toggle handler, which is called every time the playlist is paused/resumed
 func (pl *Playlist) SetPauseToggleHandler(psh func(playing bool, sample uint64)) {
+	pl.playingMutex.Lock()
+	defer pl.playingMutex.Unlock()
 	pl.pauseToggleHandler = psh
 }
 

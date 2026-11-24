@@ -162,15 +162,15 @@ func (ss *serverState) volumeCommand() ssh.Command {
 		Usage: "volume",
 		Info:  "set the playback volume",
 		ExecFunc: func(args []string) (string, bool) {
-			var ok bool
-			ss.volume, ok = parseFloatParam(args, 0)
+			volume, ok := parseFloatParam(args, 0)
 			if !ok {
 				return "", false
 			}
-			if err := ss.sender.SendMessage(&comm.SetVolumeRequest{Volume: ss.volume}); err != nil {
-				return fmt.Sprintf("failed to set volume to %.3f: %v", ss.volume, err), true
+			ss.setVolume(volume)
+			if err := ss.sender.SendMessage(&comm.SetVolumeRequest{Volume: volume}); err != nil {
+				return fmt.Sprintf("failed to set volume to %.3f: %v", volume, err), true
 			}
-			return fmt.Sprintf("setting volume to %.3f", ss.volume), true
+			return fmt.Sprintf("setting volume to %.3f", volume), true
 		},
 	}
 }
@@ -195,7 +195,7 @@ func (ss *serverState) playbackSetCommand(targetPlaying bool) ssh.Command {
 		Usage: "",
 		Info:  action + "s playback",
 		ExecFunc: func([]string) (string, bool) {
-			ss.playlist.SetPlaying(targetPlaying)
+			ss.setPlaying(targetPlaying)
 			return "playback " + action + "d", true
 		},
 	}

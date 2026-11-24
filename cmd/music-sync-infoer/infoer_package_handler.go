@@ -58,13 +58,24 @@ func (i *infoerPackageHandler) HandleChunkInfo(chunkInfo *comm.ChunkInfo, _ net.
 }
 
 func (i *infoerPackageHandler) HandlePauseInfo(pauseInfo *comm.PauseInfo, _ net.Conn) {
-	currentState.PausesMutex.Lock()
-	defer currentState.PausesMutex.Unlock()
-	currentState.Pauses = append(currentState.Pauses, pauseToggle{
+	toggle := pauseToggle{
 		playing:     pauseInfo.Playing,
 		toggleIndex: pauseInfo.ToggleSampleIndex,
-	})
-	sort.Sort(pauseByToggleIndex(currentState.Pauses))
+	}
+
+	currentState.PausesMutex.Lock()
+	defer currentState.PausesMutex.Unlock()
+
+	// Re-subscribing META replays the current snapshot. Identical toggles are
+	// safe to drop so repeated subscriptions do not grow the client history.
+	for _, existing := range currentState.Pauses {
+		if existing == toggle {
+			return
+		}
+	}
+
+	currentState.Pauses = append(currentState.Pauses, toggle)
+	sort.Stable(pauseByToggleIndex(currentState.Pauses))
 }
 
 func (i *infoerPackageHandler) HandleSetVolumeRequest(svr *comm.SetVolumeRequest, _ net.Conn) {
