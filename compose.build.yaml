@@ -1,0 +1,9 @@
+services:
+  media:
+    build: .
+  server:
+    build: .
+  models:
+    build:
+      context: .
+      target: models

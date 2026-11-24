@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ambivox</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body data-state="idle">
+  <main>
+    <header>
+      <h1>ambi<span>vox</span></h1>
+      <p class="tagline">Speak your language. Be heard in theirs.</p>
+    </header>
+
+    <form id="join" autocomplete="off">
+      <p id="invited" hidden>You have been invited to a call.</p>
+      <label>Your name
+        <input id="name" maxlength="40" placeholder="Guest">
+      </label>
+      <label>I speak
+        <select id="lang">
+          <option value="en">English</option>
+          <option value="fr">Français</option>
+          <option value="es">Español</option>
+          <option value="it">Italiano</option>
+        </select>
+      </label>
+      <label id="key-field" hidden>Access key
+        <input id="key" type="password" autocomplete="current-password">
+      </label>
+      <button id="go" type="submit">Start a call</button>
+    </form>
+
+    <section id="call" hidden>
+      <div class="bar">
+        <div>
+          <strong id="room-label"></strong>
+          <span id="peer-label" class="muted">Waiting for someone to join…</span>
+        </div>
+        <div class="actions">
+          <button id="same-room" type="button" aria-pressed="false"
+                  title="Both devices are in the same room: only the person speaking is heard">Same room</button>
+          <button id="headphones" type="button" aria-pressed="false"
+                  title="Both people wear headphones: the translation starts before the sentence ends">Headphones</button>
+          <button id="mute" type="button" aria-pressed="false">Mute</button>
+          <button id="leave" type="button" class="danger">Leave</button>
+        </div>
+      </div>
+      <div id="invite" hidden>
+        <p id="invite-text">Send this link to the person you want to talk to.</p>
+        <div class="link">
+          <input id="invite-link" readonly aria-label="Invitation link">
+          <button id="copy" type="button">Copy</button>
+          <button id="share" type="button" hidden>Share</button>
+        </div>
+      </div>
+      <p id="status" class="muted" role="status"></p>
+      <ol id="captions" aria-live="polite"></ol>
+    </section>
+
+    <p id="error" role="alert" hidden></p>
+    <audio id="remote" autoplay></audio>
+  </main>
+  <script src="app.js" type="module"></script>
+</body>
+</html>

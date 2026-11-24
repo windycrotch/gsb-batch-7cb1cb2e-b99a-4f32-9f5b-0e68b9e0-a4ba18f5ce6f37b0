@@ -1,0 +1,12 @@
+[package]
+name = "ambivox-dsp"
+description = "Resampling, voice activity detection and SIMD kernels for ambivox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["asm"]
+asm = []

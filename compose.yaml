@@ -1,0 +1,47 @@
+name: ambivox
+
+x-image: &image ghcr.io/whispem/ambivox:${AMBIVOX_VERSION:-0.8}
+
+services:
+  media:
+    image: *image
+    restart: unless-stopped
+    command: ["ambivox-media", "serve", "--socket", "/run/ambivox/media.sock", "--backend", "${AMBIVOX_BACKEND:-sussurro}",
+              "--models", "/models", "--profile", "${AMBIVOX_PROFILE:-balanced}",
+              "--whisper", "${AMBIVOX_WHISPER:-}", "--translator", "${AMBIVOX_TRANSLATOR:-}"]
+    volumes:
+      - socket:/run/ambivox
+      - ${AMBIVOX_MODELS:-models}:/models:ro
+
+  server:
+    image: *image
+    restart: unless-stopped
+    command: ["ambivox"]
+    depends_on: [media]
+    environment:
+      AMBIVOX_HOST: ${AMBIVOX_HOST:?set AMBIVOX_HOST to this machine's IP address on the local network}
+      AMBIVOX_PUBLIC_IP: ${AMBIVOX_HOST}
+      AMBIVOX_ACCESS_KEY: ${AMBIVOX_ACCESS_KEY:-}
+      AMBIVOX_INVITE_TTL: ${AMBIVOX_INVITE_TTL:-24h}
+      AMBIVOX_ECHO_GUARD: ${AMBIVOX_ECHO_GUARD:-1}
+    ports:
+      - "8443:8443/tcp"
+      - "8443:8443/udp"
+    volumes:
+      - socket:/run/ambivox
+      - data:/data
+
+  models:
+    image: ghcr.io/whispem/ambivox:${AMBIVOX_VERSION:-0.8}-models
+    profiles: [setup]
+    environment:
+      AMBIVOX_PROFILE: ${AMBIVOX_PROFILE:-balanced}
+      AMBIVOX_WHISPER: ${AMBIVOX_WHISPER:-}
+      AMBIVOX_TRANSLATOR: ${AMBIVOX_TRANSLATOR:-}
+    volumes:
+      - ${AMBIVOX_MODELS:-models}:/models
+
+volumes:
+  socket:
+  data:
+  models:

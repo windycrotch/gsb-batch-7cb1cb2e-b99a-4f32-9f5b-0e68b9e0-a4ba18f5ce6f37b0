@@ -1,0 +1,140 @@
+:root {
+  --ink: #e9e6df;
+  --muted: #8d8a83;
+  --paper: #14151a;
+  --panel: #1c1e25;
+  --line: #2b2e38;
+  --mine: #f2a65a;
+  --theirs: #6cc5b0;
+  --danger: #e2685f;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--paper);
+  color: var(--ink);
+  font: 16px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+main {
+  max-width: 44rem;
+  margin: 0 auto;
+  padding: 3rem 1.25rem 4rem;
+}
+
+h1 {
+  margin: 0;
+  font: 600 2.75rem/1 ui-serif, Georgia, serif;
+  letter-spacing: -0.02em;
+  color: var(--mine);
+}
+
+h1 span { color: var(--theirs); }
+
+.tagline { margin: 0.5rem 0 2.5rem; color: var(--muted); }
+.muted { color: var(--muted); }
+
+form {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  align-items: end;
+}
+
+label > input, label > select { width: 100%; min-width: 0; }
+
+label {
+  display: grid;
+  gap: 0.35rem;
+  font-size: 0.8rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+input, select, button {
+  font: inherit;
+  color: var(--ink);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  padding: 0.65rem 0.8rem;
+}
+
+input:focus-visible, select:focus-visible, button:focus-visible {
+  outline: 2px solid var(--theirs);
+  outline-offset: 2px;
+}
+
+button { cursor: pointer; }
+button[type="submit"] { background: var(--mine); border-color: var(--mine); color: #1b1304; font-weight: 600; }
+button[aria-pressed="true"] { border-color: var(--mine); color: var(--mine); }
+button.danger { border-color: var(--danger); color: var(--danger); }
+
+.bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--line);
+}
+
+#invited { grid-column: 1 / -1; margin: 0; color: var(--theirs); }
+
+#invite {
+  margin-top: 1rem;
+  padding: 0.9rem 1rem;
+  border: 1px dashed var(--theirs);
+  border-radius: 0.75rem;
+}
+
+#invite p { margin: 0 0 0.6rem; }
+.link { display: flex; gap: 0.5rem; }
+.link input { flex: 1; min-width: 0; font-size: 0.85rem; }
+
+.bar strong { display: block; font-size: 1.1rem; }
+.actions { display: flex; gap: 0.5rem; }
+#status { min-height: 1.5rem; font-size: 0.9rem; }
+
+#captions {
+  list-style: none;
+  margin: 1rem 0 0;
+  padding: 0;
+  display: grid;
+  gap: 0.75rem;
+}
+
+#captions li {
+  max-width: 85%;
+  padding: 0.7rem 0.9rem;
+  border-radius: 0.75rem;
+  background: var(--panel);
+  border-left: 3px solid var(--theirs);
+}
+
+#captions li.mine { justify-self: end; border-left: 0; border-right: 3px solid var(--mine); }
+#captions .who { font-size: 0.75rem; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); }
+#captions .said { margin: 0.15rem 0 0; }
+#captions .heard { margin: 0.15rem 0 0; font-size: 0.85rem; color: var(--muted); }
+#captions li.draft .said, #captions li.draft .heard { font-style: italic; opacity: 0.7; }
+#captions li.draft .said::after { content: " …"; color: var(--muted); }
+
+#error {
+  margin-top: 1.5rem;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--danger);
+  border-radius: 0.5rem;
+  color: var(--danger);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  #captions li { animation: rise 180ms ease-out; }
+  @keyframes rise { from { opacity: 0; transform: translateY(6px); } }
+}

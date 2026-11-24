@@ -1,0 +1,57 @@
+# id | spoken | target | sentence | reference translation
+fr-en-01 | fr | en | Bonjour, comment ça va ? | Hello, how are you?
+fr-en-02 | fr | en | Je suis désolée, je suis en retard. | I'm sorry, I'm late.
+fr-en-03 | fr | en | On se retrouve devant la gare à six heures. | Let's meet in front of the station at six.
+fr-en-04 | fr | en | Tu peux me passer le sel, s'il te plaît ? | Can you pass me the salt, please?
+fr-en-05 | fr | en | J'ai mal à la tête depuis ce matin. | I've had a headache since this morning.
+fr-en-06 | fr | en | Ça me fait vraiment plaisir de te voir. | I'm really happy to see you.
+fr-en-07 | fr | en | Il fait super froid aujourd'hui, prends ton manteau. | It's really cold today, take your coat.
+fr-en-08 | fr | en | Je n'ai pas compris, tu peux répéter plus lentement ? | I didn't understand, can you say it again more slowly?
+fr-en-09 | fr | en | On a pris le train de Paris à Marseille la semaine dernière. | We took the train from Paris to Marseille last week.
+fr-en-10 | fr | en | Ma sœur habite à Lyon avec ses deux enfants. | My sister lives in Lyon with her two children.
+fr-en-11 | fr | en | C'est pas grave, ça arrive à tout le monde. | It's no big deal, it happens to everyone.
+fr-en-12 | fr | en | J'en ai marre de ce temps pourri. | I'm fed up with this lousy weather.
+fr-en-13 | fr | en | Le rendez-vous chez le médecin est mardi à quatorze heures trente. | The doctor's appointment is on Tuesday at half past two.
+fr-en-14 | fr | en | Quand j'étais petite, on passait tous nos étés chez ma grand-mère, au bord de la mer. | When I was little, we spent every summer at my grandmother's, by the sea.
+fr-en-15 | fr | en | Est-ce que tu veux qu'on commande une pizza ce soir ? | Do you want to order a pizza tonight?
+fr-en-16 | fr | en | Hier soir, je suis rentrée tard, j'ai mangé une pizza, puis j'ai travaillé jusqu'à minuit. | Last night I got home late, I ate a pizza, and then I worked until midnight.
+en-fr-01 | en | fr | Good morning, did you sleep well? | Bonjour, tu as bien dormi ?
+en-fr-02 | en | fr | Where is the nearest pharmacy? | Où est la pharmacie la plus proche ?
+en-fr-03 | en | fr | I'll call you back in ten minutes. | Je te rappelle dans dix minutes.
+en-fr-04 | en | fr | Could you speak a little louder, please? | Tu pourrais parler un peu plus fort, s'il te plaît ?
+en-fr-05 | en | fr | We're thinking about moving to Bordeaux next year. | On pense déménager à Bordeaux l'année prochaine.
+en-fr-06 | en | fr | My flight leaves at seven fifteen tomorrow morning. | Mon vol part à sept heures et quart demain matin.
+en-fr-07 | en | fr | That sounds great, count me in. | Ça a l'air génial, compte sur moi.
+en-fr-08 | en | fr | I can't find my keys anywhere. | Je ne trouve mes clés nulle part.
+en-fr-09 | en | fr | How much does this cost? | Combien ça coûte ?
+en-fr-10 | en | fr | Don't worry, it's not your fault. | Ne t'inquiète pas, ce n'est pas ta faute.
+en-fr-11 | en | fr | It's raining cats and dogs out there. | Il pleut des cordes dehors.
+en-fr-12 | en | fr | John and Sarah are coming for dinner on Saturday. | John et Sarah viennent dîner samedi.
+en-fr-13 | en | fr | I've been learning French for three years, but I still make mistakes. | J'apprends le français depuis trois ans, mais je fais encore des erreurs.
+en-fr-14 | en | fr | Can you send me the address by text? | Tu peux m'envoyer l'adresse par texto ?
+en-fr-15 | en | fr | The meeting has been moved to Thursday afternoon. | La réunion a été déplacée à jeudi après-midi.
+en-fr-16 | en | fr | When we got to the beach, the sun was setting, the wind had dropped, and everyone was quiet. | Quand on est arrivés à la plage, le soleil se couchait, le vent était tombé et tout le monde se taisait.
+es-en-01 | es | en | Hola, ¿qué tal estás? | Hi, how are you?
+es-en-02 | es | en | ¿Dónde está la estación de metro? | Where is the metro station?
+es-en-03 | es | en | Mañana voy a visitar a mis padres en Sevilla. | Tomorrow I'm going to visit my parents in Seville.
+es-en-04 | es | en | No te preocupes, ya lo arreglamos luego. | Don't worry, we'll sort it out later.
+es-en-05 | es | en | Me encanta cocinar los domingos. | I love cooking on Sundays.
+es-en-06 | es | en | El tren sale a las ocho y media. | The train leaves at half past eight.
+it-en-01 | it | en | Ciao, come stai? | Hi, how are you?
+it-en-02 | it | en | Vorrei un caffè e un cornetto, per favore. | I'd like a coffee and a croissant, please.
+it-en-03 | it | en | Domani andiamo a Firenze in macchina. | Tomorrow we're driving to Florence.
+it-en-04 | it | en | Non ho capito, puoi ripetere? | I didn't understand, can you repeat that?
+it-en-05 | it | en | Mia madre fa la lasagna più buona del mondo. | My mother makes the best lasagna in the world.
+it-en-06 | it | en | Ci vediamo stasera alle nove. | See you tonight at nine.
+en-es-01 | en | es | Thank you so much for your help. | Muchas gracias por tu ayuda.
+en-es-02 | en | es | What time does the museum open? | ¿A qué hora abre el museo?
+en-es-03 | en | es | I'm going to be a little late. | Voy a llegar un poco tarde.
+en-es-04 | en | es | We had a wonderful time in Madrid. | Lo pasamos genial en Madrid.
+en-it-01 | en | it | Thank you so much for your help. | Grazie mille per il tuo aiuto.
+en-it-02 | en | it | What time does the museum open? | A che ora apre il museo?
+en-it-03 | en | it | I'm going to be a little late. | Arrivo un po' in ritardo.
+en-it-04 | en | it | We had a wonderful time in Rome. | Ci siamo divertiti tantissimo a Roma.
+fr-es-01 | fr | es | Tu viens avec nous au cinéma ce soir ? | ¿Vienes con nosotros al cine esta noche?
+fr-es-02 | fr | es | J'ai oublié mon parapluie dans le bus. | Olvidé mi paraguas en el autobús.
+fr-it-01 | fr | it | Tu viens avec nous au cinéma ce soir ? | Vieni con noi al cinema stasera?
+fr-it-02 | fr | it | J'ai oublié mon parapluie dans le bus. | Ho dimenticato l'ombrello sull'autobus.

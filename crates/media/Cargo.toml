@@ -1,0 +1,23 @@
+[package]
+name = "ambivox-media"
+description = "Real-time speech translation media engine for ambivox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[features]
+default = ["asm"]
+asm = ["ambivox-dsp/asm"]
+sussurro = ["ambivox-engine/sussurro"]
+
+[dependencies]
+ambivox-dsp = { path = "../dsp", default-features = false }
+ambivox-engine = { path = "../engine" }
+opus = "0.4"
+
+[[bin]]
+name = "ambivox-media"
+path = "src/main.rs"

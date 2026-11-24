@@ -1,0 +1,11 @@
+.git
+.github
+target
+build
+bin
+models
+third_party
+node_modules
+docs
+*.md
+*.sock

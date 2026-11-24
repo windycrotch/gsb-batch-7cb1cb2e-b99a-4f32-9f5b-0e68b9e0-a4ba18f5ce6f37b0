@@ -1,0 +1,16 @@
+[package]
+name = "ambivox-engine"
+description = "Safe bindings to the ambivox C++ inference engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+links = "ambivox_engine"
+build = "build.rs"
+
+[features]
+sussurro = []
+
+[build-dependencies]
+cmake = "0.1"
