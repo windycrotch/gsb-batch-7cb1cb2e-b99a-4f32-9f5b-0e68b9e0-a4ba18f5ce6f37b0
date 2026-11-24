@@ -1,0 +1,76 @@
+syntax = "proto3";
+package comm;
+
+message Envelope {
+    string type = 1;
+    bytes data = 2;
+}
+
+message TimeSyncRequest {
+    int64 clientSend = 1;
+}
+
+message TimeSyncResponse {
+    int64 clientSendTime = 1;
+    int64 serverRecvTime = 2;
+    int64 serverSendTime = 3;
+}
+
+message QueueChunkRequest {
+    int64 startTime = 1;
+    int64 chunkId = 2;
+    repeated double sampleLow = 3 [packed = true];
+    repeated double sampleHigh = 4 [packed = true];
+	uint64 firstSampleIndex = 5;
+}
+
+message PingMessage {
+}
+
+message PongMessage {
+}
+
+message SetVolumeRequest {
+    double volume = 1;
+}
+
+message SubscribeChannelRequest {
+    Channel channel = 1;
+}
+
+enum Channel {
+    AUDIO = 0;
+    META = 1;
+}
+
+message NewSongInfo {
+	message SongLyricsAtom {
+		int64 timestamp = 1;
+		string caption = 2;
+	}
+	message SongLyricsLine {
+		repeated SongLyricsAtom atoms = 1;
+	}
+	message SongMetadata {
+		string Title = 1;
+		string Artist = 2;
+		string Album = 3;
+	}
+
+	uint64 firstSampleOfSongIndex = 1;
+	string songFileName = 2;
+	int64 songLength = 3;
+	repeated SongLyricsLine lyrics = 4;
+	SongMetadata metadata = 5;
+}
+
+message ChunkInfo {
+	int64 startTime = 1;
+	uint64 firstSampleIndex = 2;
+	uint64 chunkSize = 3;
+}
+
+message PauseInfo {
+	bool playing = 1;
+	uint64 toggleSampleIndex = 2;
+}

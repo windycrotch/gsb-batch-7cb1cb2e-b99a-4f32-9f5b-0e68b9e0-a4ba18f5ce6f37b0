@@ -1,0 +1,35 @@
+version: "2"
+
+exclude_patterns:
+- '**/*.pb.go'
+- 'ssh/parser/shell_parser/'
+- 'metadata/_test_files/'
+- 'ssh/_ls_test_files/'
+- 'ssh/_host_key_test_files/'
+- 'util/_file_lister_test_files/'
+
+
+plugins:
+  gofmt:
+    enabled: true
+  golint:
+    enabled: true
+  govet:
+    enabled: true
+
+checks:
+  method-complexity:
+    config:
+      threshold: 8
+
+  method-lines:
+    config:
+      threshold: 30
+
+  return-statements:
+    config:
+      threshold: 5
+
+  method-count:
+    config:
+      threshold: 25

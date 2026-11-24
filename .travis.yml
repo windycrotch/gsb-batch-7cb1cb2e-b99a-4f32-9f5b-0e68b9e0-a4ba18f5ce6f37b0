@@ -1,0 +1,48 @@
+language: go
+sudo: falsee
+go:
+  - 1.9.x
+go_import_path: github.com/LogicalOverflow/music-sync
+
+env:
+  gobal:
+    secure: "HeAOAbqpJITaviNJ1PFDcEyDrRx0tPTj9fHNFKxxoQ0EErroeX0b7XBAowVrgCVr3EjOCpUIn8l1/1N6JZv6/rjhbZObkWRsDx8fAYgeVDKHWLrDVI2MtWdOtuEyk8LEpds42bI+rKXShIu2FtfX6jjTcOtpxda6QFZ/OZxn2L5SDAWUqPkmdpej7GfIYE1WBjsReumVtdaNaA+0SKdzl39YKfBs3AMU8t+5RnjMRbLEO9XlY1oDKgtoTg0xaTvSCiJpeh56u084gyfi3TvVh3CYCNDWLAkVT0hBuJ/ZFfwjZw/fIrGHlfEjauOSxnSW8fKheyMzsvSuXAOe8I1dTpQeI1BTnT7jxw9M7NOSzUyYgrSvH9Z/dw15vU5KQTfxMwjmaVSIXlUDPU11KzY7Y9lRdM45KYUW/vEf53/SY7F5JYdf3Xt7Lm6tFLNU0rlvHWuYcZY+VKZh2U8k2uabmbjF1w4bNv8hXZtMRa8gyB622tiuogWCDAZiFr5C70FKJXXdoShXhHhqm3eiJsRm/iBIhYtOHEyZ1bDEWCv8/EHckgvg0ZvYsl3zcZNTVcNIo++PhWiX9bMU0i+wGtoId0paeP7+CKMIZlIUMhptEjh/zc7LWSpOYFunWZHUVm4w6GiiNdlClEtO3i+//4Uj15trt+QxTiV9nvtm+4lSOBg="
+
+branches:
+  except:
+  - "gh-pages"
+
+before_install:
+- go get github.com/mitchellh/gox
+- go get github.com/mattn/goveralls
+- go get github.com/axw/gocov/gocov
+- go get -u github.com/AlekSi/gocoverutil
+- sudo apt-get -qq update
+- sudo apt-get install -y libasound2-dev
+install:
+- go get ./...
+- go get github.com/stretchr/testify
+- curl -L https://codeclimate.com/downloads/test-reporter/test-reporter-latest-linux-amd64 > ./cc-test-reporter
+- chmod +x ./cc-test-reporter
+
+before_script:
+- ./cc-test-reporter before-build
+script:
+- go test ./...
+- $GOPATH/bin/gocoverutil -coverprofile=c.out test -covermode=atomic ./...
+after_script:
+- ./cc-test-reporter after-build -t gocov --exit-code $TRAVIS_TEST_RESULT
+- $GOPATH/bin/goveralls -service=travis-ci
+
+before_deploy:
+- gox -output "build/{{.Dir}}-{{.OS}}-{{.Arch}}" -ldflags="-X github.com/LogicalOverflow/music-sync/cmd.Tag=$TRAVIS_TAG -X github.com/LogicalOverflow/music-sync/cmd.Commit=$TRAVIS_COMMIT" -os="windows" ./...
+deploy:
+  provider: releases
+  api_key:
+    secure: Om2NF6H/aiWsaqNq8Yfh7IqAx5hHw92H6/oWDjFA2a0xG8J1ZhdOeixjr18d9cwo4nO7UgxFrhUzz3LcuBs5E3NlH1jVaICcRCKM+QHfefPqFNEMQh6WF4Di/x35MFlmSXJo8jghV+zifVP+xH9B/CIiT6vuqI5wtfCCWVFCRhl7I4nCZbbZXlXw3eobz1+t69Z7OhWAlHv6BxF+3+YRvL3gM2BIqbaDROuQZeFhmyqjbekQQDENv71kn2MSg2O3VQHceQ9ZgUd2isjrSayxq/0x0R74+0egpdSeC29VrzHfLka5XGVAxkYAFmn0RQ/2yIrEfQVfksLlhvhDiWKth2Ae36aVx7pMAhRHvnChon2lcYltJ/cjkHicrmG2iVQCdnyjzS9RVHPcNbTUOBcA0CWu1yM+1x5n2Y1Wtv00IJGznoyiZyoRpeFOaa8OAd78yCz+35DykWTyiqibJMQgeyD0DX/59kxbFyQTVd6I53wN5ipdMWsSbuUH5uxjpGmoSIjh0PTXD+wHi/ZUDuHiOc55VWqM7E6QdAxLikLq9xT9quEiLwpCHEGP+cCMBwCQPiuQEmCvAeNuGryo4BfL5SAzvmRrC96oSuqdYn3I6l5sqa7AZKJLGueVOos1hgjCNW2rPwgUMhME7LHYrNU+h3bHJ5gwWZ6mKxKzLHwqARA=
+  file_glob: true
+  file: build/*
+  on:
+    repo: LogicalOverflow/music-sync
+    tags: true
+  skip_cleanup: true
