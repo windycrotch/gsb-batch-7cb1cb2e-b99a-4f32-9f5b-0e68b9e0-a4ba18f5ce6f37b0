@@ -85,4 +85,26 @@ class PlayerConfigStoreCacheTest {
         assertEquals("second", target.readText())
         assertFalse(File(cacheDir, "configs_remote.json.tmp").exists())
     }
+
+    @Test
+    fun `writeAtomic preserves multi-KB UTF-8 content byte-for-byte across rewrites`() {
+        val target = File(cacheDir, "configs_remote.json")
+        // Larger than any single flush buffer, with multibyte characters, so a truncation or a
+        // charset/streaming mistake can't hide behind the small strings in the other tests.
+        val large = buildString {
+            append("{\"players\":{")
+            repeat(5_000) { i ->
+                if (i > 0) append(',')
+                append('"').append(i.toString(16).padStart(8, '0')).append("\":").append(i)
+            }
+            append("},\"note\":\"αβγδ\"}")
+        }
+        assertTrue(large.toByteArray().size > 32_000)
+
+        PlayerConfigStore.writeAtomic(target, "warmup")
+        PlayerConfigStore.writeAtomic(target, large)
+
+        assertEquals(large, target.readText())
+        assertFalse(File(cacheDir, "${target.name}.tmp").exists())
+    }
 }

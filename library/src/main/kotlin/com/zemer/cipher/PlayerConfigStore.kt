@@ -12,6 +12,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import timber.log.Timber
 import java.io.File
+import java.io.FileOutputStream
 
 /**
  * Owns the player-config table at runtime: bundled asset as the offline default, overlaid
@@ -29,11 +30,11 @@ object PlayerConfigStore {
         "https://raw.githubusercontent.com/ZemerTeam/zemer-cipher/master/library/src/main/assets/player_configs.json"
 
     // Mirrors PlayerJsFetcher.CACHE_TTL_MS.
-    private const val REFRESH_TTL_MS = 6 * 60 * 60 * 1000L
+    internal const val REFRESH_TTL_MS = 6 * 60 * 60 * 1000L
 
     // Failure-triggered refreshes are rate-limited so a player that is unknown both locally
     // and remotely doesn't turn every song into a GitHub request.
-    private const val FORCE_REFRESH_COOLDOWN_MS = 5 * 60 * 1000L
+    internal const val FORCE_REFRESH_COOLDOWN_MS = 5 * 60 * 1000L
 
     // Note: names must not start with "player_" — PlayerJsFetcher.writeToCache() and
     // invalidateCache() purge the player-JS files (player_* + current_hash.txt) from this
@@ -55,7 +56,7 @@ object PlayerConfigStore {
     // its WebView was built under and rebuilds when this advances, so a corrected config for the
     // current player — arriving by any refresh path AFTER the WebView was built from a missing or
     // wrong entry — takes effect on the next decipher instead of being ignored until the process is
-    // restarted. See CipherDeobfuscator.getOrCreateWebView().
+    // restarted. See DecipherBuildState / CipherDeobfuscator.getOrCreateWebView().
     @Volatile
     var configEpoch: Int = 0
         private set
@@ -87,19 +88,62 @@ object PlayerConfigStore {
 
     internal fun rejectionCooldownActive(now: Long) = withinWindow(now, lastRejectionAttemptMs, FORCE_REFRESH_COOLDOWN_MS)
 
-    // Test-only: arm a cooldown stamp without invoking the network refresh paths.
+    // Test-only: arm/disarm a cooldown stamp without invoking the network refresh paths.
     internal fun armForcedCooldownForTest(ms: Long) { lastForcedAttemptMs = ms }
 
     internal fun armRejectionCooldownForTest(ms: Long) { lastRejectionAttemptMs = ms }
 
-    // True when the most recent fetch got ANY HTTP response (200/304/404/...). The forced-refresh
-    // cooldown only arms in that case — it exists to protect the config host from repeat hits,
-    // not to delay recovery after a pure network failure (e.g. rotation hit while offline).
+    /**
+     * Wall-clock source for every timestamp this object writes or compares. Routed through a
+     * seam so unit tests can drive cooldown/TTL behavior — including a backward clock step —
+     * deterministically. Production always reads the real system clock.
+     */
     @Volatile
-    private var lastAttemptReachedServer = false
+    internal var clockMs: () -> Long = { System.currentTimeMillis() }
+
+    /**
+     * Result of one remote-fetch transport attempt. [NetworkFailure] means the server was never
+     * reached (DNS/connect/timeout/TLS) and therefore must NOT consume a cooldown; any
+     * [Response] — 200, 304, 4xx, 5xx — did reach the host and arms the calling path's cooldown.
+     */
+    internal sealed interface RemoteFetch {
+        data object NetworkFailure : RemoteFetch
+        data class Response(val code: Int, val body: String?, val etag: String?) : RemoteFetch
+    }
+
+    /**
+     * Transport seam: production uses OkHttp ([performHttpFetch]); unit tests install a fake.
+     * Suspending so a test can park a fetch mid-flight (to exercise single-flight piggybacking)
+     * without blocking a dispatcher thread; the production implementation is the ordinary
+     * blocking OkHttp call, executed on Dispatchers.IO by the callers.
+     */
+    internal fun interface ConfigFetcher {
+        suspend fun fetch(ifNoneMatch: String?): RemoteFetch
+    }
+
+    @Volatile
+    internal var fetcherForTest: ConfigFetcher? = null
 
     private val refreshMutex = Mutex()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    // Monotonic fetch generation. A caller snapshots it BEFORE acquiring [refreshMutex]; if it
+    // advanced by the time the lock is held, another path's fetch landed during the wait and the
+    // caller piggybacks on that outcome (see [adoptOutcomeIfFetchedDuringWait]) instead of issuing
+    // a duplicate request to the same URL. Writes happen under the lock; the volatile read is only
+    // a pre-lock snapshot.
+    @Volatile
+    private var fetchSerial: Long = 0L
+
+    // Outcome of the most recent fetch. Guarded by refreshMutex.
+    private class FetchOutcomeSummary(
+        val serial: Long,
+        val changed: Boolean,
+        val reachedServer: Boolean,
+        val completedAtMs: Long,
+    )
+
+    private var lastFetchOutcome: FetchOutcomeSummary? = null
 
     // One shared client for the whole library — see ZemerCipher.httpClient.
     private val httpClient: OkHttpClient
@@ -137,6 +181,14 @@ object PlayerConfigStore {
         val cached = parseSource("cached remote copy") { cacheFile()?.takeIf { it.exists() }?.readText() }
         mergedConfigs = if (cached != null) {
             Timber.tag(TAG).d("Overlaying cached remote configs (${cached.size} hashes)")
+            // A readable body beside an unreadable meta means the ETag line is garbage: the next
+            // conditional request would carry a junk If-None-Match. Drop the meta so that request
+            // goes out unconditional and a fresh ETag gets written, instead of trusting the junk.
+            val meta = metaFile()
+            if (meta?.exists() == true && readMeta() == null) {
+                Timber.tag(TAG).w("Cached meta unreadable beside a valid body — discarding stale ETag")
+                meta.delete()
+            }
             PlayerConfigParser.merge(bundledConfigs, cached)
         } else {
             cacheFile()?.delete()
@@ -171,6 +223,20 @@ object PlayerConfigStore {
         mergedConfigs = configs
     }
 
+    /** Test-only: clears process-global state between JUnit tests. configEpoch deliberately stays. */
+    internal fun resetForTest() {
+        bundledConfigs = emptyMap()
+        mergedConfigs = emptyMap()
+        lastForcedAttemptMs = 0L
+        lastRejectionAttemptMs = 0L
+        fetchSerial = 0L
+        lastFetchOutcome = null
+        fetcherForTest = null
+        clockMs = { System.currentTimeMillis() }
+        cacheDirForTest = null
+        appContext = null
+    }
+
     /**
      * Failure-triggered refresh: called when a player-hash lookup misses. Single-flight, with
      * the cooldown decided under the lock (a check-then-set outside it would let concurrent
@@ -179,6 +245,7 @@ object PlayerConfigStore {
      * callers retry extraction exactly when it can succeed.
      */
     suspend fun forceRefresh(missingHash: String): Boolean = withContext(Dispatchers.IO) {
+        val serialAtEntry = fetchSerial
         refreshMutex.withLock {
             // A refresh that held the lock while we waited (startup TTL, another miss) may
             // have just landed this config — don't burn a fetch or arm the cooldown.
@@ -187,13 +254,30 @@ object PlayerConfigStore {
                 return@withLock true
             }
 
-            val now = System.currentTimeMillis()
+            val now = clockMs()
             if (forcedCooldownActive(now)) {
                 Timber.tag(TAG).d("forceRefresh skipped (cooldown)")
                 return@withLock false
             }
+
+            // A fetch that completed while we queued on the lock already answered this call:
+            // adopt its outcome (and its cooldown semantics) rather than duplicate the request.
+            adoptOutcomeIfFetchedDuringWait(
+                serialAtEntry,
+                armStamp = { lastForcedAttemptMs = it },
+                resetStamp = { lastForcedAttemptMs = 0L },
+            )?.let { outcome ->
+                Timber.tag(TAG).d("forceRefresh piggybacked on a fetch that finished during the lock wait")
+                return@withLock outcome.changed && mergedConfigs.containsKey(missingHash)
+            }
+
             lastForcedAttemptMs = now
-            fetchAndApplyResetting { lastForcedAttemptMs = 0L }
+            val result = fetchAndApply()
+            if (!result.reachedServer) {
+                // The host was never contacted — don't consume the cooldown on a pure network
+                // failure, so a rotation hit while briefly offline retries on the next trigger.
+                lastForcedAttemptMs = 0L
+            }
             mergedConfigs.containsKey(missingHash)
         }
     }
@@ -203,40 +287,61 @@ object PlayerConfigStore {
      * which can mean the cipher produced a wrong-but-non-throwing signature from a stale/wrong
      * player config — a failure the [CipherDeobfuscator] exception-retry never sees. Unlike
      * [forceRefresh], this does NOT short-circuit when the current hash is already present (the
-     * entry may be present but WRONG), so it always re-fetches; it has its OWN cooldown (so it can't
-     * starve the unknown-hash [forceRefresh] path) but shares the single-flight lock. Returns
-     * whether the table changed — when true, [configEpoch] has advanced and the cipher rebuilds.
+     * entry may be present but WRONG), so it always re-fetches unless gated; it has its OWN
+     * cooldown (so it can't starve the unknown-hash [forceRefresh] path) but shares the
+     * single-flight lock. Returns whether the table changed — when true, [configEpoch] has
+     * advanced and the cipher rebuilds.
      */
     suspend fun refreshAfterStreamRejection(): Boolean = withContext(Dispatchers.IO) {
+        val serialAtEntry = fetchSerial
         refreshMutex.withLock {
-            val now = System.currentTimeMillis()
+            val now = clockMs()
             if (rejectionCooldownActive(now)) {
                 Timber.tag(TAG).d("refreshAfterStreamRejection skipped (cooldown)")
                 return@withLock false
             }
+
+            adoptOutcomeIfFetchedDuringWait(
+                serialAtEntry,
+                armStamp = { lastRejectionAttemptMs = it },
+                resetStamp = { lastRejectionAttemptMs = 0L },
+            )?.let { outcome ->
+                Timber.tag(TAG).d("refreshAfterStreamRejection piggybacked on a fetch that finished during the lock wait")
+                return@withLock outcome.changed
+            }
+
             lastRejectionAttemptMs = now
-            fetchAndApplyResetting { lastRejectionAttemptMs = 0L }
+            val result = fetchAndApply()
+            if (!result.reachedServer) lastRejectionAttemptMs = 0L
+            result.changed
         }
     }
 
     /**
-     * Shared fetch tail for the cooldown-gated refresh paths: fetch + apply, and on a pure network
-     * failure (the server was never reached) reset the caller's cooldown stamp so a rotation hit
-     * while briefly offline retries on the next trigger instead of waiting out the cooldown.
-     * Returns whether the table changed. Must be called with [refreshMutex] held.
+     * If a fetch completed while this caller waited for [refreshMutex] (the serial advanced past
+     * [serialAtEntry]), adopt its outcome: arm this path's cooldown when the server was reached,
+     * leave the stamp disarmed on a pure network failure — exactly the semantics a self-performed
+     * fetch would have produced. Returns null when nothing was fetched during the wait, so the
+     * caller proceeds to its own gated fetch. Must be called under the lock.
      */
-    private fun fetchAndApplyResetting(resetCooldown: () -> Unit): Boolean {
-        val changed = fetchAndApply()
-        if (!lastAttemptReachedServer) resetCooldown()
-        return changed
+    private fun adoptOutcomeIfFetchedDuringWait(
+        serialAtEntry: Long,
+        armStamp: (Long) -> Unit,
+        resetStamp: () -> Unit,
+    ): FetchOutcomeSummary? {
+        val outcome = lastFetchOutcome ?: return null
+        if (outcome.serial <= serialAtEntry) return null
+        if (outcome.reachedServer) armStamp(outcome.completedAtMs) else resetStamp()
+        return outcome
     }
 
     private suspend fun refreshIfStale() {
         val lastFetchMs = readMeta()?.second ?: 0L
+        val now = clockMs()
         // lastFetchMs is persisted, so a future stamp (wall clock stepped back after the
         // write) must count as stale, not fresh — withinWindow handles that.
-        if (withinWindow(System.currentTimeMillis(), lastFetchMs, REFRESH_TTL_MS)) {
-            Timber.tag(TAG).d("Remote configs fresh (fetched ${System.currentTimeMillis() - lastFetchMs} ms ago)")
+        if (withinWindow(now, lastFetchMs, REFRESH_TTL_MS)) {
+            Timber.tag(TAG).d("Remote configs fresh (fetched ${now - lastFetchMs} ms ago)")
             return
         }
         withContext(Dispatchers.IO) {
@@ -244,58 +349,97 @@ object PlayerConfigStore {
         }
     }
 
+    /** Test-only entry point for the TTL gate (the production caller is scheduleStartupRefresh). */
+    internal suspend fun refreshIfStaleForTest() = refreshIfStale()
+
+    private class FetchResult(val changed: Boolean, val reachedServer: Boolean)
+
     /**
      * Fetches the remote JSON (with If-None-Match) and applies it when valid. Any failure —
      * HTTP error (including the 404 served until the file lands on the repo's default
      * branch), network exception, or validation failure — keeps the previous map and cache.
      * lastFetchMs is only advanced on 200/304 so transient failures retry on the next trigger.
+     * Records a [FetchOutcomeSummary] under the lock so callers that queued during this fetch
+     * can piggyback instead of repeating the request.
      */
-    private fun fetchAndApply(): Boolean {
-        lastAttemptReachedServer = false
-        try {
-            val etag = readMeta()?.first
+    private suspend fun fetchAndApply(): FetchResult {
+        val ifNoneMatch = readMeta()?.first
+        val remoteFetch = fetcherForTest?.fetch(ifNoneMatch) ?: performHttpFetch(ifNoneMatch)
+
+        val result = when (remoteFetch) {
+            is RemoteFetch.NetworkFailure -> {
+                Timber.tag(TAG).w("Remote config fetch never reached the server — keeping previous configs")
+                FetchResult(changed = false, reachedServer = false)
+            }
+            is RemoteFetch.Response -> handleResponse(remoteFetch, ifNoneMatch)
+        }
+
+        lastFetchOutcome = FetchOutcomeSummary(
+            serial = ++fetchSerial,
+            changed = result.changed,
+            reachedServer = result.reachedServer,
+            completedAtMs = clockMs(),
+        )
+        return result
+    }
+
+    private fun handleResponse(response: RemoteFetch.Response, requestEtag: String?): FetchResult {
+        // Any HTTP response — including error codes — means the host was reached, so the calling
+        // path's cooldown must arm. Only a transport-level failure leaves it disarmed.
+        if (response.code == 304) {
+            Timber.tag(TAG).d("Remote configs unchanged (304)")
+            writeMeta(response.etag ?: requestEtag.orEmpty(), clockMs())
+            return FetchResult(changed = false, reachedServer = true)
+        }
+        if (response.code !in 200..299) {
+            Timber.tag(TAG).w("Remote config fetch HTTP ${response.code} — keeping previous configs")
+            return FetchResult(changed = false, reachedServer = true)
+        }
+
+        val body = response.body
+        if (body.isNullOrEmpty()) {
+            Timber.tag(TAG).w("Remote config fetch returned empty body — keeping previous configs")
+            return FetchResult(changed = false, reachedServer = true)
+        }
+
+        val remote = when (val parsed = PlayerConfigParser.parse(body)) {
+            is PlayerConfigParser.ParseResult.Failure -> {
+                // A new table that fails validation must never displace the last-good one —
+                // keeping the previous map/cache is what prevents a bad publish from locking
+                // the device onto a broken or empty table.
+                Timber.tag(TAG).w("Remote configs rejected: ${parsed.reason} — keeping previous configs")
+                return FetchResult(changed = false, reachedServer = true)
+            }
+            is PlayerConfigParser.ParseResult.Success -> {
+                if (parsed.skippedEntries.isNotEmpty()) {
+                    Timber.tag(TAG).w("Remote configs: skipped invalid entries ${parsed.skippedEntries}")
+                }
+                parsed.configs
+            }
+        }
+
+        val changed = applyRemote(remote, body, response.etag.orEmpty())
+        return FetchResult(changed, reachedServer = true)
+    }
+
+    private fun performHttpFetch(ifNoneMatch: String?): RemoteFetch {
+        return try {
             val request = Request.Builder()
                 .url(REMOTE_URL)
                 .header("User-Agent", "Mozilla/5.0")
-                .apply { if (!etag.isNullOrEmpty()) header("If-None-Match", etag) }
+                .apply { if (!ifNoneMatch.isNullOrEmpty()) header("If-None-Match", ifNoneMatch) }
                 .build()
 
             httpClient.newCall(request).execute().use { response ->
-                lastAttemptReachedServer = true
-                if (response.code == 304) {
-                    Timber.tag(TAG).d("Remote configs unchanged (304)")
-                    writeMeta(etag.orEmpty(), System.currentTimeMillis())
-                    return false
-                }
-                if (!response.isSuccessful) {
-                    Timber.tag(TAG).w("Remote config fetch HTTP ${response.code} — keeping previous configs")
-                    return false
-                }
-
-                val body = response.body?.string()
-                if (body.isNullOrEmpty()) {
-                    Timber.tag(TAG).w("Remote config fetch returned empty body — keeping previous configs")
-                    return false
-                }
-
-                val remote = when (val result = PlayerConfigParser.parse(body)) {
-                    is PlayerConfigParser.ParseResult.Failure -> {
-                        Timber.tag(TAG).w("Remote configs rejected: ${result.reason} — keeping previous configs")
-                        return false
-                    }
-                    is PlayerConfigParser.ParseResult.Success -> {
-                        if (result.skippedEntries.isNotEmpty()) {
-                            Timber.tag(TAG).w("Remote configs: skipped invalid entries ${result.skippedEntries}")
-                        }
-                        result.configs
-                    }
-                }
-
-                return applyRemote(remote, body, response.header("ETag").orEmpty())
+                RemoteFetch.Response(
+                    code = response.code,
+                    body = response.body?.string(),
+                    etag = response.header("ETag"),
+                )
             }
         } catch (e: Exception) {
             Timber.tag(TAG).w(e, "Remote config fetch failed: ${e.message} — keeping previous configs")
-            return false
+            RemoteFetch.NetworkFailure
         }
     }
 
@@ -318,7 +462,7 @@ object PlayerConfigStore {
 
         try {
             cacheFile()?.let { writeAtomic(it, body) }
-            writeMeta(etag, System.currentTimeMillis())
+            writeMeta(etag, clockMs())
         } catch (e: Exception) {
             Timber.tag(TAG).w(e, "Could not persist remote configs (kept in memory): ${e.message}")
         }
@@ -387,17 +531,23 @@ object PlayerConfigStore {
     }
 
     /**
-     * Temp-file + rename so a process death mid-write can't leave a truncated file (a
-     * corrupt cache body beside a valid ETag is exactly the 304-lock state
-     * [applyCachedOverlay] defends against).
+     * Temp-file + fsync + rename so a process death mid-write can't leave a truncated file
+     * (a corrupt cache body beside a valid ETag is exactly the 304-lock state
+     * [applyCachedOverlay] defends against). The bytes are forced to disk BEFORE the rename:
+     * rename is atomic, but without the sync a kill between rename and flush could expose an
+     * empty or short target.
      */
     internal fun writeAtomic(file: File, content: String) {
         val tmp = File(file.parentFile, "${file.name}.tmp")
-        tmp.writeText(content)
+        FileOutputStream(tmp).use { stream ->
+            stream.write(content.toByteArray(Charsets.UTF_8))
+            stream.flush()
+            stream.fd.sync()
+        }
         if (!tmp.renameTo(file)) {
-            // renameTo won't overwrite an existing target on some filesystems — retry after
-            // deleting it (two cheap metadata ops, still atomic) before the last-resort direct
-            // write, which is both non-atomic and a second full write of the content.
+            // renameTo won't overwrite an existing target on some filesystems (notably Windows) —
+            // retry after deleting it (two cheap metadata ops, still atomic) before the last-resort
+            // direct write, which is both non-atomic and a second full write of the content.
             file.delete()
             if (!tmp.renameTo(file)) {
                 file.writeText(content)

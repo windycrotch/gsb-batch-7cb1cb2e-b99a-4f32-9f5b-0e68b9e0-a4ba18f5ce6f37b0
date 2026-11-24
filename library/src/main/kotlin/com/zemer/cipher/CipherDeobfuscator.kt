@@ -21,13 +21,11 @@ object CipherDeobfuscator {
     }
 
     private var cipherWebView: CipherWebView? = null
-    private var currentPlayerHash: String? = null
 
-    // The PlayerConfigStore.configEpoch the cached WebView was built under. When the config table
-    // changes (epoch advances), the cached WebView may have been built from a missing or wrong
-    // config for the current player, so getOrCreateWebView() rebuilds it instead of trusting it for
-    // the life of the process — the staleness that previously required an app restart to recover.
-    private var builtConfigEpoch = -1
+    // All "is the cached instance built from the live config table?" state lives in this pure-JVM
+    // state machine so the refresh-during-build / failed-build / renderer-death timings are unit
+    // testable without a WebView. See DecipherBuildState for the contract.
+    private val buildState = DecipherBuildState()
 
     /**
      * The `player_ias` hash last used to decipher a web stream (sig/n), or null if none yet.
@@ -35,7 +33,7 @@ object CipherDeobfuscator {
      * (ANDROID_VR/IOS) never run the cipher, so this reflects the last *web* stream.
      */
     val lastUsedPlayerHash: String?
-        get() = currentPlayerHash
+        get() = buildState.currentPlayerHash
     // CipherWebView has single-shot continuation slots — serialize all calls
     private val deobfuscateMutex = Mutex()
 
@@ -226,30 +224,41 @@ object CipherDeobfuscator {
             return null
         }
 
-        // Snapshot the epoch BEFORE extracting/building. A refresh that lands on another thread
-        // during this (multi-second) build then leaves builtConfigEpoch behind the live epoch,
-        // forcing a rebuild on the next decipher instead of masking the change. Capturing the epoch
-        // AFTER the build would record a config this WebView never actually incorporated — the
-        // staleness this whole mechanism exists to prevent.
-        val epochAtStart = PlayerConfigStore.configEpoch
-        if (!forceRefresh && cipherWebView != null && builtConfigEpoch == epochAtStart) {
+        val liveEpoch = PlayerConfigStore.configEpoch
+        if (buildState.canReuseInstance(liveEpoch, forceRefresh)) {
             return cipherWebView
         }
 
-        // The epoch whose config this build incorporates. Defaults to the pre-build snapshot; the
-        // incomplete-extraction path below advances it only after a same-thread forceRefresh whose
-        // new config we re-extract and therefore HAVE incorporated (avoids a needless next rebuild).
-        var builtEpoch = epochAtStart
-
-        // Close existing WebView if any
+        // Close existing WebView if any.
         if (cipherWebView != null) {
             closeWebView()
         }
 
+        // Snapshot the epoch BEFORE extracting/building. A refresh that lands on another thread
+        // during this (multi-second) build then leaves the build state behind the live epoch,
+        // forcing a rebuild on the next decipher instead of masking the change. Recording the
+        // epoch AFTER the build would claim a config this WebView never actually incorporated —
+        // the staleness this whole mechanism exists to prevent.
+        buildState.beginBuild(liveEpoch)
+        try {
+            return buildWebView(forceRefresh)
+        } catch (e: CancellationException) {
+            buildState.onBuildFailed()
+            throw e
+        } catch (e: Exception) {
+            // Never leave a half-built environment published as a usable instance: the state
+            // machine stays "no instance", so the next call retries from scratch.
+            buildState.onBuildFailed()
+            throw e
+        }
+    }
+
+    private suspend fun buildWebView(forceRefresh: Boolean): CipherWebView? {
         // Fetch player JS
         val result = PlayerJsFetcher.getPlayerJs(forceRefresh = forceRefresh)
         if (result == null) {
             Timber.tag(TAG).e("Failed to get player JS")
+            buildState.onBuildFailed()
             return null
         }
         val (playerJs, hash) = result
@@ -274,18 +283,24 @@ object CipherDeobfuscator {
         // break. EITHER side missing triggers it: a legacy-regex false positive on one side
         // must not block recovery of the other, and after a successful refresh both sides
         // re-extract so a validated config replaces any heuristic guess.
+        //
+        // The epoch this build may legitimately claim. Defaults to the pre-build snapshot; the
+        // forceRefresh path below advances it only after a same-thread refresh whose new config
+        // we re-extract and therefore HAVE incorporated.
+        var incorporatedEpoch = buildState.epochAtBuildStart
         if (sigInfo == null || nFuncInfo == null) {
             Timber.tag(TAG).w("Incomplete extraction for player $hash (sig=${sigInfo != null}, n=${nFuncInfo != null}) — forcing remote config refresh")
             if (PlayerConfigStore.forceRefresh(missingHash = hash)) {
                 sigInfo = FunctionNameExtractor.extractSigFunctionInfo(playerJs, hash) ?: sigInfo
                 nFuncInfo = FunctionNameExtractor.extractNFunctionInfo(playerJs, hash) ?: nFuncInfo
-                builtEpoch = PlayerConfigStore.configEpoch
+                incorporatedEpoch = PlayerConfigStore.configEpoch
             }
         }
 
         // Nothing useful to put in a WebView if both are null
         if (sigInfo == null && nFuncInfo == null) {
             Timber.tag(TAG).e("Neither sig nor n-function could be extracted — skipping WebView creation")
+            buildState.onBuildFailed()
             return null
         }
 
@@ -300,8 +315,10 @@ object CipherDeobfuscator {
         )
 
         cipherWebView = webView
-        currentPlayerHash = hash
-        builtConfigEpoch = builtEpoch
+        // Publish ONLY now that a complete instance exists. A refresh that landed after
+        // incorporatedEpoch (including one that landed during this build) stays visible as an
+        // epoch mismatch and triggers a rebuild on the next decipher.
+        buildState.onBuildSucceeded(hash, incorporatedEpoch)
         return webView
     }
 
@@ -311,7 +328,7 @@ object CipherDeobfuscator {
                 .onFailure { Timber.tag(TAG).w("closeWebView threw: $it") }
         }
         cipherWebView = null
-        currentPlayerHash = null
+        buildState.onInstanceDiscarded()
     }
 
     private fun parseQueryParams(query: String): Map<String, String> {
