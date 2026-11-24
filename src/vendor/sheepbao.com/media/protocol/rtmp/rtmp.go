@@ -17,6 +17,8 @@ import (
 
 	"flag"
 
+	"sync"
+
 	"sheepbao.com/glog"
 )
 
@@ -111,6 +113,10 @@ func (self *Server) handleConn(conn *core.Conn) error {
 	}
 	if connServer.IsPublisher() {
 		reader := NewVirReader(connServer)
+		// Register this publisher with the stream first so downstream getters
+		// attach to the generation that is actually current, then let them
+		// subscribe. A getter that keeps state across publishers resets it via
+		// av.Migrator when the RTMP stream migrates the writer at handover.
 		self.handler.HandleReader(reader)
 		glog.Infof("new publisher: %+v", reader.Info())
 
@@ -143,10 +149,14 @@ type StreamReadWriteCloser interface {
 }
 
 type VirWriter struct {
-	Uid    string
-	closed bool
+	Uid string
 	av.RWBaser
-	conn        StreamReadWriteCloser
+	conn StreamReadWriteCloser
+
+	mu          sync.RWMutex
+	closed      bool
+	closeOnce   sync.Once
+	done        chan struct{}
 	packetQueue chan av.Packet
 }
 
@@ -155,6 +165,7 @@ func NewVirWriter(conn StreamReadWriteCloser) *VirWriter {
 		Uid:         uid.NEWID(),
 		conn:        conn,
 		RWBaser:     av.NewRWBaser(time.Second * time.Duration(*writeTimeout)),
+		done:        make(chan struct{}),
 		packetQueue: make(chan av.Packet, maxQueueNum),
 	}
 	go ret.Check()
@@ -167,6 +178,13 @@ func NewVirWriter(conn StreamReadWriteCloser) *VirWriter {
 	return ret
 }
 
+// IsClosed reports whether the writer has been closed.
+func (self *VirWriter) IsClosed() bool {
+	self.mu.RLock()
+	defer self.mu.RUnlock()
+	return self.closed
+}
+
 func (self *VirWriter) Check() {
 	var c core.ChunkStream
 	for {
@@ -174,6 +192,25 @@ func (self *VirWriter) Check() {
 			self.Close(err)
 			return
 		}
+	}
+}
+
+// push enqueues a packet unless the writer is closed. It never blocks: for a
+// live player it is better to drop a frame than to stall the stream's delivery
+// loop (which would stall every other player on the stream).
+func (self *VirWriter) push(p av.Packet) bool {
+	select {
+	case <-self.done:
+		return false
+	default:
+	}
+	select {
+	case self.packetQueue <- p:
+		return true
+	case <-self.done:
+		return false
+	default:
+		return false
 	}
 }
 
@@ -188,7 +225,7 @@ func (self *VirWriter) DropPacket(pktQue chan av.Packet, info av.Info) {
 					glog.Infoln("drop audio pkt")
 					<-pktQue
 				} else {
-					pktQue <- tmpPkt
+					self.push(tmpPkt)
 				}
 			}
 
@@ -196,7 +233,7 @@ func (self *VirWriter) DropPacket(pktQue chan av.Packet, info av.Info) {
 				videoPkt, ok := tmpPkt.Header.(av.VideoPacketHeader)
 				// dont't drop sps config and dont't drop key frame
 				if ok && (videoPkt.IsSeq() || videoPkt.IsKeyFrame()) {
-					pktQue <- tmpPkt
+					self.push(tmpPkt)
 				}
 				if len(pktQue) > maxQueueNum-10 {
 					glog.Infoln("drop video pkt")
@@ -208,25 +245,32 @@ func (self *VirWriter) DropPacket(pktQue chan av.Packet, info av.Info) {
 	glog.Infoln("packet queue len: ", len(pktQue))
 }
 
-//
 func (self *VirWriter) Write(p av.Packet) error {
-	if !self.closed {
-		if len(self.packetQueue) >= maxQueueNum-24 {
-			self.DropPacket(self.packetQueue, self.Info())
-		} else {
-			self.packetQueue <- p
-		}
-		return nil
-	} else {
+	if self.IsClosed() {
 		return errors.New("closed")
 	}
+	if len(self.packetQueue) >= maxQueueNum-24 {
+		self.DropPacket(self.packetQueue, self.Info())
+	}
+	// Best effort: a full queue drops the frame rather than stalling the
+	// publisher. Only a closed writer is an error.
+	self.push(p)
+	if self.IsClosed() {
+		return errors.New("closed")
+	}
+	return nil
 }
 
 func (self *VirWriter) SendPacket() error {
 	var cs core.ChunkStream
 	for {
-		p, ok := <-self.packetQueue
-		if ok {
+		select {
+		case <-self.done:
+			return errors.New("closed")
+		case p, ok := <-self.packetQueue:
+			if !ok {
+				return errors.New("closed")
+			}
 			cs.Data = p.Data
 			cs.Length = uint32(len(p.Data))
 			cs.StreamID = 1
@@ -247,15 +291,11 @@ func (self *VirWriter) SendPacket() error {
 			self.RecTimeStamp(cs.Timestamp, cs.TypeID)
 			err := self.conn.Write(cs)
 			if err != nil {
-				self.closed = true
+				self.Close(err)
 				return err
 			}
-		} else {
-			return errors.New("closed")
 		}
-
 	}
-	return nil
 }
 
 func (self *VirWriter) Info() (ret av.Info) {
@@ -273,11 +313,13 @@ func (self *VirWriter) Info() (ret av.Info) {
 
 func (self *VirWriter) Close(err error) {
 	glog.Infoln("player ", self.Info(), "closed: "+err.Error())
-	if !self.closed {
-		close(self.packetQueue)
-	}
-	self.closed = true
-	self.conn.Close(err)
+	self.closeOnce.Do(func() {
+		self.mu.Lock()
+		self.closed = true
+		close(self.done)
+		self.mu.Unlock()
+		self.conn.Close(err)
+	})
 }
 
 type VirReader struct {

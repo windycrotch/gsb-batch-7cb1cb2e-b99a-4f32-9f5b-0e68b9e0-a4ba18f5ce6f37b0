@@ -12,6 +12,8 @@ type Cache struct {
 	videoSeq *SpecialCache
 	audioSeq *SpecialCache
 	metadata *SpecialCache
+	sawVideo bool
+	sawAudio bool
 }
 
 func NewCache() *Cache {
@@ -23,7 +25,26 @@ func NewCache() *Cache {
 	}
 }
 
+// Ready reports whether enough of the stream has been cached to start feeding
+// a newly attached (or migrated) writer: the writer must receive the codec
+// configuration followed by a key frame before any other media packet.
+//
+// For a video stream this means a key frame has been cached. An audio-only
+// stream has no key frame concept, so audio is accepted as soon as it is seen.
+func (self *Cache) Ready() bool {
+	if self.gop.Ready() {
+		return true
+	}
+	return !self.sawVideo && self.sawAudio
+}
+
 func (self *Cache) Write(p av.Packet) {
+	if p.IsVideo {
+		self.sawVideo = true
+	}
+	if p.IsAudio {
+		self.sawAudio = true
+	}
 	if p.IsMetadata {
 		self.metadata.Write(p)
 		return

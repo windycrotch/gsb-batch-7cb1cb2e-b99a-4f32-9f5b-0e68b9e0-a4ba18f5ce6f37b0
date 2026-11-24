@@ -104,6 +104,16 @@ type GetWriter interface {
 	GetWriter(Info) WriteCloser
 }
 
+// Migrator is an optional interface a WriteCloser may implement. The RTMP
+// stream calls OnMigrate when it moves the writer from a retired stream
+// generation to the new one, at a point where the old publisher has stopped
+// being delivered and the new one has not started. A writer that keeps state
+// across publishers (e.g. HLS) uses this to reset itself for the new stream
+// without any packet being misattributed to the old session.
+type Migrator interface {
+	OnMigrate()
+}
+
 type Handler interface {
 	HandleReader(ReadCloser)
 	HandleWriter(WriteCloser)

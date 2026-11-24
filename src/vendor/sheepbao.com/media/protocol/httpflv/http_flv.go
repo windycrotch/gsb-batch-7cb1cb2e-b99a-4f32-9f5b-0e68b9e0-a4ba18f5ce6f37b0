@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"errors"
@@ -121,7 +122,10 @@ type FLVWriter struct {
 	app, title, url string
 	buf             []byte
 	closed          bool
+	closeOnce       sync.Once
 	closedChan      chan struct{}
+	done            chan struct{}
+	mu              sync.RWMutex
 	ctx             http.ResponseWriter
 	packetQueue     chan av.Packet
 }
@@ -135,6 +139,7 @@ func NewFLVWriter(app, title, url string, ctx http.ResponseWriter) *FLVWriter {
 		ctx:         ctx,
 		RWBaser:     av.NewRWBaser(time.Second * 10),
 		closedChan:  make(chan struct{}),
+		done:        make(chan struct{}),
 		buf:         make([]byte, headerLen),
 		packetQueue: make(chan av.Packet, maxQueueNum),
 	}
@@ -146,10 +151,34 @@ func NewFLVWriter(app, title, url string, ctx http.ResponseWriter) *FLVWriter {
 		err := ret.SendPacket()
 		if err != nil {
 			glog.Errorln("SendPacket error:", err)
-			ret.closed = true
+			ret.Close(err)
 		}
 	}()
 	return ret
+}
+
+func (self *FLVWriter) isClosed() bool {
+	self.mu.RLock()
+	defer self.mu.RUnlock()
+	return self.closed
+}
+
+// push enqueues a packet unless the writer is closed. Like the RTMP writer it
+// never blocks: dropping a frame beats stalling the shared delivery loop.
+func (self *FLVWriter) push(p av.Packet) bool {
+	select {
+	case <-self.done:
+		return false
+	default:
+	}
+	select {
+	case self.packetQueue <- p:
+		return true
+	case <-self.done:
+		return false
+	default:
+		return false
+	}
 }
 
 func (self *FLVWriter) DropPacket(pktQue chan av.Packet, info av.Info) {
@@ -163,7 +192,7 @@ func (self *FLVWriter) DropPacket(pktQue chan av.Packet, info av.Info) {
 				if len(pktQue) > maxQueueNum-2 {
 					<-pktQue
 				} else {
-					pktQue <- tmpPkt
+					self.push(tmpPkt)
 				}
 			}
 
@@ -175,7 +204,7 @@ func (self *FLVWriter) DropPacket(pktQue chan av.Packet, info av.Info) {
 				// dont't drop sps config and dont't drop key frame
 				if videoPkt.IsSeq() || videoPkt.IsKeyFrame() {
 					glog.Infoln("insert keyframe to queue")
-					pktQue <- tmpPkt
+					self.push(tmpPkt)
 				}
 			}
 
@@ -186,24 +215,29 @@ func (self *FLVWriter) DropPacket(pktQue chan av.Packet, info av.Info) {
 }
 
 func (self *FLVWriter) Write(p av.Packet) error {
-	if !self.closed {
-		if len(self.packetQueue) >= maxQueueNum-24 {
-			self.DropPacket(self.packetQueue, self.Info())
-		} else {
-			self.packetQueue <- p
-		}
-		return nil
-	} else {
+	if self.isClosed() {
 		return errors.New("closed")
 	}
-
+	if len(self.packetQueue) >= maxQueueNum-24 {
+		self.DropPacket(self.packetQueue, self.Info())
+	}
+	self.push(p)
+	if self.isClosed() {
+		return errors.New("closed")
+	}
+	return nil
 }
 
 // func (self *FLVWriter) Write(p av.Packet) error {
 func (self *FLVWriter) SendPacket() error {
 	for {
-		p, ok := <-self.packetQueue
-		if ok {
+		select {
+		case <-self.done:
+			return errors.New("closed")
+		case p, ok := <-self.packetQueue:
+			if !ok {
+				return errors.New("closed")
+			}
 			self.RWBaser.SetPreTime()
 			h := self.buf[:headerLen]
 			typeID := av.TAG_VIDEO
@@ -245,13 +279,8 @@ func (self *FLVWriter) SendPacket() error {
 			if _, err := self.ctx.Write(h[:4]); err != nil {
 				return err
 			}
-		} else {
-			return errors.New("closed")
 		}
-
 	}
-
-	return nil
 }
 
 func (self *FLVWriter) Wait() {
@@ -261,13 +290,17 @@ func (self *FLVWriter) Wait() {
 	}
 }
 
-func (self *FLVWriter) Close(error) {
+// Close is idempotent: it may be called concurrently by the stream teardown and
+// by the send goroutine on a write error, and must release Wait exactly once.
+func (self *FLVWriter) Close(err error) {
 	glog.Infoln("http flv closed")
-	if !self.closed {
-		close(self.packetQueue)
+	self.closeOnce.Do(func() {
+		self.mu.Lock()
+		self.closed = true
+		close(self.done)
 		close(self.closedChan)
-	}
-	self.closed = true
+		self.mu.Unlock()
+	})
 }
 
 func (self *FLVWriter) Info() (ret av.Info) {

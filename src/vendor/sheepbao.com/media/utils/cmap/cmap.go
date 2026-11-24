@@ -122,6 +122,22 @@ func (m *ConcurrentMap) Remove(key string) {
 	shard.Unlock()
 }
 
+// RemoveIf removes the element under key only if the currently stored value is
+// identical to val. It reports whether the value was removed. This is a
+// compare-and-delete which lets callers clean up a stale object without
+// removing a newer object that replaced it under the same key.
+func (m *ConcurrentMap) RemoveIf(key string, val interface{}) bool {
+	shard := m.GetShard(key)
+	shard.Lock()
+	defer shard.Unlock()
+	cur, ok := shard.items[key]
+	if !ok || cur != val {
+		return false
+	}
+	delete(shard.items, key)
+	return true
+}
+
 // Removes an element from the map and returns it
 func (m *ConcurrentMap) Pop(key string) (v interface{}, exists bool) {
 	// Try to get shard.
@@ -256,7 +272,7 @@ func (m ConcurrentMap) Keys() []string {
 	return keys
 }
 
-//Reviles ConcurrentMap "private" variables to json marshal.
+// Reviles ConcurrentMap "private" variables to json marshal.
 func (m ConcurrentMap) MarshalJSON() ([]byte, error) {
 	// Create a temporary map, which will hold all item spread across shards.
 	tmp := make(map[string]interface{})

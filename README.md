@@ -25,4 +25,13 @@ cd sms
 ## Run
 ./bin/sms
 
+## Test
+The project uses the GOPATH layout (`src/vendor`), so tests run with
+`GO111MODULE=off` and `GOPATH` set to the repository root. `test.sh` does both:
+```
+./test.sh
+```
+It runs `go vet` and the unit/integration tests (with the race detector) for
+RTMP stream takeover, HLS segment-cache handover, and the concurrent-map helpers.
+
 

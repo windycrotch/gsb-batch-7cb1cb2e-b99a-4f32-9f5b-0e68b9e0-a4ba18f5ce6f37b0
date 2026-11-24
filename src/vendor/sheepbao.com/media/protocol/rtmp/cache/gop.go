@@ -84,6 +84,12 @@ func (self *GopCache) writeToArray(chunk av.Packet, startNew bool) error {
 	return nil
 }
 
+// Ready reports whether a key frame has been cached, i.e. whether Send is able
+// to start a writer at a key frame.
+func (self *GopCache) Ready() bool {
+	return self.start
+}
+
 func (self *GopCache) Write(p av.Packet) {
 	var ok bool
 	if p.IsVideo {
