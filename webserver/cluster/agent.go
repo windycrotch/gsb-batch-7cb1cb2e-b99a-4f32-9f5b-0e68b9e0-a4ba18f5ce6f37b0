@@ -43,6 +43,9 @@ type Agent struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+	// tunnelWG tracks the serveTunnel goroutines so Stop waits for every stream
+	// handler and raw TCP bridge to exit before returning.
+	tunnelWG sync.WaitGroup
 }
 
 func NewAgent(cfg AgentConfig, handler http.Handler) (*Agent, error) {
@@ -91,6 +94,7 @@ func (a *Agent) Stop() {
 		a.cancel()
 	}
 	a.wg.Wait()
+	a.tunnelWG.Wait()
 }
 
 func (a *Agent) run(kind string) {
@@ -191,7 +195,11 @@ func (a *Agent) connectOnce(kind string) error {
 		_ = conn.Close()
 		return fmt.Errorf("start yamux: %w", err)
 	}
-	go serveTunnel(a.ctx, session, a.handler)
+	a.tunnelWG.Add(1)
+	go func() {
+		defer a.tunnelWG.Done()
+		serveTunnel(a.ctx, session, a.handler)
+	}()
 
 	slog.Info("cluster: tunnel connected", "slave", a.slaveID, "kind", kind, "master", a.wsURL)
 

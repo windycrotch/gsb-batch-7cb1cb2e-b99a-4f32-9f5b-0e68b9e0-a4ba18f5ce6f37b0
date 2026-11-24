@@ -210,7 +210,7 @@ func (d *remoteDevice) Connect(socketAddr string) (net.Conn, error) {
 	if session == nil {
 		return nil, ErrSlaveOffline
 	}
-	return openRawStream(session, RawTarget{DeviceID: d.localID, SocketAddr: socketAddr})
+	return openRawStreamContext(context.Background(), session, RawTarget{DeviceID: d.localID, SocketAddr: socketAddr})
 }
 
 // RunShell lets the master's MCP shell tool operate on remote devices.

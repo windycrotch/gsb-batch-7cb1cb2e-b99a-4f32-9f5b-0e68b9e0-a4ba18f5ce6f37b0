@@ -30,7 +30,8 @@ func yamuxConfig() *yamux.Config {
 }
 
 // serveTunnel accepts streams from a yamux session and routes them to either
-// the HTTP handler or a raw TCP connection.
+// the HTTP handler or a raw TCP connection. It returns once every stream
+// handler goroutine has exited, so callers can wait for full tunnel shutdown.
 func serveTunnel(ctx context.Context, session *yamux.Session, handler http.Handler) {
 	listener := newStreamListener()
 	server := &http.Server{
@@ -49,14 +50,18 @@ func serveTunnel(ctx context.Context, session *yamux.Session, handler http.Handl
 		_ = session.Close()
 	}()
 
+	var handlers sync.WaitGroup
 	for {
 		stream, err := session.AcceptStream()
 		if err != nil {
 			listener.Close()
 			_ = server.Close()
+			handlers.Wait()
 			return
 		}
+		handlers.Add(1)
 		go func(stream net.Conn) {
+			defer handlers.Done()
 			frame := []byte{0}
 			if _, err := io.ReadFull(stream, frame); err != nil {
 				_ = stream.Close()
@@ -193,7 +198,13 @@ func (a tunnelAddr) String() string  { return string(a) }
 
 // openHTTPStream opens a tunnel stream and marks it as carrying HTTP.
 func openHTTPStream(session *yamux.Session) (net.Conn, error) {
-	stream, err := session.OpenStream()
+	return openHTTPStreamContext(context.Background(), session)
+}
+
+// openHTTPStreamContext opens an HTTP tunnel stream, aborting the dial when
+// the context ends instead of blocking on a half-dead session.
+func openHTTPStreamContext(ctx context.Context, session *yamux.Session) (net.Conn, error) {
+	stream, err := openSessionStream(ctx, session)
 	if err != nil {
 		return nil, err
 	}
@@ -206,7 +217,13 @@ func openHTTPStream(session *yamux.Session) (net.Conn, error) {
 
 // openRawStream opens a tunnel stream and writes the raw connection target.
 func openRawStream(session *yamux.Session, target RawTarget) (net.Conn, error) {
-	stream, err := session.OpenStream()
+	return openRawStreamContext(context.Background(), session, target)
+}
+
+// openRawStreamContext opens a raw tunnel stream, aborting the dial when the
+// context ends instead of blocking on a half-dead session.
+func openRawStreamContext(ctx context.Context, session *yamux.Session, target RawTarget) (net.Conn, error) {
+	stream, err := openSessionStream(ctx, session)
 	if err != nil {
 		return nil, err
 	}

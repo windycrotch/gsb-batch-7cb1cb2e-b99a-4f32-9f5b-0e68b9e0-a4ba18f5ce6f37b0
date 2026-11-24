@@ -31,12 +31,19 @@ type MasterConfig struct {
 	// masters and used to detect aggregation cycles.
 	NodeID string
 	Relay  ADBRelayConfig
+	// SessionPingTimeout bounds the post-handshake liveness probe of new slave
+	// sessions. Zero uses the default timeout.
+	SessionPingTimeout time.Duration
+	// SessionDrainTimeout bounds how long a superseded session keeps serving
+	// streams opened before the replacement. Zero uses the default timeout.
+	SessionDrainTimeout time.Duration
 }
 
 type slaveState struct {
 	record      SlaveRecord
 	hello       Hello
-	sessions    map[string]*yamux.Session
+	sessions    map[string]*managedSession
+	retired     []*managedSession
 	connectedAt time.Time
 	lastSeen    time.Time
 
@@ -66,12 +73,19 @@ func (s *slaveState) displayName() string {
 	return s.record.Name
 }
 
+// session returns the current active session of the given kind. Media traffic
+// falls back to the control session when the slave only opened one. Retired
+// generations are never returned, so new streams always land on the newest
+// session.
 func (s *slaveState) session(kind string) *yamux.Session {
-	session := s.sessions[kind]
-	if session == nil && kind == SessionMedia {
-		session = s.sessions[SessionControl]
+	managed := s.sessions[kind]
+	if managed == nil && kind == SessionMedia {
+		managed = s.sessions[SessionControl]
 	}
-	return session
+	if managed == nil {
+		return nil
+	}
+	return managed.session
 }
 
 // Master aggregates slaves, proxies their API and records registrations.
@@ -148,10 +162,13 @@ func (m *Master) Close() {
 		pollers = append(pollers, p)
 	}
 	m.pollers = make(map[string]*directPoller)
-	sessions := make([]*yamux.Session, 0)
+	var sessions []*yamux.Session
 	for _, state := range m.slaves {
-		for _, session := range state.sessions {
-			sessions = append(sessions, session)
+		for _, managed := range state.sessions {
+			sessions = append(sessions, managed.session)
+		}
+		for _, managed := range state.retired {
+			sessions = append(sessions, managed.session)
 		}
 	}
 	m.mu.Unlock()
@@ -170,7 +187,7 @@ func (m *Master) ensureState(record SlaveRecord) *slaveState {
 	defer m.mu.Unlock()
 	state := m.slaves[record.ID]
 	if state == nil {
-		state = &slaveState{sessions: make(map[string]*yamux.Session)}
+		state = &slaveState{sessions: make(map[string]*managedSession)}
 		m.slaves[record.ID] = state
 	}
 	state.record = record
@@ -327,6 +344,15 @@ func (m *Master) ConnectHandler() echo.HandlerFunc {
 			return nil
 		}
 
+		// Probe the session before publishing it. If the new connection cannot
+		// complete a yamux round trip, keep the previously attached session in
+		// service instead of taking the slave offline with a broken replacement.
+		if err := verifySession(c.Request().Context(), session, m.cfg.SessionPingTimeout); err != nil {
+			slog.Warn("cluster: new slave session failed liveness probe", "slave", slaveID, "kind", kind, "error", err)
+			_ = conn.Close()
+			return nil
+		}
+
 		m.attach(record, hello, kind, session)
 		go func() {
 			<-session.CloseChan()
@@ -340,11 +366,16 @@ func (m *Master) ConnectHandler() echo.HandlerFunc {
 	}
 }
 
+// attach publishes a new session generation for the slave and kind. The
+// previous generation is retired rather than closed: streams already opened on
+// it are allowed to finish, while no new stream can be routed to it.
 func (m *Master) attach(record SlaveRecord, hello Hello, kind string, session *yamux.Session) {
+	managed := newManagedSession(session)
+
 	m.mu.Lock()
 	state := m.slaves[record.ID]
 	if state == nil {
-		state = &slaveState{sessions: make(map[string]*yamux.Session)}
+		state = &slaveState{sessions: make(map[string]*managedSession)}
 		m.slaves[record.ID] = state
 	}
 	old := state.sessions[kind]
@@ -353,20 +384,64 @@ func (m *Master) attach(record SlaveRecord, hello Hello, kind string, session *y
 	if hello.NodeID != "" {
 		state.nodeID = hello.NodeID
 	}
-	state.sessions[kind] = session
+	state.sessions[kind] = managed
 	now := time.Now()
 	state.lastSeen = now
 	if state.connectedAt.IsZero() {
 		state.connectedAt = now
 	}
+	if old != nil && old != managed {
+		old.retire()
+		state.retired = append(state.retired, old)
+	}
 	m.mu.Unlock()
 
-	if old != nil && old != session {
-		_ = old.Close()
+	if old != nil && old != managed {
+		go m.drainSession(record.ID, kind, old)
 	}
 	slog.Info("cluster: slave session attached", "slave", record.ID, "kind", kind, "name", hello.Name)
 }
 
+// drainSession waits for a retired session's existing streams to finish, then
+// closes the tunnel and removes it from the bookkeeping. If the streams do not
+// finish in time, the session is force-closed after the drain timeout so a
+// stuck transfer cannot hold the WebSocket open forever.
+func (m *Master) drainSession(slaveID, kind string, managed *managedSession) {
+	drainTimeout := m.cfg.SessionDrainTimeout
+	managed.waitDrained(drainTimeout)
+	// The slave side may keep the retired WebSocket open while its runner waits
+	// for the next reconnect; the master owns the lifecycle of its own end and
+	// closes the tunnel once nothing depends on it anymore.
+	_ = managed.session.Close()
+
+	m.mu.Lock()
+	state := m.slaves[slaveID]
+	if state != nil {
+		state.retired = removeManaged(state.retired, managed)
+		if current := state.sessions[kind]; current == managed {
+			delete(state.sessions, kind)
+		}
+		offline := len(state.sessions) == 0
+		if offline {
+			defer m.relays.CloseSlave(slaveID)
+		}
+	}
+	m.mu.Unlock()
+}
+
+func removeManaged(sessions []*managedSession, target *managedSession) []*managedSession {
+	out := sessions[:0]
+	for _, managed := range sessions {
+		if managed != target {
+			out = append(out, managed)
+		}
+	}
+	return out
+}
+
+// detach removes a session generation once its yamux session has closed. A
+// generation that was already superseded only leaves the retired list; the
+// slave stays online through the replacement.
 func (m *Master) detach(slaveID, kind string, session *yamux.Session) {
 	m.mu.Lock()
 	state := m.slaves[slaveID]
@@ -374,13 +449,19 @@ func (m *Master) detach(slaveID, kind string, session *yamux.Session) {
 		m.mu.Unlock()
 		return
 	}
-	if state.sessions[kind] != session {
-		m.mu.Unlock()
-		return
+	offline := false
+	if current := state.sessions[kind]; current != nil && current.session == session {
+		delete(state.sessions, kind)
+		state.lastSeen = time.Now()
+		offline = len(state.sessions) == 0
+	} else {
+		for i, managed := range state.retired {
+			if managed.session == session {
+				state.retired = append(state.retired[:i], state.retired[i+1:]...)
+				break
+			}
+		}
 	}
-	delete(state.sessions, kind)
-	state.lastSeen = time.Now()
-	offline := len(state.sessions) == 0
 	m.mu.Unlock()
 
 	if offline {
@@ -406,7 +487,7 @@ func (m *Master) transport(slaveID, kind string) *http.Transport {
 			if session == nil {
 				return nil, fmt.Errorf("%w: %s", ErrSlaveOffline, slaveID)
 			}
-			return openHTTPStream(session)
+			return openHTTPStreamContext(ctx, session)
 		},
 		DisableKeepAlives:     true,
 		MaxIdleConns:          -1,
@@ -1190,8 +1271,11 @@ func (m *Master) closeSlave(slaveID string) {
 	delete(m.slaves, slaveID)
 	var sessions []*yamux.Session
 	if state != nil {
-		for _, session := range state.sessions {
-			sessions = append(sessions, session)
+		for _, managed := range state.sessions {
+			sessions = append(sessions, managed.session)
+		}
+		for _, managed := range state.retired {
+			sessions = append(sessions, managed.session)
 		}
 	}
 	m.mu.Unlock()

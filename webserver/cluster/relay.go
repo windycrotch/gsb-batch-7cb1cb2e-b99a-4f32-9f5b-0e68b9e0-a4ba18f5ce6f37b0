@@ -410,7 +410,7 @@ func (r *relay) handle(client net.Conn, slaveAddr string) {
 		slog.Warn("cluster: slave offline during adb relay", "device", r.deviceID, "slave", r.slaveID)
 		return
 	}
-	stream, err := openRawStream(session, RawTarget{Host: host, Port: port})
+	stream, err := openRawStreamContext(context.Background(), session, RawTarget{Host: host, Port: port})
 	if err != nil {
 		slog.Warn("cluster: failed to open adb relay stream", "device", r.deviceID, "error", err)
 		return
