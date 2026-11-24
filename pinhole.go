@@ -159,6 +159,12 @@ func (p *Pinhole) Center() {
 	if len(p.stack) > 0 {
 		i = p.stack[len(p.stack)-1]
 	}
+	// Centering an empty scene (or an empty open block) has no bounding box;
+	// make it a no-op instead of translating by NaN, which would poison the
+	// scene for every later frame.
+	if i >= len(p.lines) {
+		return
+	}
 	minx, miny, minz := math.Inf(+1), math.Inf(+1), math.Inf(+1)
 	maxx, maxy, maxz := math.Inf(-1), math.Inf(-1), math.Inf(-1)
 	for ; i < len(p.lines); i++ {
@@ -177,8 +183,8 @@ func (p *Pinhole) Center() {
 		if p.lines[i].z1 < minz {
 			minz = p.lines[i].z1
 		}
-		if p.lines[i].z2 > maxz {
-			maxz = p.lines[i].z2
+		if p.lines[i].z1 > maxz {
+			maxz = p.lines[i].z1
 		}
 		if p.lines[i].x2 < minx {
 			minx = p.lines[i].x2
@@ -326,8 +332,14 @@ func (p *Pinhole) Image(width, height int, opts *ImageOptions) *image.RGBA {
 	if opts == nil {
 		opts = DefaultImageOptions
 	}
-	sort.Sort(byDistance(p.lines))
-	for _, line := range p.lines {
+	// Render from a sorted copy so the render order never mutates the
+	// caller's scene. Reordering p.lines in place would invalidate the
+	// Begin/End stack indices (which are positions in p.lines) and make
+	// subsequent block-scoped transforms hit the wrong lines.
+	ordered := make([]*line, len(p.lines))
+	copy(ordered, p.lines)
+	sort.Sort(byDistance(ordered))
+	for _, line := range ordered {
 		line.drawcoords = nil
 	}
 	img := image.NewRGBA(image.Rect(0, 0, width, height))
@@ -372,7 +384,7 @@ func (p *Pinhole) Image(width, height int, opts *ImageOptions) *image.RGBA {
 			line.circle,
 		)
 	}
-	for _, line := range p.lines {
+	for _, line := range ordered {
 		if line.color != ccolor {
 			ccolor = line.color
 			caps = capsMap[ccolor]
@@ -390,11 +402,12 @@ func (p *Pinhole) Image(width, height int, opts *ImageOptions) *image.RGBA {
 				var coords []*fourcorners
 				seg := line.cfirst
 				for seg != nil {
-					seg.drawcoords = maybeDraw(seg)
-					if seg.drawcoords == nil {
-						panic("nil!")
+					// maybeDraw returns nil when the segment projects to a
+					// single point or is otherwise degenerate; skip it rather
+					// than panicking so the scene stays usable.
+					if seg.drawcoords = maybeDraw(seg); seg.drawcoords != nil {
+						coords = append(coords, seg.drawcoords)
 					}
-					coords = append(coords, seg.drawcoords)
 					seg = seg.cnext
 				}
 				// next reprocess to join the midpoints
@@ -421,13 +434,16 @@ func (p *Pinhole) Image(width, height int, opts *ImageOptions) *image.RGBA {
 
 				}
 			}
-			// draw the cached coords
-			c.MoveTo(line.drawcoords.x1-math.SmallestNonzeroFloat64, line.drawcoords.y1-math.SmallestNonzeroFloat64)
-			c.LineTo(line.drawcoords.x2-math.SmallestNonzeroFloat64, line.drawcoords.y2-math.SmallestNonzeroFloat64)
-			c.LineTo(line.drawcoords.x3+math.SmallestNonzeroFloat64, line.drawcoords.y3+math.SmallestNonzeroFloat64)
-			c.LineTo(line.drawcoords.x4+math.SmallestNonzeroFloat64, line.drawcoords.y4+math.SmallestNonzeroFloat64)
-			c.LineTo(line.drawcoords.x1-math.SmallestNonzeroFloat64, line.drawcoords.y1-math.SmallestNonzeroFloat64)
-			c.ClosePath()
+			// draw the cached coords. A nil drawcoords marks a degenerate
+			// segment (projected to a point), which has no quad to fill.
+			if line.drawcoords != nil {
+				c.MoveTo(line.drawcoords.x1-math.SmallestNonzeroFloat64, line.drawcoords.y1-math.SmallestNonzeroFloat64)
+				c.LineTo(line.drawcoords.x2-math.SmallestNonzeroFloat64, line.drawcoords.y2-math.SmallestNonzeroFloat64)
+				c.LineTo(line.drawcoords.x3+math.SmallestNonzeroFloat64, line.drawcoords.y3+math.SmallestNonzeroFloat64)
+				c.LineTo(line.drawcoords.x4+math.SmallestNonzeroFloat64, line.drawcoords.y4+math.SmallestNonzeroFloat64)
+				c.LineTo(line.drawcoords.x1-math.SmallestNonzeroFloat64, line.drawcoords.y1-math.SmallestNonzeroFloat64)
+				c.ClosePath()
+			}
 		} else {
 			maybeDraw(line)
 		}

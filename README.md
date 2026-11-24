@@ -78,6 +78,38 @@ p.SavePNG("cube.png", 500, 500, nil)
 
 <img src="http://i.imgur.com/UafJsKW.jpg" width="300" height="300">
 
+## Incremental framing
+
+`Image` and `SavePNG` never mutate the scene: rendering sorts an internal copy
+of the lines, so the order of `p.lines` — and therefore every `Begin/End`
+block range — is preserved. The same `Pinhole` can therefore be rotated and
+rendered frame after frame, and each frame is pixel-identical to a scene
+rebuilt from scratch with the same sequence of operations.
+
+```go
+p := pinhole.New()
+p.DrawCube(-0.3, -0.3, -0.3, 0.3, 0.3, 0.3)
+for i := 0; i < n; i++ {
+    p.Rotate(0, math.Pi/30, 0)
+    // identical to rendering a freshly rebuilt scene at this frame
+    img := p.Image(500, 500, nil)
+    _ = img
+}
+```
+
+Misuse is non-fatal and never leaks state into later frames:
+
+- an `End` without a matching `Begin` is a no-op; nested blocks keep
+  transforms scoped to the currently open block,
+- calling `Begin` again before `End` (including after an in-block render) does
+  not corrupt block scoping,
+- `Center` on an empty scene or empty open block is a no-op,
+- a failed `SavePNG` (e.g. an unwritable path) returns the error and leaves
+  the `Pinhole` fully usable for the next `Image`.
+
+A runnable end-to-end sample lives in
+[`examples/incremental`](examples/incremental/main.go).
+
 ## Contact
 
 Josh Baker [@tidwall](http://twitter.com/tidwall)
