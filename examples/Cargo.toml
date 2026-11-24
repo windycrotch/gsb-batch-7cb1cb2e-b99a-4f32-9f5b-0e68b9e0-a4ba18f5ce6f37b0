@@ -1,0 +1,52 @@
+[package]
+name = "stream-download-examples"
+publish = false
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+stream-download = { path = "../crates/stream-download", features = [
+  "reqwest-middleware",
+  "process",
+  "async-read",
+  "registry",
+] }
+stream-download-opendal = { path = "../crates/stream-download-opendal", optional = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+rodio = { workspace = true }
+regex = { workspace = true }
+reqwest = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tokio = { workspace = true, features = [
+  "sync",
+  "macros",
+  "rt-multi-thread",
+  "io-std",
+] }
+tower = { workspace = true, features = ["make"] }
+reqwest-retry = { workspace = true }
+youtube_dl = { workspace = true, features = ["tokio"] }
+libmpv2 = { workspace = true, optional = true }
+testcontainers-modules = { workspace = true, features = [
+  "localstack",
+], optional = true }
+opendal = { workspace = true, features = ["services-s3"], optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
+
+[features]
+mpv = ["dep:libmpv2"]
+opendal = [
+  "dep:stream-download-opendal",
+  "dep:testcontainers-modules",
+  "dep:aws-sdk-s3",
+  "dep:opendal",
+]
+
+[[example]]
+name = "video_mpv"
+required-features = ["mpv"]
+
+[[example]]
+name = "s3"
+required-features = ["opendal"]
