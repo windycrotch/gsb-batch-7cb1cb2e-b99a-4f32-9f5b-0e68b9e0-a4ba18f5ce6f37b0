@@ -1,0 +1,167 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.2.0)'
+        required: true
+        default: 'v1.2.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build & Package Binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+
+      - name: Resolve version
+        id: ver
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then TAG="${GITHUB_REF_NAME}"; fi
+          case "$TAG" in
+            v*) ;;
+            *)  TAG="v${TAG}" ;;
+          esac
+          echo "tag=${TAG}"   >> "$GITHUB_OUTPUT"
+          echo "semver=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Normalize & verify Windows batch line endings
+        run: |
+          set -euo pipefail
+          # ---------------------------------------------------------------
+          # cmd.exe parses .cmd/.bat using CRLF byte offsets. LF-only files
+          # cause truncated tokens ("echo" -> "ho") and the window closes
+          # before `pause`. Convert defensively, then fail hard if any file
+          # still has a bare LF.
+          # ---------------------------------------------------------------
+          shopt -s nullglob
+          files=(run.cmd setup_token.cmd scripts/windows_helpers/*.cmd *.bat)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::No batch scripts found to validate"
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            [ -f "$f" ] || continue
+            sed -i 's/\r$//' "$f"
+            sed -i 's/$/\r/' "$f"
+            # Every LF byte must be preceded by exactly one CR byte.
+            crs=$(tr -cd '\r' < "$f" | wc -c)
+            lfs=$(tr -cd '\n' < "$f" | wc -c)
+            if [ "$crs" -ne "$lfs" ]; then
+              echo "::error file=$f::Bare LF detected (CR=$crs LF=$lfs) - cmd.exe would corrupt this script"
+              exit 1
+            fi
+            echo "OK  $f (CRLF=$lfs lines)"
+          done
+
+      - name: Build Windows amd64
+        env:
+          CGO_ENABLED: 0
+          GOOS: windows
+          GOARCH: amd64
+        run: |
+          set -euo pipefail
+          go build -trimpath -ldflags="-s -w -X main.Version=${{ steps.ver.outputs.semver }}" \
+            -o build/windows-amd64/discord-quest-phantom.exe ./cmd/completer
+          cp README.md LICENSE run.cmd setup_token.cmd config.example.json .token.example build/windows-amd64/
+          # Double-check the staged bundle before zipping it for end users.
+          for f in build/windows-amd64/*.cmd; do
+            crs=$(tr -cd '\r' < "$f" | wc -c)
+            lfs=$(tr -cd '\n' < "$f" | wc -c)
+            if [ "$crs" -ne "$lfs" ]; then
+              echo "::error file=$f::Bare LF in packaged batch script (CR=$crs LF=$lfs)"
+              exit 1
+            fi
+          done
+          (cd build/windows-amd64 && zip -r ../../discord-quest-phantom-windows-amd64.zip .)
+
+      - name: Build Linux amd64
+        env:
+          CGO_ENABLED: 0
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          set -euo pipefail
+          go build -trimpath -ldflags="-s -w -X main.Version=${{ steps.ver.outputs.semver }}" \
+            -o build/linux-amd64/discord-quest-phantom ./cmd/completer
+          cp README.md LICENSE config.example.json .token.example build/linux-amd64/
+          (cd build/linux-amd64 && tar -czvf ../../discord-quest-phantom-linux-amd64.tar.gz .)
+
+      - name: Build Linux arm64 (Armbian / Raspberry Pi)
+        env:
+          CGO_ENABLED: 0
+          GOOS: linux
+          GOARCH: arm64
+        run: |
+          set -euo pipefail
+          go build -trimpath -ldflags="-s -w -X main.Version=${{ steps.ver.outputs.semver }}" \
+            -o build/linux-arm64/discord-quest-phantom ./cmd/completer
+          cp README.md LICENSE config.example.json .token.example build/linux-arm64/
+          (cd build/linux-arm64 && tar -czvf ../../discord-quest-phantom-linux-arm64.tar.gz .)
+
+      - name: Verify packaged architectures
+        run: |
+          set -euo pipefail
+          file build/windows-amd64/discord-quest-phantom.exe
+          file build/linux-amd64/discord-quest-phantom
+          file build/linux-arm64/discord-quest-phantom
+          file build/linux-arm64/discord-quest-phantom | grep -qi aarch64
+          file build/linux-amd64/discord-quest-phantom | grep -qi 'x86-64'
+          unzip -l discord-quest-phantom-windows-amd64.zip
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG_NAME="${{ steps.ver.outputs.tag }}"
+
+          {
+            printf '## Discord Quest Phantom %s\n\n' "$TAG_NAME"
+            printf '### Anti-profiling and consistency\n'
+            printf -- '- **One stable device identity per account** - OS build, Discord client / Electron / Chromium / native build, system locale and timezone come from one source and are pinned per account instead of a shared hardcoded fingerprint. Linux hosts claim x64 so `os_arch` matches the user agent.\n'
+            printf -- '- **`system_locale` stays the OS locale** while `client_locale` / `X-Discord-Locale` follow the account and the sweep target.\n'
+            printf -- '- **Per-account profile store and DPAPI token vault** on Windows; a plaintext `.token` is sealed once and left in place for you to delete.\n'
+            printf -- '- **Presence guard (`-presence-guard`, default on)** - desktop quests run strictly one at a time, pause while you play another game or a full-screen app is active, ride your really-running game instead of starting a second copy, and hold a named mutex while a stub is visible. REST desktop heartbeats pause during full-screen activity when Discord runs locally.\n'
+            printf -- '- **Jittered pacing (`-jitter`, default 0.15)** - bell-shaped delay jitter on heartbeats, retries, enrollment spacing and poll intervals.\n'
+            printf '\n### Improvements\n'
+            printf -- '- Spoofer stub uses an install-shaped path, hard links instead of copying, per-engine window classes, reserved working set and idle CPU noise.\n'
+            printf -- '- Enrollment spacing between auto-enrolls is jittered.\n'
+            printf -- '- New flags: `-fingerprint auto|legacy`, `-profile-store`, `-presence-guard`, `-jitter`, `-cache-dir`. See `docs/ANTI_PROFILING.md`.\n'
+            printf '\n### Downloads\n'
+            printf -- '- Windows x64: `discord-quest-phantom-windows-amd64.zip`\n'
+            printf -- '- Linux x64: `discord-quest-phantom-linux-amd64.tar.gz`\n'
+            printf -- '- Linux ARM64: `discord-quest-phantom-linux-arm64.tar.gz`\n'
+          } > RELEASE_NOTES.md
+
+          # Replace a stale/prerelease of the same tag if one already exists.
+          gh release delete "$TAG_NAME" --yes --cleanup-tag 2>/dev/null || true
+
+          gh release create "$TAG_NAME" \
+            discord-quest-phantom-windows-amd64.zip \
+            discord-quest-phantom-linux-amd64.tar.gz \
+            discord-quest-phantom-linux-arm64.tar.gz \
+            --title "Discord Quest Phantom $TAG_NAME" \
+            --notes-file RELEASE_NOTES.md \
+            --draft=false \
+            --prerelease=false \
+            --latest

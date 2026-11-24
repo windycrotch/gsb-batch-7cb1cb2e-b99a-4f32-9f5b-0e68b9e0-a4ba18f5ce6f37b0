@@ -1,0 +1,401 @@
+package scanner
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"discord-quest-completer/pkg/api"
+	"discord-quest-completer/pkg/captcha"
+	"discord-quest-completer/pkg/i18n"
+	"discord-quest-completer/pkg/pacing"
+)
+
+// EnrollSpread is the relative jitter applied to the delay between enrollments.
+// main wires it from the -jitter flag; zero disables jitter.
+var EnrollSpread = pacing.DefaultSpread
+
+// QuestState represents the current user status for a quest.
+type QuestState string
+
+const (
+	StateClaimed   QuestState = "CLAIMED"
+	StateCompleted QuestState = "COMPLETED"
+	StateEnrolled  QuestState = "ENROLLED"
+	StateAvailable QuestState = "AVAILABLE"
+	StateExpired   QuestState = "EXPIRED"
+)
+
+// QuestCategory classifies the quest platform and interaction mode.
+type QuestCategory string
+
+const (
+	CategoryPurePC        QuestCategory = "🖥️ Pure PC (Game)"
+	CategoryCrossPlatform QuestCategory = "🎮 Cross-Platform"
+	CategoryVideoDesktop  QuestCategory = "📺 Video (Desktop)"
+	CategoryVideoMobile   QuestCategory = "📱 Video (Mobile)"
+	CategoryActivity      QuestCategory = "🏆 Activity/Mission"
+	CategoryUnknown       QuestCategory = "❓ Other"
+)
+
+// Localized returns the localized category string.
+func (c QuestCategory) Localized() string {
+	switch c {
+	case CategoryPurePC:
+		return i18n.M().CatPurePC
+	case CategoryCrossPlatform:
+		return i18n.M().CatCrossPlatform
+	case CategoryVideoDesktop:
+		return i18n.M().CatVideoDesktop
+	case CategoryVideoMobile:
+		return i18n.M().CatVideoMobile
+	case CategoryActivity:
+		return i18n.M().CatActivity
+	default:
+		return i18n.M().CatOther
+	}
+}
+
+// AnalyzedQuest summarizes quest requirements and user progression.
+type AnalyzedQuest struct {
+	Quest      api.Quest
+	ID         string
+	Title      string
+	Category   QuestCategory
+	TaskType   string
+	AppID      string
+	TargetSec  int
+	CurrentSec float64
+	State      QuestState
+	IsExpired  bool
+	ExpiresAt  string
+	Region     string
+}
+
+// AnalyzeQuest inspects an api.Quest and classifies its state and primary requirement.
+func AnalyzeQuest(q api.Quest) AnalyzedQuest {
+	reg := q.DiscoveredRegion
+	if reg == "" {
+		reg = "US"
+	}
+	aq := AnalyzedQuest{
+		Quest:     q,
+		ID:        q.ID,
+		Title:     extractTitle(q),
+		Region:    reg,
+		State:     StateAvailable,
+		Category:  CategoryUnknown,
+		ExpiresAt: q.Config.ExpiresAt,
+	}
+
+	if q.UserStatus != nil {
+		if q.UserStatus.ClaimedAt != nil && *q.UserStatus.ClaimedAt != "" {
+			aq.State = StateClaimed
+		} else if q.UserStatus.CompletedAt != nil && *q.UserStatus.CompletedAt != "" {
+			aq.State = StateCompleted
+		} else if q.UserStatus.EnrolledAt != nil && *q.UserStatus.EnrolledAt != "" {
+			aq.State = StateEnrolled
+		}
+	}
+
+	// Expiry verification
+	if aq.ExpiresAt != "" {
+		if expTime, err := time.Parse(time.RFC3339, aq.ExpiresAt); err == nil {
+			if time.Now().UTC().After(expTime) {
+				aq.IsExpired = true
+				if aq.State != StateClaimed && aq.State != StateCompleted {
+					aq.State = StateExpired
+				}
+			}
+		}
+	}
+
+	// Task configuration lookup (prioritizes TaskConfigV2 over TaskConfig)
+	tc := q.Config.TaskConfigV2
+	if tc == nil {
+		tc = q.Config.TaskConfig
+	}
+
+	if tc != nil && len(tc.Tasks) > 0 {
+		_, hasMobileVideo := tc.Tasks["WATCH_VIDEO_ON_MOBILE"]
+		_, hasDesktopVideo := tc.Tasks["WATCH_VIDEO"]
+		_, hasDesktopPlay := tc.Tasks["PLAY_ON_DESKTOP"]
+		_, hasXbox := tc.Tasks["PLAY_ON_XBOX"]
+		_, hasPS := tc.Tasks["PLAY_ON_PLAYSTATION"]
+		_, hasActivity := tc.Tasks["PLAY_ACTIVITY"]
+		_, hasAchievement := tc.Tasks["ACHIEVEMENT_IN_ACTIVITY"]
+
+		chosenType := ""
+
+		if hasMobileVideo && !hasDesktopVideo {
+			aq.Category = CategoryVideoMobile
+			chosenType = "WATCH_VIDEO_ON_MOBILE"
+		} else if hasDesktopVideo || (hasDesktopVideo && hasMobileVideo) {
+			aq.Category = CategoryVideoDesktop
+			chosenType = "WATCH_VIDEO"
+			if !hasDesktopVideo {
+				chosenType = "WATCH_VIDEO_ON_MOBILE"
+			}
+		} else if hasDesktopPlay {
+			if hasXbox || hasPS {
+				aq.Category = CategoryCrossPlatform
+			} else {
+				aq.Category = CategoryPurePC
+			}
+			chosenType = "PLAY_ON_DESKTOP"
+		} else if hasActivity || hasAchievement {
+			aq.Category = CategoryActivity
+			if hasActivity {
+				chosenType = "PLAY_ACTIVITY"
+			} else {
+				chosenType = "ACHIEVEMENT_IN_ACTIVITY"
+			}
+		} else {
+			for tType := range tc.Tasks {
+				chosenType = tType
+				break
+			}
+			aq.Category = CategoryUnknown
+		}
+
+		if req, ok := tc.Tasks[chosenType]; ok {
+			aq.TaskType = chosenType
+			aq.TargetSec = req.Target
+			if len(req.Applications) > 0 {
+				aq.AppID = req.Applications[0].ID
+			} else if q.Config.Application != nil {
+				aq.AppID = q.Config.Application.ID
+			}
+
+			if q.UserStatus != nil && q.UserStatus.Progress != nil {
+				if prog, hasProg := q.UserStatus.Progress[chosenType]; hasProg {
+					aq.CurrentSec = prog.Value
+				}
+			}
+		}
+	}
+
+	return aq
+}
+
+func extractTitle(q api.Quest) string {
+	if q.Config.Messages.QuestName != nil && *q.Config.Messages.QuestName != "" {
+		return *q.Config.Messages.QuestName
+	}
+	if q.Config.Messages.GameTitle != nil && *q.Config.Messages.GameTitle != "" {
+		return *q.Config.Messages.GameTitle
+	}
+	if q.Config.Application != nil && q.Config.Application.Name != "" {
+		return q.Config.Application.Name
+	}
+	return "Quest #" + q.ID
+}
+
+// AnalyzeAll processes a slice of raw quests into AnalyzedQuest items.
+func AnalyzeAll(rawQuests []api.Quest) []AnalyzedQuest {
+	analyzed := make([]AnalyzedQuest, len(rawQuests))
+	for i, q := range rawQuests {
+		analyzed[i] = AnalyzeQuest(q)
+	}
+	return analyzed
+}
+
+// AutoEnrollPending automatically enrolls into all un-enrolled active quests and
+// returns the IDs that were successfully enrolled. When quiet is true, per-quest
+// progress lines are suppressed (daemon mode).
+func AutoEnrollPending(ctx context.Context, client *api.Client, quests []AnalyzedQuest, enablePortal bool, portalPort int, quiet bool) ([]string, error) {
+	enrolled := make([]string, 0, len(quests))
+	for _, q := range quests {
+		if q.State != StateAvailable || q.IsExpired {
+			continue
+		}
+		if q.Quest.FromCache {
+			// Snapshot quests carry stale sealed traffic metadata; enrolling them
+			// is likely to fail and wastes rate-limit budget.
+			continue
+		}
+		if q.Quest.RegionProxied && q.Region != "" && !client.HasRegionProxy(q.Region) {
+			// The proxy that discovered this quest is no longer configured.
+			continue
+		}
+		// Enroll through the region that discovered the quest: Discord binds the
+		// sealed traffic metadata to the fetch IP, so a direct request for a
+		// proxy-discovered quest can be rejected.
+		questCtx := ctx
+		if q.Region != "" {
+			questCtx = api.WithRegionInfo(ctx, api.RegionInfo{
+				Code:     q.Region,
+				Locale:   q.Quest.DiscoveredLocale,
+				Timezone: q.Quest.DiscoveredTimezone,
+			})
+		}
+
+		if !quiet {
+			if i18n.GetLanguage() == i18n.LangVI {
+				fmt.Printf(" [Tự Động Nhận] Đang tham gia quest: %s (%s) [%s]...\n", q.Title, q.ID, q.Category.Localized())
+			} else {
+				fmt.Printf(" [Auto-Enroll] Enrolling in quest: %s (%s) [%s]...\n", q.Title, q.ID, q.Category.Localized())
+			}
+		}
+		err := client.EnrollQuest(questCtx, q.Quest)
+		if err != nil {
+			var captchaErr *api.CaptchaRequiredError
+			if errors.As(err, &captchaErr) {
+				fmt.Printf(i18n.M().CaptchaAlertTerminal, q.Title, q.ID)
+				fmt.Printf(i18n.M().CaptchaDeepLink, q.ID)
+				if enablePortal {
+					activePort := captcha.FindAvailablePort(portalPort)
+					outboundIP := captcha.GetOutboundIP()
+					fmt.Printf(i18n.M().CaptchaPortalLink, outboundIP, activePort, q.ID)
+					fmt.Print(i18n.M().CaptchaWaiting)
+
+					portalCtx, cancelPortal := context.WithTimeout(ctx, 3*time.Minute)
+					token, solveErr := captcha.StartPortal(portalCtx, activePort, captchaErr, q.Title)
+					cancelPortal()
+
+					if solveErr == nil && token != "" {
+						fmt.Printf(i18n.M().CaptchaSolvedSuccess, q.Title)
+						enrollErr := client.EnrollQuestWithCaptcha(questCtx, q.Quest, token, captchaErr.CaptchaRqtoken)
+						if enrollErr == nil {
+							enrolled = append(enrolled, q.ID)
+							continue
+						}
+						fmt.Printf(" [-] Error enrolling after captcha: %v\n", enrollErr)
+					} else {
+						fmt.Print(i18n.M().CaptchaTimeoutWarning)
+					}
+				} else {
+					fmt.Print(i18n.M().CaptchaPortalDisabled)
+				}
+				continue
+			}
+
+			if errors.Is(err, api.ErrQuestExpired) {
+				fmt.Printf(i18n.M().QuestExpiredSkip, q.Title, q.ID)
+				continue
+			}
+
+			if i18n.GetLanguage() == i18n.LangVI {
+				fmt.Printf(" [Tự Động Nhận] Cảnh báo: không thể nhận quest %s: %v\n", q.Title, err)
+			} else {
+				fmt.Printf(" [Auto-Enroll] Warning: failed enrolling in %s: %v\n", q.Title, err)
+			}
+			continue
+		}
+		enrolled = append(enrolled, q.ID)
+		// Polite delay between enrollments to respect Discord burst rate limits.
+		// The delay is jittered so the cadence does not look clockwork.
+		if !pacing.Sleep(ctx, 2500*time.Millisecond, EnrollSpread) {
+			return enrolled, ctx.Err()
+		}
+	}
+	return enrolled, nil
+}
+
+// ApplyEnrolledState marks the given quest IDs as enrolled in place so a pass can
+// continue without spending another rate-limited quest refetch.
+func ApplyEnrolledState(quests []AnalyzedQuest, enrolledIDs []string) int {
+	if len(enrolledIDs) == 0 || len(quests) == 0 {
+		return 0
+	}
+	wanted := make(map[string]bool, len(enrolledIDs))
+	for _, id := range enrolledIDs {
+		wanted[id] = true
+	}
+	updated := 0
+	for i := range quests {
+		if !wanted[quests[i].ID] {
+			continue
+		}
+		if quests[i].State == StateClaimed || quests[i].State == StateCompleted {
+			continue
+		}
+		quests[i].State = StateEnrolled
+		quests[i].IsExpired = false
+		updated++
+	}
+	return updated
+}
+
+// FormatQuestTable returns a clean CLI overview of quests with categories.
+// Expired quests are collapsed into a single summary line by default so that a
+// long-idle account cannot flood the console with dead campaigns.
+func FormatQuestTable(quests []AnalyzedQuest, showExpired bool) string {
+	var sb strings.Builder
+
+	var claimed, completed, enrolled, available, expired int
+	for _, q := range quests {
+		switch q.State {
+		case StateClaimed:
+			claimed++
+		case StateCompleted:
+			completed++
+		case StateEnrolled:
+			enrolled++
+		case StateAvailable:
+			available++
+		case StateExpired:
+			expired++
+		}
+	}
+
+	sb.WriteString(fmt.Sprintf(i18n.M().TableInventory, len(quests)))
+	sb.WriteString(fmt.Sprintf(i18n.M().TableBreakdown,
+		claimed, completed, enrolled, available, expired))
+	sb.WriteString(strings.Repeat("-", 116) + "\n")
+	sb.WriteString(fmt.Sprintf("%-19s | %-6s | %-24s | %-24s | %-14s | %-9s | %s\n",
+		i18n.M().TableHeaderID, "REGION", i18n.M().TableHeaderTitle, i18n.M().TableHeaderCategory, i18n.M().TableHeaderTaskType, i18n.M().TableHeaderProgress, i18n.M().TableHeaderState))
+	sb.WriteString(strings.Repeat("-", 116) + "\n")
+
+	hiddenExpired := 0
+	for _, q := range quests {
+		if q.State == StateExpired && !showExpired {
+			hiddenExpired++
+			continue
+		}
+		progressStr := fmt.Sprintf("%.0fs / %ds", q.CurrentSec, q.TargetSec)
+		if q.TargetSec == 0 {
+			progressStr = "N/A"
+		}
+		title := q.Title
+		if len([]rune(title)) > 24 {
+			title = string([]rune(title)[:21]) + "..."
+		}
+		cat := q.Category.Localized()
+		if len([]rune(cat)) > 24 {
+			cat = string([]rune(cat)[:21]) + "..."
+		}
+		reg := q.Region
+		if reg == "" {
+			reg = "US"
+		}
+		sb.WriteString(fmt.Sprintf("%-19s | %-6s | %-24s | %-24s | %-14s | %-9s | %s\n",
+			q.ID, "["+reg+"]", title, cat, q.TaskType, progressStr, q.State))
+	}
+	sb.WriteString(strings.Repeat("-", 116) + "\n")
+
+	if hiddenExpired > 0 {
+		sb.WriteString(fmt.Sprintf(i18n.M().TableExpiredNotice, hiddenExpired))
+	}
+
+	return sb.String()
+}
+
+// TableSignature produces a stable fingerprint of the quest inventory state so
+// long-running daemons can skip re-printing an unchanged table every cycle.
+func TableSignature(quests []AnalyzedQuest) string {
+	var sb strings.Builder
+	for _, q := range quests {
+		sb.WriteString(q.ID)
+		sb.WriteByte(':')
+		sb.WriteString(string(q.State))
+		sb.WriteByte(':')
+		sb.WriteString(fmt.Sprintf("%.0f", q.CurrentSec))
+		sb.WriteByte(':')
+		sb.WriteString(fmt.Sprintf("%d", q.TargetSec))
+		sb.WriteByte('|')
+	}
+	return sb.String()
+}

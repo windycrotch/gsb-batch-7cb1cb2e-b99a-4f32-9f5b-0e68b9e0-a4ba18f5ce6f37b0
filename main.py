@@ -1,0 +1,778 @@
+#!/usr/bin/env python3
+"""
+CTDOTEAM - Discord Quest Auto-Completer
+"""
+
+import requests
+import time
+import json
+import random
+import sys
+import os
+import re
+import base64
+import traceback
+from datetime import datetime, timezone
+from typing import Optional
+
+# Ensure UTF-8 output encoding on Windows console (cp1252 / cmd.exe)
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+API_BASE = "https://discord.com/api/v9"
+POLL_INTERVAL = 60          # seconds between quest scans
+HEARTBEAT_INTERVAL = 20     # seconds between heartbeat calls
+AUTO_ACCEPT = True          # auto-enroll in all available quests
+LOG_PROGRESS = True
+DEBUG = True                # verbose debug logging
+
+SUPPORTED_TASKS = [
+    "WATCH_VIDEO",
+    "PLAY_ON_DESKTOP",
+    "STREAM_ON_DESKTOP",
+    "PLAY_ACTIVITY",
+    "WATCH_VIDEO_ON_MOBILE",
+]
+
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+class Colors:
+    RESET  = "\033[0m"
+    GREEN  = "\033[92m"
+    YELLOW = "\033[93m"
+    RED    = "\033[91m"
+    CYAN   = "\033[96m"
+    BOLD   = "\033[1m"
+    DIM    = "\033[2m"
+
+
+def log(msg: str, level: str = "info"):
+    ts = datetime.now().strftime("%H:%M:%S")
+    prefix = {
+        "info":     f"{Colors.CYAN}[INFO]{Colors.RESET}",
+        "ok":       f"{Colors.GREEN}[  OK]{Colors.RESET}",
+        "warn":     f"{Colors.YELLOW}[WARN]{Colors.RESET}",
+        "error":    f"{Colors.RED}[ ERR]{Colors.RESET}",
+        "progress": f"{Colors.DIM}[PROG]{Colors.RESET}",
+        "debug":    f"{Colors.DIM}[DBG ]{Colors.RESET}",
+    }.get(level, f"[{level.upper()}]")
+
+    if level == "debug" and not DEBUG:
+        return
+    if LOG_PROGRESS or level != "progress":
+        print(f"{Colors.DIM}{ts}{Colors.RESET} {prefix} {msg}")
+
+
+# ── Build number fetcher ───────────────────────────────────────────────────────
+def fetch_latest_build_number() -> int:
+    """Scrape Discord web app to get the latest client_build_number."""
+    FALLBACK = 504649
+    try:
+        log("Đang lấy build number mới nhất từ Discord...", "info")
+        ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        r = requests.get("https://discord.com/app", headers={"User-Agent": ua}, timeout=15)
+        if r.status_code != 200:
+            log(f"Không lấy được trang Discord ({r.status_code}), dùng fallback", "warn")
+            return FALLBACK
+
+        scripts = re.findall(r'/assets/([a-f0-9]+)\.js', r.text)
+        if not scripts:
+            scripts_alt = re.findall(r'src="(/assets/[^"]+\.js)"', r.text)
+            scripts = [s.split('/')[-1].replace('.js', '') for s in scripts_alt]
+
+        if not scripts:
+            log("Không tìm thấy JS assets, dùng fallback", "warn")
+            return FALLBACK
+
+        for asset_hash in scripts[-5:]:
+            try:
+                ar = requests.get(
+                    f"https://discord.com/assets/{asset_hash}.js",
+                    headers={"User-Agent": ua}, timeout=15
+                )
+                m = re.search(r'buildNumber["\s:]+["\s]*(\d{5,7})', ar.text)
+                if m:
+                    bn = int(m.group(1))
+                    log(f"Build number: {Colors.BOLD}{bn}{Colors.RESET}", "ok")
+                    return bn
+            except Exception:
+                continue
+
+        log(f"Không tìm thấy build number, dùng fallback {FALLBACK}", "warn")
+        return FALLBACK
+    except Exception as e:
+        log(f"Lỗi lấy build number: {e}, dùng fallback {FALLBACK}", "warn")
+        return FALLBACK
+
+
+def make_super_properties(build_number: int) -> str:
+    """Create base64-encoded X-Super-Properties header."""
+    obj = {
+        "os": "Windows",
+        "browser": "Discord Client",
+        "release_channel": "stable",
+        "client_version": "1.0.9175",
+        "os_version": "10.0.26100",
+        "os_arch": "x64",
+        "app_arch": "x64",
+        "system_locale": "en-US",
+        "browser_user_agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "discord/1.0.9175 Chrome/128.0.6613.186 "
+            "Electron/32.2.7 Safari/537.36"
+        ),
+        "browser_version": "32.2.7",
+        "client_build_number": build_number,
+        "native_build_number": 59498,
+        "client_event_source": None,
+    }
+    return base64.b64encode(json.dumps(obj).encode()).decode()
+
+
+# ── HTTP helpers ───────────────────────────────────────────────────────────────
+class DiscordAPI:
+    def __init__(self, token: str, build_number: int, hypesquad_action: str = "", dry_run: bool = False):
+        self.token = token
+        self.hypesquad_action = hypesquad_action
+        self.dry_run = dry_run
+        self.session = requests.Session()
+        ua = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "discord/1.0.9175 Chrome/128.0.6613.186 "
+            "Electron/32.2.7 Safari/537.36"
+        )
+        sp = make_super_properties(build_number)
+        self.session.headers.update({
+            "Authorization": token,
+            "Content-Type": "application/json",
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "User-Agent": ua,
+            "X-Super-Properties": sp,
+            "X-Discord-Locale": "en-US",
+            "X-Discord-Timezone": "Asia/Ho_Chi_Minh",
+            "Origin": "https://discord.com",
+            "Referer": "https://discord.com/channels/@me",
+        })
+
+    def get(self, path: str, **kwargs) -> requests.Response:
+        url = f"{API_BASE}{path}"
+        log(f"GET {path}", "debug")
+        r = self.session.get(url, **kwargs)
+        log(f"  -> {r.status_code} ({len(r.content)} bytes)", "debug")
+        return r
+
+    def post(self, path: str, payload: Optional[dict] = None, **kwargs) -> requests.Response:
+        url = f"{API_BASE}{path}"
+        log(f"POST {path}", "debug")
+        r = self.session.post(url, json=payload, **kwargs)
+        log(f"  -> {r.status_code} ({len(r.content)} bytes)", "debug")
+        return r
+
+    def delete(self, path: str, **kwargs) -> requests.Response:
+        url = f"{API_BASE}{path}"
+        log(f"DELETE {path}", "debug")
+        r = self.session.delete(url, **kwargs)
+        log(f"  -> {r.status_code} ({len(r.content)} bytes)", "debug")
+        return r
+
+    def join_hypesquad(self, house_id: int) -> bool:
+        r = self.post("/hypesquad/online", payload={"house_id": house_id})
+        return r.status_code in (200, 204)
+
+    def leave_hypesquad(self) -> bool:
+        r = self.delete("/hypesquad/online")
+        return r.status_code in (200, 204)
+
+    def validate_token(self) -> bool:
+        try:
+            r = self.get("/users/@me")
+            if r.status_code == 200:
+                user = r.json()
+                name = user.get("username", "?")
+                log(f"Đăng nhập: {Colors.BOLD}{name}{Colors.RESET} (ID: {user['id']})", "ok")
+
+                flags = (user.get("flags") or 0) | (user.get("public_flags") or 0)
+                badges = []
+                if flags & (1 << 0): badges.append("Staff")
+                if flags & (1 << 1): badges.append("Partner")
+                if flags & (1 << 2): badges.append("HypeSquad Events")
+                if flags & (1 << 3): badges.append("Bug Hunter L1")
+                if flags & (1 << 6): badges.append("HypeSquad Bravery")
+                if flags & (1 << 7): badges.append("HypeSquad Brilliance")
+                if flags & (1 << 8): badges.append("HypeSquad Balance")
+                if flags & (1 << 9): badges.append("Early Supporter")
+                if flags & (1 << 14): badges.append("Bug Hunter L2")
+                if flags & (1 << 17): badges.append("Early Bot Dev")
+                if flags & (1 << 18): badges.append("Certified Mod")
+                if flags & (1 << 22): badges.append("Active Developer")
+                prem = user.get("premium_type", 0)
+                if prem == 1: badges.append("Nitro Classic")
+                elif prem == 2: badges.append("Nitro")
+                elif prem == 3: badges.append("Nitro Basic")
+
+                badge_str = " ".join(f"[{b}]" for b in badges) if badges else "None"
+                log(f"Huy hiệu / Badges: {Colors.BOLD}{badge_str}{Colors.RESET}", "info")
+
+                has_hypesquad = bool(flags & ((1 << 6) | (1 << 7) | (1 << 8)))
+                
+                # Check explicit or auto hypesquad actions
+                action = getattr(self, "hypesquad_action", "").lower().strip()
+                dry_run = getattr(self, "dry_run", False)
+
+                if action in ("leave", "0", "none", "remove"):
+                    if dry_run:
+                        log("[DRY-RUN] Sẽ rời khỏi HypeSquad (chế độ giả lập, không thay đổi)", "info")
+                    else:
+                        log("Đang rời khỏi nhà HypeSquad...", "info")
+                        if self.leave_hypesquad():
+                            log("Đã gỡ bỏ huy hiệu HypeSquad thành công!", "ok")
+                elif action in ("1", "bravery", "2", "brilliance", "3", "balance"):
+                    house_map = {"1": (1, "Bravery"), "bravery": (1, "Bravery"), "2": (2, "Brilliance"), "brilliance": (2, "Brilliance"), "3": (3, "Balance"), "balance": (3, "Balance")}
+                    hid, hname = house_map[action]
+                    if dry_run:
+                        log(f"[DRY-RUN] Sẽ tham gia HypeSquad {hname} (chế độ giả lập, không thay đổi)", "info")
+                    else:
+                        log(f"Đang tham gia HypeSquad {hname}...", "info")
+                        if self.join_hypesquad(hid):
+                            log(f"Mở khóa huy hiệu HypeSquad {hname} thành công!", "ok")
+                elif not has_hypesquad:
+                    if dry_run:
+                        log("[DRY-RUN] Tự động nhận huy hiệu HypeSquad Bravery (chế độ giả lập, không thay đổi)", "info")
+                    else:
+                        log("Tự động nhận huy hiệu HypeSquad Bravery (Badge Maximizer)...", "info")
+                        if self.join_hypesquad(1):
+                            log("Mở khóa huy hiệu HypeSquad Bravery thành công!", "ok")
+                else:
+                    house = "Bravery" if flags & (1 << 6) else ("Brilliance" if flags & (1 << 7) else "Balance")
+                    log(f"Tài khoản đã có huy hiệu HypeSquad {house}", "ok")
+
+                return True
+            else:
+                log(f"Token không hợp lệ (status {r.status_code})", "error")
+                return False
+        except Exception as e:
+            log(f"Không thể kết nối tới Discord: {e}", "error")
+            return False
+
+
+# ── Quest helpers (handles both camelCase & snake_case) ────────────────────────
+def _get(d: Optional[dict], *keys):
+    """Get value from dict trying multiple key names."""
+    if d is None:
+        return None
+    for k in keys:
+        if k in d:
+            return d[k]
+    return None
+
+
+def get_task_config(quest: dict) -> Optional[dict]:
+    cfg = quest.get("config", {})
+    return _get(cfg, "taskConfig", "task_config", "taskConfigV2", "task_config_v2")
+
+
+def get_quest_name(quest: dict) -> str:
+    cfg = quest.get("config", {})
+    msgs = cfg.get("messages", {})
+    name = _get(msgs, "questName", "quest_name")
+    if name:
+        return name.strip()
+    game = _get(msgs, "gameTitle", "game_title")
+    if game:
+        return game.strip()
+    app_name = cfg.get("application", {}).get("name")
+    if app_name:
+        return app_name
+    return f"Quest#{quest.get('id', '?')}"
+
+
+def get_expires_at(quest: dict) -> Optional[str]:
+    cfg = quest.get("config", {})
+    return _get(cfg, "expiresAt", "expires_at")
+
+
+def get_user_status(quest: dict) -> dict:
+    us = _get(quest, "userStatus", "user_status")
+    return us if isinstance(us, dict) else {}
+
+
+def is_completable(quest: dict) -> bool:
+    expires = get_expires_at(quest)
+    if expires:
+        try:
+            exp_dt = datetime.fromisoformat(expires.replace("Z", "+00:00"))
+            if exp_dt <= datetime.now(timezone.utc):
+                return False
+        except Exception:
+            pass
+
+    tc = get_task_config(quest)
+    if not tc or "tasks" not in tc:
+        return False
+
+    tasks = tc["tasks"]
+    return any(tasks.get(t) is not None for t in SUPPORTED_TASKS)
+
+
+def is_enrolled(quest: dict) -> bool:
+    us = get_user_status(quest)
+    return bool(_get(us, "enrolledAt", "enrolled_at"))
+
+
+def is_completed(quest: dict) -> bool:
+    us = get_user_status(quest)
+    return bool(_get(us, "completedAt", "completed_at"))
+
+
+def get_task_type(quest: dict) -> Optional[str]:
+    tc = get_task_config(quest)
+    if not tc or "tasks" not in tc:
+        return None
+    for t in SUPPORTED_TASKS:
+        if tc["tasks"].get(t) is not None:
+            return t
+    return None
+
+
+def get_seconds_needed(quest: dict) -> int:
+    tc = get_task_config(quest)
+    task_type = get_task_type(quest)
+    if not tc or not task_type:
+        return 0
+    return tc["tasks"][task_type].get("target", 0)
+
+
+def get_seconds_done(quest: dict) -> float:
+    task_type = get_task_type(quest)
+    if not task_type:
+        return 0
+    us = get_user_status(quest)
+    progress = us.get("progress", {})
+    if not progress:
+        progress = {}
+    return progress.get(task_type, {}).get("value", 0)
+
+
+def get_enrolled_at(quest: dict) -> Optional[str]:
+    us = get_user_status(quest)
+    return _get(us, "enrolledAt", "enrolled_at")
+
+
+# ── Core logic ─────────────────────────────────────────────────────────────────
+class QuestAutocompleter:
+    def __init__(self, api: DiscordAPI):
+        self.api = api
+        self.completed_ids: set = set()
+
+    # ── Fetch quests ───────────────────────────────────────────────────────────
+    def fetch_quests(self) -> list:
+        try:
+            r = self.api.get("/quests/@me")
+
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, dict):
+                    quests = data.get("quests", [])
+                    excluded = data.get("excluded_quests", [])
+                    blocked = _get(data, "quest_enrollment_blocked_until")
+                    if blocked:
+                        log(f"Enrollment blocked until: {blocked}", "warn")
+                    if excluded:
+                        log(f"{len(excluded)} quest(s) excluded", "debug")
+                    return quests
+                elif isinstance(data, list):
+                    return data
+                return []
+
+            elif r.status_code == 429:
+                retry_after = r.json().get("retry_after", 10)
+                log(f"Rate limited – chờ {retry_after}s", "warn")
+                time.sleep(retry_after)
+                return self.fetch_quests()
+            else:
+                log(f"Quest fetch lỗi ({r.status_code}): {r.text[:200]}", "warn")
+                return []
+
+        except Exception as e:
+            log(f"Error fetching quests: {e}", "error")
+            if DEBUG:
+                traceback.print_exc()
+            return []
+
+    # ── Auto-accept ────────────────────────────────────────────────────────────
+    def enroll_quest(self, quest: dict) -> bool:
+        name = get_quest_name(quest)
+        qid = quest["id"]
+
+        for attempt in range(1, 4):
+            try:
+                r = self.api.post(f"/quests/{qid}/enroll", {
+                    "location": 11,
+                    "is_targeted": False,
+                    "metadata_raw": None,
+                    "metadata_sealed": None,
+                    "traffic_metadata_raw": quest.get("traffic_metadata_raw"),
+                    "traffic_metadata_sealed": quest.get("traffic_metadata_sealed"),
+                })
+
+                if r.status_code == 429:
+                    retry_after = r.json().get("retry_after", 5)
+                    wait = retry_after + 1
+                    log(f"Rate limited nhận \"{name}\" (lần {attempt}/3) – chờ {wait}s", "warn")
+                    time.sleep(wait)
+                    continue
+
+                if r.status_code in (200, 201, 204):
+                    log(f"Đã nhận: {Colors.BOLD}{name}{Colors.RESET}", "ok")
+                    return True
+
+                if r.status_code == 400 and "captcha" in r.text.lower():
+                    log(f"[⚠️ CAPTCHA] Discord yêu cầu xác minh người thật cho quest \"{name}\" ({qid})!", "warn")
+                    log(f"  👉 Mở trực tiếp trên app/web Discord để bấm nhận: https://discord.com/quests/{qid}", "info")
+                    return False
+
+                log(f"Enroll \"{name}\" thất bại ({r.status_code}): {r.text[:200]}", "warn")
+                return False
+
+            except Exception as e:
+                log(f"Lỗi enroll \"{name}\": {e}", "error")
+                return False
+
+        log(f"Bỏ qua \"{name}\" sau 3 lần rate limited", "warn")
+        return False
+
+    def auto_accept(self, quests: list) -> list:
+        if not AUTO_ACCEPT:
+            return quests
+
+        unaccepted = [
+            q for q in quests
+            if not is_enrolled(q) and not is_completed(q) and is_completable(q)
+        ]
+
+        if not unaccepted:
+            return quests
+
+        log(f"Tìm thấy {len(unaccepted)} quest chưa nhận – đang auto-accept...", "info")
+
+        for q in unaccepted:
+            self.enroll_quest(q)
+            time.sleep(3)
+
+        time.sleep(2)
+        return self.fetch_quests()
+
+    # ── Complete: WATCH_VIDEO ──────────────────────────────────────────────────
+    def complete_video(self, quest: dict):
+        name = get_quest_name(quest)
+        qid = quest["id"]
+        seconds_needed = get_seconds_needed(quest)
+        seconds_done = get_seconds_done(quest)
+        enrolled_at_str = get_enrolled_at(quest)
+
+        if enrolled_at_str:
+            enrolled_ts = datetime.fromisoformat(enrolled_at_str.replace("Z", "+00:00")).timestamp()
+        else:
+            enrolled_ts = time.time()
+
+        log(f"🎬 Video: {Colors.BOLD}{name}{Colors.RESET} ({seconds_done:.0f}/{seconds_needed}s)", "info")
+
+        max_future = 10
+        speed = 7
+        interval = 1
+
+        while seconds_done < seconds_needed:
+            max_allowed = (time.time() - enrolled_ts) + max_future
+            diff = max_allowed - seconds_done
+            timestamp = seconds_done + speed
+
+            if diff >= speed:
+                try:
+                    r = self.api.post(f"/quests/{qid}/video-progress", {
+                        "timestamp": min(seconds_needed, timestamp + random.random())
+                    })
+                    if r.status_code == 200:
+                        body = r.json()
+                        if body.get("completed_at"):
+                            log(f"✅ Hoàn thành: {Colors.BOLD}{name}{Colors.RESET}", "ok")
+                            return
+                        seconds_done = min(seconds_needed, timestamp)
+                        log(f"  [{name}] {seconds_done:.0f}/{seconds_needed}s", "progress")
+                    elif r.status_code == 429:
+                        retry_after = r.json().get("retry_after", 5)
+                        log(f"  Rate limited – chờ {retry_after + 1}s", "warn")
+                        time.sleep(retry_after + 1)
+                        continue
+                    else:
+                        log(f"  Video progress lỗi ({r.status_code}): {r.text[:200]}", "warn")
+                except Exception as e:
+                    log(f"  Lỗi: {e}", "error")
+
+            if timestamp >= seconds_needed:
+                break
+            time.sleep(interval)
+
+        try:
+            self.api.post(f"/quests/{qid}/video-progress", {"timestamp": seconds_needed})
+        except Exception:
+            pass
+        log(f"✅ Hoàn thành: {Colors.BOLD}{name}{Colors.RESET}", "ok")
+
+    # ── Complete: PLAY_ON_DESKTOP / STREAM_ON_DESKTOP ──────────────────────────
+    def complete_heartbeat(self, quest: dict):
+        name = get_quest_name(quest)
+        qid = quest["id"]
+        task_type = get_task_type(quest)
+        seconds_needed = get_seconds_needed(quest)
+        seconds_done = get_seconds_done(quest)
+
+        remaining = max(0, seconds_needed - seconds_done)
+        log(
+            f"🎮 {task_type}: {Colors.BOLD}{name}{Colors.RESET} "
+            f"(~{remaining // 60} phút còn lại)",
+            "info"
+        )
+
+        pid = random.randint(1000, 30000)
+
+        while seconds_done < seconds_needed:
+            try:
+                r = self.api.post(f"/quests/{qid}/heartbeat", {
+                    "stream_key": f"call:0:{pid}",
+                    "terminal": False,
+                })
+
+                if r.status_code == 200:
+                    body = r.json()
+                    progress_data = body.get("progress", {})
+                    if progress_data and task_type in progress_data:
+                        seconds_done = progress_data[task_type].get("value", seconds_done)
+                    log(f"  [{name}] {seconds_done:.0f}/{seconds_needed}s", "progress")
+
+                    if body.get("completed_at") or seconds_done >= seconds_needed:
+                        log(f"✅ Hoàn thành: {Colors.BOLD}{name}{Colors.RESET}", "ok")
+                        return
+
+                elif r.status_code == 429:
+                    retry_after = r.json().get("retry_after", 10)
+                    log(f"  Rate limited – chờ {retry_after + 1}s", "warn")
+                    time.sleep(retry_after + 1)
+                    continue
+                else:
+                    log(f"  Heartbeat lỗi ({r.status_code}): {r.text[:200]}", "warn")
+
+            except Exception as e:
+                log(f"  Lỗi heartbeat: {e}", "error")
+
+            time.sleep(HEARTBEAT_INTERVAL)
+
+        try:
+            self.api.post(f"/quests/{qid}/heartbeat", {
+                "stream_key": f"call:0:{pid}",
+                "terminal": True,
+            })
+        except Exception:
+            pass
+        log(f"✅ Hoàn thành: {Colors.BOLD}{name}{Colors.RESET}", "ok")
+
+    # ── Complete: PLAY_ACTIVITY ────────────────────────────────────────────────
+    def complete_activity(self, quest: dict):
+        name = get_quest_name(quest)
+        qid = quest["id"]
+        seconds_needed = get_seconds_needed(quest)
+        seconds_done = get_seconds_done(quest)
+
+        remaining = max(0, seconds_needed - seconds_done)
+        log(
+            f"🕹️  Activity: {Colors.BOLD}{name}{Colors.RESET} "
+            f"(~{remaining // 60} phút còn lại)",
+            "info"
+        )
+
+        stream_key = "call:0:1"
+
+        while seconds_done < seconds_needed:
+            try:
+                r = self.api.post(f"/quests/{qid}/heartbeat", {
+                    "stream_key": stream_key,
+                    "terminal": False,
+                })
+
+                if r.status_code == 200:
+                    body = r.json()
+                    progress_data = body.get("progress", {})
+                    if progress_data and "PLAY_ACTIVITY" in progress_data:
+                        seconds_done = progress_data["PLAY_ACTIVITY"].get("value", seconds_done)
+                    log(f"  [{name}] {seconds_done:.0f}/{seconds_needed}s", "progress")
+
+                    if body.get("completed_at") or seconds_done >= seconds_needed:
+                        break
+                elif r.status_code == 429:
+                    retry_after = r.json().get("retry_after", 10)
+                    log(f"  Rate limited – chờ {retry_after + 1}s", "warn")
+                    time.sleep(retry_after + 1)
+                    continue
+                else:
+                    log(f"  Heartbeat lỗi ({r.status_code}): {r.text[:200]}", "warn")
+            except Exception as e:
+                log(f"  Lỗi: {e}", "error")
+
+            time.sleep(HEARTBEAT_INTERVAL)
+
+        try:
+            self.api.post(f"/quests/{qid}/heartbeat", {
+                "stream_key": stream_key,
+                "terminal": True,
+            })
+        except Exception:
+            pass
+        log(f"✅ Hoàn thành: {Colors.BOLD}{name}{Colors.RESET}", "ok")
+
+    # ── Process a single quest ─────────────────────────────────────────────────
+    def process_quest(self, quest: dict):
+        qid = quest.get("id")
+        name = get_quest_name(quest)
+        task_type = get_task_type(quest)
+
+        if not task_type:
+            log(f"\"{name}\" – task không hỗ trợ, bỏ qua", "warn")
+            return
+
+        if qid in self.completed_ids:
+            return
+
+        log(f"━━━ Bắt đầu: {Colors.BOLD}{name}{Colors.RESET} (task: {task_type}) ━━━", "info")
+
+        if task_type in ("WATCH_VIDEO", "WATCH_VIDEO_ON_MOBILE"):
+            self.complete_video(quest)
+        elif task_type in ("PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP"):
+            self.complete_heartbeat(quest)
+        elif task_type == "PLAY_ACTIVITY":
+            self.complete_activity(quest)
+
+        self.completed_ids.add(qid)
+
+    # ── Main loop ──────────────────────────────────────────────────────────────
+    def run(self):
+        log("=" * 60, "info")
+        log(f"{Colors.BOLD}Discord Quest Auto-Completer v3.0{Colors.RESET}", "info")
+        log(f"Auto-accept: {'BẬT' if AUTO_ACCEPT else 'TẮT'}  |  Poll: {POLL_INTERVAL}s", "info")
+        log("=" * 60, "info")
+
+        cycle = 0
+        while True:
+            cycle += 1
+            log(f"── Quét lần #{cycle} ──", "info")
+
+            quests = self.fetch_quests()
+            total = len(quests)
+
+            if not quests:
+                log("Không có quest nào", "info")
+            else:
+                enrolled_count = sum(1 for q in quests if is_enrolled(q))
+                completed_count = sum(1 for q in quests if is_completed(q))
+                completable_count = sum(1 for q in quests if is_completable(q))
+
+                log(
+                    f"Tổng: {total} quest | Enrolled: {enrolled_count} | "
+                    f"Completed: {completed_count} | Completable: {completable_count}",
+                    "info"
+                )
+
+                for q in quests:
+                    name = get_quest_name(q)
+                    task = get_task_type(q) or "?"
+                    if is_completed(q):
+                        status = f"{Colors.GREEN}✓{Colors.RESET}"
+                    elif is_enrolled(q):
+                        status = f"{Colors.YELLOW}▶{Colors.RESET}"
+                    else:
+                        status = f"{Colors.DIM}○{Colors.RESET}"
+                    log(f"  {status} {name} [{task}]", "info")
+
+                # Auto-accept
+                quests = self.auto_accept(quests)
+
+                # Filter actionable
+                actionable = [
+                    q for q in quests
+                    if is_enrolled(q) and not is_completed(q) and is_completable(q)
+                    and q.get("id") not in self.completed_ids
+                ]
+
+                if actionable:
+                    log(f"\n{len(actionable)} quest(s) cần hoàn thành:", "info")
+                    for q in actionable:
+                        self.process_quest(q)
+                else:
+                    log("Không có quest nào cần hoàn thành lúc này", "info")
+
+            log(f"\nChờ {POLL_INTERVAL}s... (Ctrl+C để dừng)\n", "info")
+            time.sleep(POLL_INTERVAL)
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+def main():
+    print(f"""
+{Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════╗
+║        Discord Quest Auto-Completer          ║
+║   Auto-Scan · Auto-Enroll · Auto-Complete    ║
+║  Auto quét · Auto nhận · Auto hoàn thành     ║
+╚══════════════════════════════════════════════╝{Colors.RESET}
+""")
+
+    import argparse
+    parser = argparse.ArgumentParser(description="Discord Quest Phantom & Badge Maximizer")
+    parser.add_argument("token", nargs="?", default="", help="Discord authorization token")
+    parser.add_argument("--token", dest="token_opt", default="", help="Discord token option")
+    parser.add_argument("--hypesquad", choices=["1", "2", "3", "bravery", "brilliance", "balance", "leave", "0"], default="", help="HypeSquad House action")
+    parser.add_argument("--dry-run", action="store_true", help="Simulate execution without modifying account or completing quests")
+    args, unknown = parser.parse_known_args()
+
+    token = (args.token or args.token_opt).strip()
+    if not token and len(unknown) > 0 and not unknown[0].startswith("-"):
+        token = unknown[0].strip()
+
+    if not token:
+        if os.path.exists(".token"):
+            with open(".token", "r") as f:
+                token = f.read().strip()
+            log("Đọc token từ file .token / Read token from .token", "info")
+        else:
+            token = input(f"{Colors.BOLD}Enter Discord Token / Nhập Discord Token: {Colors.RESET}").strip()
+
+    if not token:
+        log("Token is empty / Token trống – exiting.", "error")
+        sys.exit(1)
+
+    build_number = fetch_latest_build_number()
+    api = DiscordAPI(token, build_number, hypesquad_action=args.hypesquad, dry_run=args.dry_run)
+
+    if not api.validate_token():
+        sys.exit(1)
+
+    if args.dry_run:
+        log("Chế độ giả lập (Dry-run) hoàn tất. Không có thay đổi nào được thực hiện.", "ok")
+        return
+
+    completer = QuestAutocompleter(api)
+
+    try:
+        completer.run()
+    except KeyboardInterrupt:
+        print()
+        log("Đã dừng.", "info")
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
