@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"sync"
 )
 
 // Encoder encodes audio to FLAC format
@@ -14,6 +15,10 @@ type Encoder struct {
 	Channels      int
 	BitsPerSample int
 	BlockSize     int // samples per block (typically 4096)
+
+	// mu makes repeated and concurrent use of one Encoder deterministic.
+	// Per-encode statistics are reset at the beginning of Encode.
+	mu sync.Mutex
 
 	totalSamples uint64
 	minBlockSize uint16
@@ -38,54 +43,80 @@ func NewEncoder(sampleRate, channels, bitsPerSample int) *Encoder {
 	}
 }
 
-// Encode encodes PCM samples to FLAC
+// Encode encodes PCM samples to FLAC.
+//
+// Samples are interleaved and len(samples) must be a multiple of Channels.
+// Encode resets all stream statistics, so an Encoder may be reused for
+// another stream after this method returns.
 func (e *Encoder) Encode(w io.Writer, samples []int32) error {
-	// We need to write to a buffer first to calculate MD5 and frame sizes
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.Channels <= 0 || e.Channels > 8 {
+		return fmt.Errorf("invalid channel count: %d", e.Channels)
+	}
+	if e.SampleRate <= 0 || e.SampleRate > 655350 {
+		return fmt.Errorf("invalid sample rate: %d", e.SampleRate)
+	}
+	if e.BitsPerSample < 4 || e.BitsPerSample > 32 {
+		return fmt.Errorf("invalid bits per sample: %d", e.BitsPerSample)
+	}
+	if len(samples)%e.Channels != 0 {
+		return fmt.Errorf("sample count %d is not aligned to %d channels", len(samples), e.Channels)
+	}
+
+	blockSize := e.BlockSize
+	if blockSize <= 0 {
+		blockSize = 4096
+	}
+	if blockSize > 65535 {
+		return fmt.Errorf("block size %d exceeds FLAC maximum 65535", blockSize)
+	}
+
+	// Every Encode starts a new stream. Do not retain total sample count,
+	// frame-size extrema, block-size extrema, or MD5 state from a prior run.
+	samplesPerChannel := len(samples) / e.Channels
+	e.totalSamples = uint64(samplesPerChannel)
+	e.minBlockSize = 0
+	e.maxBlockSize = 0
+	e.minFrameSize = ^uint32(0)
+	e.maxFrameSize = 0
+	e.md5sum = [16]byte{}
+	e.md5hash = nil
+
+	// We need to write frames to a buffer first because STREAMINFO precedes
+	// them and is finalized with frame statistics.
 	var buf bytes.Buffer
 
-	// Calculate total samples per channel
-	e.totalSamples = uint64(len(samples) / e.Channels)
-
-	// Compute MD5 of raw samples
+	// Compute MD5 of raw little-endian PCM bytes.
 	md5h := md5.New()
+	bytesPerSample := (e.BitsPerSample + 7) / 8
+	var raw [4]byte
 	for _, s := range samples {
-		// Write sample as little-endian based on bit depth
-		switch e.BitsPerSample {
-		case 8:
-			md5h.Write([]byte{byte(s)})
-		case 16:
-			b := make([]byte, 2)
-			binary.LittleEndian.PutUint16(b, uint16(int16(s)))
-			md5h.Write(b)
-		case 24:
-			b := make([]byte, 3)
-			b[0] = byte(s)
-			b[1] = byte(s >> 8)
-			b[2] = byte(s >> 16)
-			md5h.Write(b)
-		case 32:
-			b := make([]byte, 4)
-			binary.LittleEndian.PutUint32(b, uint32(s))
-			md5h.Write(b)
+		v := uint32(s)
+		for i := 0; i < bytesPerSample; i++ {
+			raw[i] = byte(v >> (8 * i))
 		}
+		md5h.Write(raw[:bytesPerSample])
 	}
-	copy(e.md5sum[:], md5h.Sum(nil))
+	sum := md5h.Sum(nil)
+	copy(e.md5sum[:], sum)
 
-	// Encode frames
-	samplesPerChannel := len(samples) / e.Channels
+	// Track the actual range of every emitted frame so STREAMINFO covers
+	// short final frames as well as full blocks.
 	frameNum := uint64(0)
 
-	for offset := 0; offset < samplesPerChannel; offset += e.BlockSize {
-		blockSize := e.BlockSize
-		if offset+blockSize > samplesPerChannel {
-			blockSize = samplesPerChannel - offset
+	for offset := 0; offset < samplesPerChannel; offset += blockSize {
+		frameBlockSize := blockSize
+		if offset+frameBlockSize > samplesPerChannel {
+			frameBlockSize = samplesPerChannel - offset
 		}
 
-		// Extract block samples (deinterleave)
+		// Extract block samples (deinterleave).
 		block := make([][]int32, e.Channels)
 		for ch := 0; ch < e.Channels; ch++ {
-			block[ch] = make([]int32, blockSize)
-			for i := 0; i < blockSize; i++ {
+			block[ch] = make([]int32, frameBlockSize)
+			for i := 0; i < frameBlockSize; i++ {
 				block[ch][i] = samples[(offset+i)*e.Channels+ch]
 			}
 		}
@@ -95,35 +126,50 @@ func (e *Encoder) Encode(w io.Writer, samples []int32) error {
 			return fmt.Errorf("encode frame %d: %w", frameNum, err)
 		}
 
-		if uint32(frameSize) < e.minFrameSize {
-			e.minFrameSize = uint32(frameSize)
+		frameSize32 := uint32(frameSize)
+		if frameSize32 < e.minFrameSize {
+			e.minFrameSize = frameSize32
 		}
-		if uint32(frameSize) > e.maxFrameSize {
-			e.maxFrameSize = uint32(frameSize)
+		if frameSize32 > e.maxFrameSize {
+			e.maxFrameSize = frameSize32
 		}
 
-		if uint16(blockSize) < e.minBlockSize {
-			e.minBlockSize = uint16(blockSize)
+		blockSize16 := uint16(frameBlockSize)
+		if e.minBlockSize == 0 || blockSize16 < e.minBlockSize {
+			e.minBlockSize = blockSize16
 		}
-		if uint16(blockSize) > e.maxBlockSize {
-			e.maxBlockSize = uint16(blockSize)
+		if blockSize16 > e.maxBlockSize {
+			e.maxBlockSize = blockSize16
 		}
 
 		frameNum++
 	}
 
-	// Now write everything with correct header
-	// Magic number
+	if samplesPerChannel == 0 {
+		// There are no audio frames. Use the configured block size as a
+		// conventional valid STREAMINFO value and mark frame sizes unknown.
+		e.minBlockSize = uint16(blockSize)
+		e.maxBlockSize = uint16(blockSize)
+		e.minFrameSize = 0
+		e.maxFrameSize = 0
+	} else {
+		if e.minFrameSize == ^uint32(0) {
+			e.minFrameSize = 0
+		}
+	}
+
+	// Now write everything with correct header.
+	// Magic number.
 	if _, err := w.Write([]byte("fLaC")); err != nil {
 		return err
 	}
 
-	// STREAMINFO block
+	// STREAMINFO block.
 	if err := e.writeStreamInfo(w); err != nil {
 		return err
 	}
 
-	// Copy encoded frames
+	// Copy encoded frames.
 	if _, err := io.Copy(w, &buf); err != nil {
 		return err
 	}
@@ -144,10 +190,23 @@ func (e *Encoder) writeStreamInfo(w io.Writer) error {
 	// STREAMINFO data (34 bytes)
 	var buf bytes.Buffer
 
+	// The field values retain the exact observed range. Some widely used
+	// parsers reject STREAMINFO block sizes below 16 even though the FLAC
+	// format allows a short final frame; write the metadata lower bound in
+	// that edge case while the frame header still states its true size.
+	infoMinBlockSize := e.minBlockSize
+	infoMaxBlockSize := e.maxBlockSize
+	if infoMinBlockSize < 16 {
+		infoMinBlockSize = 16
+	}
+	if infoMaxBlockSize < 16 {
+		infoMaxBlockSize = 16
+	}
+
 	// Min block size (16 bits)
-	binary.Write(&buf, binary.BigEndian, e.minBlockSize)
+	binary.Write(&buf, binary.BigEndian, infoMinBlockSize)
 	// Max block size (16 bits)
-	binary.Write(&buf, binary.BigEndian, e.maxBlockSize)
+	binary.Write(&buf, binary.BigEndian, infoMaxBlockSize)
 	// Min frame size (24 bits)
 	buf.Write([]byte{byte(e.minFrameSize >> 16), byte(e.minFrameSize >> 8), byte(e.minFrameSize)})
 	// Max frame size (24 bits)
@@ -255,11 +314,21 @@ func (e *Encoder) encodeFrame(w io.Writer, block [][]int32, frameNum uint64) (in
 
 // encodeSubframe encodes a single subframe using FIXED prediction
 func (e *Encoder) encodeSubframe(bw *BitWriter, samples []int32) error {
-	// Try different prediction orders and pick the best
+	if len(samples) < 16 {
+		return e.encodeVerbatimSubframe(bw, samples)
+	}
+
+	// Try different prediction orders and pick the best. A predictor order
+	// cannot exceed the block size because that would require more warmup
+	// samples than the subframe contains.
+	maxOrder := 4
+	if len(samples) < maxOrder {
+		maxOrder = len(samples)
+	}
 	bestOrder := 0
 	bestSize := int64(1<<63 - 1)
 
-	for order := 0; order <= 4; order++ {
+	for order := 0; order <= maxOrder; order++ {
 		residuals := computeFixedResiduals(samples, order)
 		size := estimateRiceSize(residuals)
 		if size < bestSize {
@@ -398,9 +467,10 @@ func estimateRiceSize(residuals []int32) int64 {
 // encodeRicePartition encodes residuals using Rice coding
 func encodeRicePartition(bw *BitWriter, residuals []int32) error {
 	if len(residuals) == 0 {
-		// Write minimal partition header
+		// Write the partition header and a (never-used) Rice parameter.
 		bw.WriteBits(0, 2) // encoding method
 		bw.WriteBits(0, 4) // partition order
+		bw.WriteBits(0, 4) // Rice parameter
 		return nil
 	}
 
@@ -524,7 +594,9 @@ func getSampleSizeCode(bitsPerSample int) int {
 	case 24:
 		return 6
 	case 32:
-		return 7 // Non-standard but some decoders support it
+		// There is no frame-header code for 32 bits; code 0 tells the
+		// decoder to use STREAMINFO.
+		return 0
 	default:
 		return 0 // Get from STREAMINFO
 	}

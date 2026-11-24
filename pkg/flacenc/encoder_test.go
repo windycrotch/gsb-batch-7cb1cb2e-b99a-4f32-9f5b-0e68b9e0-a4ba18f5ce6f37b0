@@ -28,10 +28,10 @@ func TestBitWriter_WriteUnary(t *testing.T) {
 		expected []byte
 		bits     int
 	}{
-		{0, []byte{0x00}, 1},     // 0 -> "0"
-		{1, []byte{0x80}, 2},     // 1 -> "10"
-		{3, []byte{0xE0}, 4},     // 3 -> "1110"
-		{7, []byte{0xFE}, 8},     // 7 -> "11111110"
+		{0, []byte{0x80}, 1}, // 0 -> "1"
+		{1, []byte{0x40}, 2}, // 1 -> "01"
+		{3, []byte{0x10}, 4}, // 3 -> "0001"
+		{7, []byte{0x01}, 8}, // 7 -> "00000001"
 	}
 
 	for _, tt := range tests {

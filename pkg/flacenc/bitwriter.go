@@ -76,15 +76,14 @@ func (b *BitWriter) WriteUint32BE(v uint32) error {
 	return b.WriteBits(uint64(v), 32)
 }
 
-// WriteUnary writes unary code (n ones followed by zero)
+// WriteUnary writes v in FLAC unary coding: v zero bits followed by a one.
 func (b *BitWriter) WriteUnary(v uint32) error {
-	for v > 0 {
-		if err := b.WriteBits(1, 1); err != nil {
+	for i := uint32(0); i < v; i++ {
+		if err := b.WriteBits(0, 1); err != nil {
 			return err
 		}
-		v--
 	}
-	return b.WriteBits(0, 1)
+	return b.WriteBits(1, 1)
 }
 
 // WriteSignedRice writes a signed value using Rice coding
@@ -188,7 +187,7 @@ func (b *BitWriter) WriteUTF8(v uint64) error {
 	}
 	if err := b.WriteByte(byte(0x80 | ((v >> 12) & 0x3F))); err != nil {
 		return err
-		}
+	}
 	if err := b.WriteByte(byte(0x80 | ((v >> 6) & 0x3F))); err != nil {
 		return err
 	}

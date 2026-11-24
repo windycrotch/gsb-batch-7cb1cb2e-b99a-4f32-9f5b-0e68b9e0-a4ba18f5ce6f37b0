@@ -50,8 +50,19 @@ func New() *Converter {
 	}
 }
 
-// ConvertFile converts audio file
-func (c *Converter) ConvertFile(inputPath, outputPath string) error {
+// ConvertFile converts audio file.
+//
+// Encoding is performed in a temporary file in the destination directory and
+// only renamed to outputPath after it succeeds. Consequently, a failed
+// conversion leaves an existing outputPath untouched and does not leave the
+// temporary file behind.
+func (c *Converter) ConvertFile(inputPath, outputPath string) (retErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			retErr = fmt.Errorf("convert %s to %s: %v", inputPath, outputPath, r)
+		}
+	}()
+
 	inputFmt := DetectFormat(inputPath)
 	outputFmt := DetectFormat(outputPath)
 
@@ -63,7 +74,6 @@ func (c *Converter) ConvertFile(inputPath, outputPath string) error {
 	if err != nil {
 		return fmt.Errorf("open input: %w", err)
 	}
-	defer inFile.Close()
 
 	var pcm *PCMData
 	switch inputFmt {
@@ -79,27 +89,61 @@ func (c *Converter) ConvertFile(inputPath, outputPath string) error {
 		return fmt.Errorf("unsupported input format: %s", inputFmt)
 	}
 	if err != nil {
+		_ = inFile.Close()
 		return fmt.Errorf("decode: %w", err)
 	}
-
-	outFile, err := os.Create(outputPath)
-	if err != nil {
-		return fmt.Errorf("create output: %w", err)
+	if err := inFile.Close(); err != nil {
+		return fmt.Errorf("close input: %w", err)
 	}
-	defer outFile.Close()
+
+	// Create the temporary output next to the destination so the final
+	// replacement is a same-directory rename.
+	outputDir := filepath.Dir(outputPath)
+	tmpFile, err := os.CreateTemp(outputDir, "."+filepath.Base(outputPath)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temporary output: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	// Match the usual os.Create mode, or preserve an existing destination's
+	// permissions when replacing it.
+	if info, err := os.Stat(outputPath); err == nil {
+		_ = tmpFile.Chmod(info.Mode().Perm())
+	} else {
+		_ = tmpFile.Chmod(0o644)
+	}
+	cleanup := func() {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
+	}
+	defer cleanup()
 
 	switch outputFmt {
 	case FormatWAV:
-		return encodeWAV(outFile, pcm)
+		err = encodeWAV(tmpFile, pcm)
 	case FormatMP3:
-		return encodeMP3(outFile, pcm)
+		err = encodeMP3(tmpFile, pcm)
 	case FormatFLAC:
-		return encodeFLAC(outFile, pcm)
+		err = encodeFLAC(tmpFile, pcm)
 	case FormatOGG:
-		return c.encodeOGG(outFile, pcm)
+		err = c.encodeOGG(tmpFile, pcm)
 	default:
-		return fmt.Errorf("unsupported output format: %s", outputFmt)
+		err = fmt.Errorf("unsupported output format: %s", outputFmt)
 	}
+	if err != nil {
+		return fmt.Errorf("encode: %w", err)
+	}
+
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("close temporary output: %w", err)
+	}
+
+	// On Unix rename atomically replaces the destination. Go's Windows
+	// implementation also uses the replace-existing move operation.
+	if err := os.Rename(tmpPath, outputPath); err != nil {
+		return fmt.Errorf("replace output: %w", err)
+	}
+
+	return nil
 }
 
 // DetectFormat detects audio format from file extension
@@ -162,21 +206,65 @@ func decodeWAV(r io.Reader) (*PCMData, error) {
 	}
 
 	samples := make([]int16, len(buf.Data))
-	var maxVal float64 = 32768
-	if bitDepth == 24 {
-		maxVal = 8388608
-	} else if bitDepth == 32 {
-		maxVal = 2147483648
-	}
-
-	for i, s := range buf.Data {
-		normalized := float64(s) / maxVal * 32767
-		if normalized > 32767 {
-			normalized = 32767
-		} else if normalized < -32768 {
-			normalized = -32768
+	switch bitDepth {
+	case 8:
+		// WAV 8-bit PCM is unsigned while PCMData stores signed int16.
+		for i, s := range buf.Data {
+			v := s - 128
+			if v < -128 {
+				v = -128
+			} else if v > 127 {
+				v = 127
+			}
+			samples[i] = int16(v << 8)
 		}
-		samples[i] = int16(normalized)
+	case 16:
+		for i, s := range buf.Data {
+			if s > 32767 {
+				s = 32767
+			} else if s < -32768 {
+				s = -32768
+			}
+			samples[i] = int16(s)
+		}
+	case 24:
+		for i, s := range buf.Data {
+			if s > 8388607 {
+				s = 8388607
+			} else if s < -8388608 {
+				s = -8388608
+			}
+			// Arithmetic shift preserves the sign and maps 24-bit PCM to
+			// the int16 range used throughout the converter.
+			samples[i] = int16(s >> 8)
+		}
+	case 32:
+		for i, s := range buf.Data {
+			if s > 2147483647 {
+				s = 2147483647
+			} else if s < -2147483648 {
+				s = -2147483648
+			}
+			samples[i] = int16(s >> 16)
+		}
+	default:
+		// Keep the previous normalization as a fallback for unusual bit
+		// depths accepted by the WAV decoder.
+		var maxVal float64 = 32768
+		if bitDepth == 24 {
+			maxVal = 8388608
+		} else if bitDepth == 32 {
+			maxVal = 2147483648
+		}
+		for i, s := range buf.Data {
+			normalized := float64(s) / maxVal * 32767
+			if normalized > 32767 {
+				normalized = 32767
+			} else if normalized < -32768 {
+				normalized = -32768
+			}
+			samples[i] = int16(normalized)
+		}
 	}
 
 	return &PCMData{
@@ -307,31 +395,59 @@ func decodeOGG(r io.Reader) (*PCMData, error) {
 	}, nil
 }
 
-// encodeWAV encodes PCM to WAV
+// encodeWAV encodes PCM to WAV.
 func encodeWAV(w io.Writer, pcm *PCMData) error {
 	dataSize := len(pcm.Samples) * 2
 	fileSize := 36 + dataSize
 	byteRate := pcm.SampleRate * pcm.Channels * 2
 	blockAlign := pcm.Channels * 2
 
-	w.Write([]byte("RIFF"))
-	binary.Write(w, binary.LittleEndian, uint32(fileSize))
-	w.Write([]byte("WAVE"))
+	if _, err := w.Write([]byte("RIFF")); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, uint32(fileSize)); err != nil {
+		return err
+	}
+	if _, err := w.Write([]byte("WAVE")); err != nil {
+		return err
+	}
 
-	w.Write([]byte("fmt "))
-	binary.Write(w, binary.LittleEndian, uint32(16))
-	binary.Write(w, binary.LittleEndian, uint16(1))
-	binary.Write(w, binary.LittleEndian, uint16(pcm.Channels))
-	binary.Write(w, binary.LittleEndian, uint32(pcm.SampleRate))
-	binary.Write(w, binary.LittleEndian, uint32(byteRate))
-	binary.Write(w, binary.LittleEndian, uint16(blockAlign))
-	binary.Write(w, binary.LittleEndian, uint16(16))
+	if _, err := w.Write([]byte("fmt ")); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, uint32(16)); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, uint16(1)); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, uint16(pcm.Channels)); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, uint32(pcm.SampleRate)); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, uint32(byteRate)); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, uint16(blockAlign)); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, uint16(16)); err != nil {
+		return err
+	}
 
-	w.Write([]byte("data"))
-	binary.Write(w, binary.LittleEndian, uint32(dataSize))
+	if _, err := w.Write([]byte("data")); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, uint32(dataSize)); err != nil {
+		return err
+	}
 
 	for _, s := range pcm.Samples {
-		binary.Write(w, binary.LittleEndian, s)
+		if err := binary.Write(w, binary.LittleEndian, s); err != nil {
+			return err
+		}
 	}
 
 	return nil
