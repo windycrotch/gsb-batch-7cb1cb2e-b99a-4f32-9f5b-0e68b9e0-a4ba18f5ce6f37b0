@@ -184,7 +184,7 @@ func (h *connHandler) OnPublish(ctx *gortmp.StreamContext, timestamp uint32, cmd
 
 	h.authenticated = true
 
-	h.streamID = h.stream.StreamID
+	h.streamID = h.stream.StreamID()
 
 	// Add some meta info to the logger
 	h.log = h.log.WithFields(logrus.Fields{

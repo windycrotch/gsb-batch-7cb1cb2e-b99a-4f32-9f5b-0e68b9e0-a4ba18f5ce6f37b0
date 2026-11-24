@@ -46,7 +46,7 @@ func (s *Stream) Ingest(ctx context.Context) error {
 
 		if trackCodec := codec.MimeType; trackCodec == webrtc.MimeTypeH264 {
 			if s.saveVideo {
-				filename := fmt.Sprintf("stream.%d.%s", s.StreamID, "out.h264")
+				filename := fmt.Sprintf("stream.%d.%s", s.StreamID(), "out.h264")
 				videoFileWriter := NewVideoWriter(
 					s.log.WithField("file-writer", webrtc.MimeTypeH264),
 					webrtc.MimeTypeH264,
